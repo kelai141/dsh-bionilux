@@ -1,15 +1,15 @@
-# Build artefacts
-preload_data.h
+# Rust
+/target/
+
+# Build artifacts
 libbionilux_preload.so
 *.o
-*.bak
+preload_data.h
 
-# Binaries — never commit compiled output
-/bionilux
-/box64
+# Vendored test fixtures
+tests/helpers/*.bin
 
-# Legacy lib path (pre-v0.2.0) — should not be tracked
-lib_x86_64/
-lib_x86_64.tar.gz
-lib_x86_64*
-ovgl
+# Editor
+.vscode/
+.idea/
+*.swp

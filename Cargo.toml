@@ -1,0 +1,13 @@
+[package]
+name = "bionilux"
+version = "0.4.0"
+edition = "2024"
+
+[dependencies]
+goblin = "0.10.7"
+memmap2 = "0.9.11"
+nix = { version = "0.31.3", features = ["process", "fs"] }
+which = "8.0.6"
+
+[dev-dependencies]
+tempfile = "3"
