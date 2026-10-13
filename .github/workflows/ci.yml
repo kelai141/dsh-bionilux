@@ -11,7 +11,6 @@ permissions:
   contents: read
 
 jobs:
-  # ── test: runs on every push/PR ────────────────────────────────
   test:
     name: test
     runs-on: ubuntu-latest
@@ -25,7 +24,6 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --verbose
 
-  # ── preload: aarch64 glibc shared library ──────────────────────
   preload:
     name: preload (aarch64-glibc)
     runs-on: ubuntu-latest
@@ -50,7 +48,6 @@ jobs:
           name: preload
           path: libbionilux_preload.so
 
-  # ── bionilux: rust binary for android bionic ───────────────────
   bionilux:
     name: bionilux (aarch64-bionic)
     runs-on: ubuntu-latest
@@ -86,8 +83,7 @@ jobs:
           name: bionilux
           path: bionilux
 
-  # ── box64: native ARM64 runner ─────────────────────────────────
-    box64:
+  box64:
     name: box64-glibc
     runs-on: ubuntu-24.04-arm
     steps:
@@ -111,8 +107,7 @@ jobs:
           name: box64
           path: box64-glibc
 
-  # ── x86_64 runtime libs from debian trixie ─────────────────────
-    x86-libs:
+  x86-libs:
     name: x86_64 runtime libs
     runs-on: ubuntu-latest
     steps:
@@ -139,7 +134,6 @@ jobs:
           name: x86_64-libs
           path: x86_64-libs.tar.xz
 
-  # ── release: only on tag push ──────────────────────────────────
   release:
     name: release
     needs: [preload, bionilux, box64, x86-libs]
