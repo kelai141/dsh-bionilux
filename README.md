@@ -17,7 +17,7 @@ box64-glibc, and x86_64 runtime libs all come from our own releases.
 curl -fsSL theonuverse.github.io/bionilux/setup | bash
 ```
 
-Pin a version with `BIONILUX_VERSION=v0.4.0`. Uninstall:
+Pin a version with `BIONILUX_VERSION=v0.4.1`. Uninstall:
 
 ```bash
 rm -f "$PREFIX/bin/bionilux" "$PREFIX/glibc/lib/libbionilux_preload.so"
@@ -141,8 +141,8 @@ important cases (DNS and NSS).
 Two components plus one external dependency.
 
 The launcher, a small Rust binary compiled for Bionic. It parses the
-target's ELF header, decides which interpreter or emulator to use, and
-`execve`s into it.
+target's ELF header, decides which interpreter or emulator to use,
+then calls `execve()` on it.
 
 The preload library, a shared library compiled for glibc. Injected via
 `LD_PRELOAD` into every glibc process bionilux starts. It hooks `exec*`, `posix_spawn*`, `open*`, and `readlink*` so that children of the target process are themselves rerouted, and so `/etc/*` accesses from programs that hardcode Linux paths redirect to `$GLIBC/etc/*` where the file exists. glibc's own DNS and NSS resolution already works under Termux and does not depend on this hook.
