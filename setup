@@ -1,0 +1,81 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# bionilux installer. Downloads everything from our own GitHub releases.
+# Pin a version with: BIONILUX_VERSION=v0.4.0 ./setup
+set -eu
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+GLIBC="$PREFIX/glibc"
+GLIBC_LIB="$GLIBC/lib"
+BIN_DIR="$PREFIX/bin"
+BOX64_DIR="$PREFIX/bionilux"
+X86_DIR="$GLIBC_LIB/x86_64-linux-gnu"
+REPO="theonuverse/bionilux"
+
+G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; N='\033[0m'
+ok()   { printf "${G}[ok]${N} %s\n" "$*"; }
+info() { printf "[..] %s\n" "$*"; }
+warn() { printf "${Y}[!]${N} %s\n" "$*"; }
+die()  { printf "${R}[xx]${N} %s\n" "$*" >&2; exit 1; }
+
+# ── prerequisites ───────────────────────────────────────────────────
+info "Installing prerequisites"
+pkg update -y >/dev/null 2>&1 || warn "pkg update failed, continuing"
+pkg install -y binutils glibc-repo curl file >/dev/null 2>&1 \
+    || die "pkg install failed"
+pkg install -y glibc >/dev/null 2>&1 || die "glibc install failed"
+ok "Prerequisites"
+
+# glibc-repo sometimes ships libc.so as a linker script. Turn it into a
+# symlink so both the compiler and the loader work.
+if [ -f "$GLIBC_LIB/libc.so" ] && [ ! -L "$GLIBC_LIB/libc.so" ]; then
+    mv "$GLIBC_LIB/libc.so" "$GLIBC_LIB/libc.so.script" 2>/dev/null || true
+fi
+[ -L "$GLIBC_LIB/libc.so" ] || \
+    ln -sf libc.so.6 "$GLIBC_LIB/libc.so" 2>/dev/null || true
+
+# ── resolve version ─────────────────────────────────────────────────
+VERSION="${BIONILUX_VERSION:-}"
+if [ -z "$VERSION" ]; then
+    info "Resolving latest release"
+    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+              | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -n1) \
+              || die "Could not query GitHub API"
+fi
+case "$VERSION" in v*) ;; *) VERSION="v$VERSION" ;; esac
+BASE="https://github.com/$REPO/releases/download/$VERSION"
+ok "Version $VERSION"
+
+# ── download and install ────────────────────────────────────────────
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+
+fetch() {
+    info "Downloading $1"
+    curl -fSL --progress-bar -o "$1" "$BASE/$1" \
+        || die "Download failed: $1"
+}
+
+fetch bionilux
+fetch libbionilux_preload.so
+fetch box64-glibc
+fetch x86_64-libs.tar.xz
+
+install -m755 bionilux               "$BIN_DIR/bionilux"
+install -m755 libbionilux_preload.so "$GLIBC_LIB/libbionilux_preload.so"
+
+mkdir -p "$BOX64_DIR"
+install -m755 box64-glibc "$BOX64_DIR/box64-glibc"
+
+mkdir -p "$X86_DIR"
+tar -xf x86_64-libs.tar.xz -C "$X86_DIR" \
+    || die "Failed to extract x86_64 libs"
+
+ok "bionilux     → $BIN_DIR/bionilux"
+ok "preload      → $GLIBC_LIB/libbionilux_preload.so"
+ok "box64-glibc  → $BOX64_DIR/box64-glibc"
+ok "x86_64 libs  → $X86_DIR"
+
+printf "\n${G}bionilux $VERSION installed${N}\n\n"
+printf "  bionilux <binary> [args...]     run a binary\n"
+printf "  BIONILUX_DEBUG=1 bionilux ...   verbose output\n\n"
