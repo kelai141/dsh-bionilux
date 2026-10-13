@@ -17,7 +17,7 @@ box64-glibc, and x86_64 runtime libs all come from our own releases.
 curl -fsSL theonuverse.github.io/bionilux/setup | bash
 ```
 
-Pin a version with `BIONILUX_VERSION=v0.4.1`. Uninstall:
+Pin a version with `BIONILUX_VERSION=v0.4.2`. Uninstall:
 
 ```bash
 rm -f "$PREFIX/bin/bionilux" "$PREFIX/glibc/lib/libbionilux_preload.so"
