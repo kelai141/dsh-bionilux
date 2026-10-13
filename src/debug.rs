@@ -1,14 +1,17 @@
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-static ENABLED: OnceLock<bool> = OnceLock::new();
+static ENABLED: AtomicBool = AtomicBool::new(false);
 
-// Empty BIONILUX_DEBUG= disables debug output.
+// Called once from main with the --debug flag. Empty BIONILUX_DEBUG= disables.
+pub fn init(force: bool) {
+    let from_env = std::env::var_os("BIONILUX_DEBUG")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    ENABLED.store(force || from_env, Ordering::Relaxed);
+}
+
 pub fn enabled() -> bool {
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("BIONILUX_DEBUG")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-    })
+    ENABLED.load(Ordering::Relaxed)
 }
 
 #[macro_export]
