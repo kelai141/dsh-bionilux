@@ -23,7 +23,10 @@ pub fn build_target_env(
             };
             vars.insert("LD_PRELOAD".into(), merged);
             vars.insert("BIONILUX_TARGET_EXE".into(), target.display().to_string());
-            vars.insert("BIONILUX_BINARY_PATH".into(), launcher.display().to_string());
+            vars.insert(
+                "BIONILUX_BINARY_PATH".into(),
+                launcher.display().to_string(),
+            );
         }
         None => {
             vars.remove("LD_PRELOAD");

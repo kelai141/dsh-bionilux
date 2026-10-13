@@ -87,7 +87,7 @@ jobs:
           path: bionilux
 
   # ── box64: native ARM64 runner ─────────────────────────────────
-  box64:
+    box64:
     name: box64-glibc
     runs-on: ubuntu-24.04-arm
     steps:
@@ -98,8 +98,7 @@ jobs:
 
       - name: clone and build
         run: |
-          git clone --depth 1 --branch v0.4.5 \
-            https://github.com/ptitSeb/box64 /tmp/box64
+          git clone --depth 1 https://github.com/ptitSeb/box64 /tmp/box64
           cd /tmp/box64
           mkdir build && cd build
           cmake .. -DARM64=1 -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -113,46 +112,27 @@ jobs:
           path: box64-glibc
 
   # ── x86_64 runtime libs from debian trixie ─────────────────────
-  x86-libs:
+    x86-libs:
     name: x86_64 runtime libs
     runs-on: ubuntu-latest
-    container: debian:trixie-slim
     steps:
-      - name: install dpkg tools
-        run: |
-          apt-get update
-          apt-get install -y dpkg-dev xz-utils
-
-      - name: download packages
+      - name: fetch ubuntu 26.04 base rootfs (amd64)
         run: |
           set -eux
-          mkdir -p root && cd root
-          apt-get download \
-            libc6 libgcc-s1 libstdc++6 \
-            zlib1g libbz2-1.0 liblzma5 libzstd1 \
-            libssl3t64 libcrypt1 \
-            libbsd0 libmd0 \
-            libtinfo6 libncurses6 libncursesw6 \
-            libgpg-error0 libgcrypt20 libgmp10 \
-            libpcre2-8-0 libseccomp2 libselinux1 \
-            libuuid1 libblkid1 libmount1 \
-            libsystemd0 libudev1 \
-            libacl1 libattr1 libcap-ng0 \
-            libcom-err2 libext2fs2 libss2 libe2p2 \
-            libaudit1 libpam0g \
-            libnsl2 libtirpc3 \
-            libkeyutils1 libkrb5-3 libk5crypto3 libkrb5support0 \
-            libidn2-0 libunistring5 libffi8 \
-            libcbor0.10 libfido2-1
-          for d in *.deb; do dpkg-deb -x "$d" .; done
-          rm -f *.deb
+          curl -fLO http://cdimage.ubuntu.com/ubuntu-base/resolute/daily/current/resolute-base-amd64.tar.gz
+          mkdir rootfs
+          tar -xzf resolute-base-amd64.tar.gz -C rootfs
 
       - name: package
         run: |
-          cd root
-          tar -cJf ../x86_64-libs.tar.xz \
-            lib/x86_64-linux-gnu \
-            usr/lib/x86_64-linux-gnu
+          set -eux
+          mkdir -p out/lib/x86_64-linux-gnu
+          cp -a rootfs/lib/x86_64-linux-gnu/. out/lib/x86_64-linux-gnu/
+          if [ -d rootfs/usr/lib/x86_64-linux-gnu ]; then
+            cp -an rootfs/usr/lib/x86_64-linux-gnu/. out/lib/x86_64-linux-gnu/
+          fi
+          cd out
+          tar -cJf ../x86_64-libs.tar.xz lib
 
       - uses: actions/upload-artifact@v4
         with:
@@ -164,7 +144,7 @@ jobs:
     name: release
     needs: [preload, bionilux, box64, x86-libs]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, 'rc')
     permissions:
       contents: write
     steps:

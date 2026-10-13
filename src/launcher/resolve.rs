@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::analyzer::elf::{self, Libc, EM_AARCH64, EM_X86_64};
+use crate::analyzer::elf::{self, EM_AARCH64, EM_X86_64, Libc};
 use crate::debug;
 
 const GLIBC_DIR: &str = "/data/data/com.termux/files/usr/glibc";
@@ -164,8 +164,8 @@ fn script(script: &Path, args: &[String], depth: u32) -> Result<Execution, Error
         return Err(Error::Unsupported("shebang recursion too deep".into()));
     }
 
-    let (interp, interp_arg) = parse_shebang(script)
-        .ok_or_else(|| Error::Unsupported("not ELF or shebang".into()))?;
+    let (interp, interp_arg) =
+        parse_shebang(script).ok_or_else(|| Error::Unsupported("not ELF or shebang".into()))?;
 
     let interp = rewrite_termux(&interp);
 
@@ -174,11 +174,9 @@ fn script(script: &Path, args: &[String], depth: u32) -> Result<Execution, Error
     // `-S` variant splits remaining words as separate arguments.
     let (interp, interp_args): (String, Option<Vec<String>>) =
         if Path::new(&interp).file_name() == Some("env".as_ref()) {
-            let arg = interp_arg.ok_or_else(|| {
-                Error::Unsupported("env shebang without program".into())
-            })?;
-            let mut words: Vec<String> =
-                arg.split_whitespace().map(String::from).collect();
+            let arg = interp_arg
+                .ok_or_else(|| Error::Unsupported("env shebang without program".into()))?;
+            let mut words: Vec<String> = arg.split_whitespace().map(String::from).collect();
             if words.is_empty() {
                 return Err(Error::Unsupported("env shebang without program".into()));
             }
@@ -240,11 +238,18 @@ fn parse_shebang(path: &Path) -> Option<(String, Option<String>)> {
         return None;
     }
     // Stop at the first newline so non-UTF-8 bytes later in the file don't fail.
-    let end = buf[2..n].iter().position(|&b| b == b'\n').map_or(n, |i| i + 2);
+    let end = buf[2..n]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(n, |i| i + 2);
     let line = std::str::from_utf8(&buf[2..end]).ok()?.trim();
     let mut parts = line.splitn(2, char::is_whitespace);
     let interp = parts.next()?.to_string();
-    let arg = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let arg = parts
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     Some((interp, arg))
 }
 
@@ -263,7 +268,10 @@ mod tests {
 
     #[test]
     fn rewrite_usr_bin_prefix() {
-        assert_eq!(rewrite_termux("/usr/bin/python3"), format!("{TERMUX_BIN}python3"));
+        assert_eq!(
+            rewrite_termux("/usr/bin/python3"),
+            format!("{TERMUX_BIN}python3")
+        );
     }
 
     #[test]
@@ -341,7 +349,9 @@ mod tests {
 
     #[test]
     fn find_loader_falls_back_to_glibc_dir() {
-        let fallback = Path::new(GLIBC_DIR).join("lib").join("ld-linux-aarch64.so.1");
+        let fallback = Path::new(GLIBC_DIR)
+            .join("lib")
+            .join("ld-linux-aarch64.so.1");
         let result = find_loader(LOADER);
         if fallback.exists() {
             assert_eq!(result.as_deref(), Some(fallback.as_path()));
