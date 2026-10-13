@@ -70,11 +70,14 @@ fn main() {
         execution.is_x86_64,
     );
 
-    launcher::exec::execute(
+    if let Err(e) = launcher::exec::execute(
         &execution.exec_target,
         execution.loader.as_deref(),
         &execution.argv,
         &target_env,
         chdir_to,
-    );
+    ) {
+        eprintln!("error: {e}");
+        exit(1);
+    }
 }

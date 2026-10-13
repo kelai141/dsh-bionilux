@@ -26,7 +26,7 @@ rm -rf "$PREFIX/bionilux"
 
 ## Build from source
 
-Requires Termux with `glibc-repo`, `glibc`, `clang`, and `cargo`.
+Requires Termux with `glibc-repo`, `glibc`, `clang`, `rust` and `git`.
 
 ```bash
 git clone https://github.com/theonuverse/bionilux
@@ -51,6 +51,35 @@ Install what you just built:
 install -m755 target/release/bionilux "$PREFIX/bin/bionilux"
 install -m755 libbionilux_preload.so "$GLIBC/lib/"
 ```
+
+## x86_64 support (optional)
+
+The launcher itself handles aarch64 glibc binaries. To also run x86_64
+binaries, you need two extra pieces: `box64-glibc` (the aarch64-glibc
+build of box64) and the x86_64 runtime libraries it loads.
+
+Fetch both from the latest release:
+
+```bash
+VERSION=$(curl -fsSL https://api.github.com/repos/theonuverse/bionilux/releases/latest \
+          | grep -oP '"tag_name":\s*"\K[^"]+')
+BASE="https://github.com/theonuverse/bionilux/releases/download/$VERSION"
+
+# box64-glibc
+mkdir -p "$PREFIX/bionilux"
+curl -fSL -o "$PREFIX/bionilux/box64-glibc" "$BASE/box64-glibc"
+chmod 755 "$PREFIX/bionilux/box64-glibc"
+
+# x86_64 runtime libraries
+cd /tmp
+curl -fSL -o x86_64-libs.tar.xz "$BASE/x86_64-libs.tar.xz"
+rm -rf "$PREFIX/glibc/lib/x86_64-linux-gnu"
+tar -xf x86_64-libs.tar.xz -C "$PREFIX/glibc/lib"
+rm x86_64-libs.tar.xz
+```
+
+After that, `bionilux ./some_x86_64_binary` works transparently. The
+installer (`setup`) does all of the above automatically.
 
 ## Usage
 

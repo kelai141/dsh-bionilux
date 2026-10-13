@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 
-// Bionic-only preload entries that must not be forwarded into a glibc
-// process. Termux sets LD_PRELOAD to libtermux-exec-ld-preload.so by
-// default; the glibc loader rejects it with a version error.
 const BIONIC_PRELOAD_BLOCKLIST: &[&str] = &["libtermux-exec"];
+
+const TERMUX_CA_FILE: &str = "/data/data/com.termux/files/usr/etc/tls/cert.pem";
+const TERMUX_CA_DIR: &str = "/data/data/com.termux/files/usr/etc/tls/certs";
 
 fn filter_preload(entry_list: &str) -> Vec<String> {
     entry_list
@@ -16,7 +16,15 @@ fn filter_preload(entry_list: &str) -> Vec<String> {
         .collect()
 }
 
-// Never set LD_PRELOAD="" — box64 crashes on empty values (strlen(NULL)).
+fn setup_tls(vars: &mut HashMap<String, String>) {
+    if !vars.contains_key("SSL_CERT_FILE") && Path::new(TERMUX_CA_FILE).exists() {
+        vars.insert("SSL_CERT_FILE".into(), TERMUX_CA_FILE.into());
+    }
+    if !vars.contains_key("SSL_CERT_DIR") && Path::new(TERMUX_CA_DIR).exists() {
+        vars.insert("SSL_CERT_DIR".into(), TERMUX_CA_DIR.into());
+    }
+}
+
 pub fn build_target_env(
     preload: Option<&str>,
     target: &Path,
@@ -27,9 +35,6 @@ pub fn build_target_env(
 
     vars.remove("BIONILUX_TARGET_EXE");
     vars.remove("BIONILUX_BINARY_PATH");
-
-    // glibc-specific debugging hooks must not leak into bionic land,
-    // and bionic hooks must not leak into glibc land.
     vars.remove("LD_AUDIT");
     vars.remove("LD_DEBUG");
 
@@ -45,6 +50,8 @@ pub fn build_target_env(
                 "BIONILUX_BINARY_PATH".into(),
                 launcher.display().to_string(),
             );
+
+            setup_tls(&mut vars);
         }
         None => {
             vars.remove("LD_PRELOAD");

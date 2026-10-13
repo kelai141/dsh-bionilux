@@ -3,15 +3,34 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::analyzer::elf::{self, EM_AARCH64, EM_X86_64, Libc};
 use crate::debug;
 
-const GLIBC_DIR: &str = "/data/data/com.termux/files/usr/glibc";
-const BOX64: &str = "/data/data/com.termux/files/usr/bionilux/box64-glibc";
-const LOADER: &str = "/lib/ld-linux-aarch64.so.1";
-const TERMUX_BIN: &str = "/data/data/com.termux/files/usr/bin/";
+const DEFAULT_PREFIX: &str = "/data/data/com.termux/files/usr";
 const MAX_SHEBANG_DEPTH: u32 = 4;
+
+fn prefix() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| env::var("PREFIX").unwrap_or_else(|_| DEFAULT_PREFIX.into()))
+}
+
+fn glibc_dir() -> PathBuf {
+    PathBuf::from(prefix()).join("glibc")
+}
+
+fn box64_path() -> PathBuf {
+    PathBuf::from(prefix()).join("bionilux/box64-glibc")
+}
+
+fn termux_bin() -> PathBuf {
+    PathBuf::from(prefix()).join("bin")
+}
+
+fn default_loader() -> PathBuf {
+    glibc_dir().join("lib/ld-linux-aarch64.so.1")
+}
 
 pub struct Execution {
     pub exec_target: PathBuf,
@@ -43,7 +62,7 @@ impl fmt::Display for Error {
         match self {
             Error::NotFound(n) => write!(f, "command not found: {n}"),
             Error::NoPreload => write!(f, "libbionilux_preload.so not found"),
-            Error::NoBox64 => write!(f, "box64 not found at {BOX64}"),
+            Error::NoBox64 => write!(f, "box64 not found at {}", box64_path().display()),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
         }
     }
@@ -90,13 +109,16 @@ fn resolve_at(raw: &str, args: &[String], depth: u32) -> Result<Execution, Error
 
     // Needs the glibc loader; x86_64 also needs box64 in front.
     let (exec_target, argv) = if is_x86 {
-        let box64 = PathBuf::from(BOX64);
+        let box64 = box64_path();
         if !box64.exists() {
             return Err(Error::NoBox64);
         }
         debug!("x86_64 glibc -> box64");
         // argv[0] must be box64's full path — box64 uses it to find itself.
-        let mut v = vec![BOX64.to_string(), target.display().to_string()];
+        let mut v = vec![
+            box64.to_string_lossy().into_owned(),
+            target.display().to_string(),
+        ];
         v.extend(args.iter().skip(1).cloned());
         (box64, v)
     } else {
@@ -105,9 +127,11 @@ fn resolve_at(raw: &str, args: &[String], depth: u32) -> Result<Execution, Error
     };
 
     let interp = if is_x86 {
-        LOADER.to_string()
+        default_loader().to_string_lossy().into_owned()
     } else {
-        info.interpreter.clone().unwrap_or(LOADER.into())
+        info.interpreter
+            .clone()
+            .unwrap_or_else(|| default_loader().to_string_lossy().into_owned())
     };
     let loader = find_loader(&interp)
         .ok_or_else(|| Error::Unsupported(format!("loader {interp} missing")))?;
@@ -130,7 +154,7 @@ fn find_loader(interp: &str) -> Option<PathBuf> {
         return Some(p);
     }
     let name = p.file_name()?;
-    let alt = Path::new(GLIBC_DIR).join("lib").join(name);
+    let alt = glibc_dir().join("lib").join(name);
     alt.exists().then_some(alt)
 }
 
@@ -154,7 +178,7 @@ fn find_preload() -> Option<PathBuf> {
         }
     }
     // Installed alongside glibc.
-    let p = Path::new(GLIBC_DIR).join("lib/libbionilux_preload.so");
+    let p = glibc_dir().join("lib/libbionilux_preload.so");
     p.exists().then_some(p)
 }
 
@@ -222,9 +246,10 @@ fn script(script: &Path, args: &[String], depth: u32) -> Result<Execution, Error
 
 // Termux has no /bin or /usr/bin.
 fn rewrite_termux(p: &str) -> String {
+    let bin = termux_bin();
     for prefix in ["/bin/", "/usr/bin/"] {
         if let Some(rest) = p.strip_prefix(prefix) {
-            return format!("{TERMUX_BIN}{rest}");
+            return format!("{}/{}", bin.display(), rest);
         }
     }
     p.to_string()
@@ -263,14 +288,14 @@ mod tests {
 
     #[test]
     fn rewrite_bin_prefix() {
-        assert_eq!(rewrite_termux("/bin/sh"), format!("{TERMUX_BIN}sh"));
+        assert_eq!(rewrite_termux("/bin/sh"), format!("{}/bin/sh", prefix()));
     }
 
     #[test]
     fn rewrite_usr_bin_prefix() {
         assert_eq!(
             rewrite_termux("/usr/bin/python3"),
-            format!("{TERMUX_BIN}python3")
+            format!("{}/bin/python3", prefix())
         );
     }
 
@@ -349,10 +374,9 @@ mod tests {
 
     #[test]
     fn find_loader_falls_back_to_glibc_dir() {
-        let fallback = Path::new(GLIBC_DIR)
-            .join("lib")
-            .join("ld-linux-aarch64.so.1");
-        let result = find_loader(LOADER);
+        let loader = default_loader();
+        let fallback = glibc_dir().join("lib").join("ld-linux-aarch64.so.1");
+        let result = find_loader(&loader.to_string_lossy());
         if fallback.exists() {
             assert_eq!(result.as_deref(), Some(fallback.as_path()));
         } else {
