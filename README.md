@@ -14,7 +14,7 @@ Prebuilt binaries from the latest GitHub release. Launcher, preload,
 box64-glibc, and x86_64 runtime libs all come from our own releases.
 
 ```bash
-curl -fsSL theonuverse.github.io/setup | bash
+curl -fsSL theonuverse.github.io/bionilux/setup | bash
 ```
 
 Pin a version with `BIONILUX_VERSION=v0.4.0`. Uninstall:
