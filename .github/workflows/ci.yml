@@ -121,13 +121,13 @@ jobs:
       - name: package
         run: |
           set -eux
-          mkdir -p out/lib/x86_64-linux-gnu
-          cp -a rootfs/lib/x86_64-linux-gnu/. out/lib/x86_64-linux-gnu/
+          mkdir -p out/x86_64-linux-gnu
+          cp -a rootfs/lib/x86_64-linux-gnu/. out/x86_64-linux-gnu/
           if [ -d rootfs/usr/lib/x86_64-linux-gnu ]; then
-            cp -an rootfs/usr/lib/x86_64-linux-gnu/. out/lib/x86_64-linux-gnu/
+            cp -an rootfs/usr/lib/x86_64-linux-gnu/. out/x86_64-linux-gnu/
           fi
           cd out
-          tar -cJf ../x86_64-libs.tar.xz lib
+          tar -cJf ../x86_64-libs.tar.xz x86_64-linux-gnu
 
       - uses: actions/upload-artifact@v4
         with:

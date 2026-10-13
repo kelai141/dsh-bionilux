@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # bionilux installer. Downloads everything from our own GitHub releases.
-# Pin a version with: BIONILUX_VERSION=v0.4.0 ./setup
+# Pin a version with: BIONILUX_VERSION=v0.4.1 ./setup
 set -eu
 
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
@@ -67,8 +67,11 @@ install -m755 libbionilux_preload.so "$GLIBC_LIB/libbionilux_preload.so"
 mkdir -p "$BOX64_DIR"
 install -m755 box64-glibc "$BOX64_DIR/box64-glibc"
 
-mkdir -p "$X86_DIR"
-tar -xf x86_64-libs.tar.xz -C "$X86_DIR" \
+# Wipe any previous x86_64 libs to avoid stale double-nested layouts from
+# older installs, then extract with the correct path.
+rm -rf "$X86_DIR"
+mkdir -p "$GLIBC_LIB"
+tar -xf x86_64-libs.tar.xz -C "$GLIBC_LIB" \
     || die "Failed to extract x86_64 libs"
 
 ok "bionilux     → $BIN_DIR/bionilux"
