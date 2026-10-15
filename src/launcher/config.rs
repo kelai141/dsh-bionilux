@@ -116,6 +116,8 @@ pub struct Config {
     pub guest_tmp: String,
     /// Guest working directory for the initial launch.
     pub guest_cwd: String,
+    /// One invocation's explicit argv[0], consumed before exporting the guest environment.
+    pub argv0: Option<String>,
     /// Whether to report uid/gid 0 and turn ownership changes into no-ops.
     /// Required for `apt`/`dpkg`, which refuse to run as a non-root user.
     pub fake_root: bool,
@@ -130,19 +132,27 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        let prefix = env_path("BIONILUX_PREFIX").or_else(|| {
-            env::var_os("PREFIX")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        });
+    pub fn from_env() -> Result<Self, String> {
+        let cwd = env::current_dir().map_err(|e| format!("cannot read working directory: {e}"))?;
+        let host_path = |path| anchor_path(&cwd, path);
+        let prefix = env_path("BIONILUX_PREFIX")
+            .or_else(|| {
+                env::var_os("PREFIX")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            })
+            .map(host_path);
 
-        let runtime_dir =
-            env_path("BIONILUX_RUNTIME_DIR").or_else(|| prefix.as_ref().map(|p| p.join("glibc")));
+        let runtime_dir = env_path("BIONILUX_RUNTIME_DIR")
+            .map(host_path)
+            .or_else(|| prefix.as_ref().map(|p| p.join("glibc")));
 
-        let rootfs = env_path("BIONILUX_ROOTFS").filter(|p| p.is_dir());
+        let rootfs = env_path("BIONILUX_ROOTFS")
+            .map(|path| validate_rootfs(&cwd, path))
+            .transpose()?;
 
         let box64 = env_path("BIONILUX_BOX64")
+            .map(host_path)
             .or_else(|| prefix.as_ref().map(|p| p.join("bionilux/box64-glibc")))
             .or_else(|| {
                 runtime_dir
@@ -157,28 +167,60 @@ impl Config {
         let mut host_paths = default_host_paths(prefix.as_deref());
         if let Some(extra) = env_str(env_keys::HOST_PATHS) {
             for p in extra.split(':').filter(|s| !s.is_empty()) {
-                host_paths.push(PathBuf::from(p));
+                host_paths.push(host_path(PathBuf::from(p)));
             }
         }
 
-        Config {
+        let guest_path = if is_rerouted() {
+            env::var("PATH").ok()
+        } else {
+            env::var(env_keys::GUEST_PATH).ok()
+        }
+        .map(|s| split_path_list(&s))
+        .unwrap_or_else(|| split_path_list(GUEST_PATH_DEFAULT));
+
+        Ok(Config {
             prefix,
             runtime_dir,
             rootfs,
             box64,
-            preload: env_path(env_keys::PRELOAD),
-            loader: env_path(env_keys::LOADER),
-            guest_path: env_str("BIONILUX_GUEST_PATH")
-                .map(|s| split_path_list(&s))
-                .unwrap_or_else(|| split_path_list(GUEST_PATH_DEFAULT)),
+            preload: env_path(env_keys::PRELOAD).map(host_path),
+            loader: env_path(env_keys::LOADER).map(host_path),
+            guest_path,
             guest_home: env_str("BIONILUX_GUEST_HOME").unwrap_or_else(|| GUEST_HOME_DEFAULT.into()),
             guest_tmp: env_str("BIONILUX_GUEST_TMP").unwrap_or_else(|| GUEST_TMP_DEFAULT.into()),
             guest_cwd: env_str("BIONILUX_GUEST_CWD").unwrap_or_else(|| GUEST_CWD_DEFAULT.into()),
+            argv0: env::var(env_keys::INTERNAL_ARGV0).ok(),
             fake_root,
             lenient: env_bool("BIONILUX_LENIENT").unwrap_or(false),
             host_paths,
-        }
+        })
     }
+}
+
+fn anchor_path(cwd: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn validate_rootfs(cwd: &Path, path: PathBuf) -> Result<PathBuf, String> {
+    let path = anchor_path(cwd, path);
+    let root = path
+        .canonicalize()
+        .map_err(|e| format!("invalid rootfs {}: {e}", path.display()))?;
+    if !root.is_dir() {
+        return Err(format!("rootfs is not a directory: {}", path.display()));
+    }
+    Ok(root)
+}
+
+/// The inherited launcher identity is retained by the preload's reroute path.
+/// It distinguishes an existing guest environment from initial host entry.
+pub fn is_rerouted() -> bool {
+    env::var_os(env_keys::BINARY_PATH).is_some()
 }
 
 /// The host application's own private directory.
@@ -220,18 +262,21 @@ fn default_host_paths(prefix: Option<&Path>) -> Vec<PathBuf> {
 
 /// Process-wide configuration. Read once so the environment cannot shift
 /// under a running resolution.
-pub fn config() -> &'static Config {
-    static CACHE: OnceLock<Config> = OnceLock::new();
-    CACHE.get_or_init(Config::from_env)
+pub fn try_config() -> Result<&'static Config, &'static str> {
+    static CACHE: OnceLock<Result<Config, String>> = OnceLock::new();
+    CACHE
+        .get_or_init(Config::from_env)
+        .as_ref()
+        .map_err(String::as_str)
 }
 
-/// Split a `PATH`-style list, dropping empty entries.
+pub fn config() -> &'static Config {
+    try_config().expect("configuration must be validated before target resolution")
+}
+
+/// Split a `PATH`-style list, preserving current-directory entries.
 pub fn split_path_list(value: &str) -> Vec<String> {
-    value
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
+    value.split(':').map(String::from).collect()
 }
 
 /// Join a guest directory and a relative name, avoiding a doubled slash.
@@ -291,6 +336,8 @@ pub mod env_keys {
     pub const LENIENT: &str = "BIONILUX_LENIENT";
     pub const BINARY_PATH: &str = "BIONILUX_BINARY_PATH";
     pub const TARGET_EXE: &str = "BIONILUX_TARGET_EXE";
+    pub const INTERNAL_ARGV0: &str = "BIONILUX_INTERNAL_ARGV0";
+    pub const INTERNAL_PRELOAD: &str = "BIONILUX_INTERNAL_PRELOAD";
 }
 
 /// Names stripped from the guest environment.
@@ -321,9 +368,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_path_list_drops_empty_entries() {
-        assert_eq!(split_path_list("/a::/b:"), vec!["/a", "/b"]);
-        assert!(split_path_list("").is_empty());
+    fn split_path_list_preserves_current_directory_entries() {
+        assert_eq!(split_path_list("/a::/b:"), vec!["/a", "", "/b", ""]);
+        assert_eq!(split_path_list(""), vec![""]);
+    }
+
+    #[test]
+    fn relative_host_configuration_is_anchored_to_invocation_cwd() {
+        assert_eq!(
+            anchor_path(Path::new("/app"), PathBuf::from("runtime/lib/loader")),
+            PathBuf::from("/app/runtime/lib/loader")
+        );
+        assert_eq!(
+            anchor_path(Path::new("/app"), PathBuf::from("/other/loader")),
+            PathBuf::from("/other/loader")
+        );
+    }
+
+    #[test]
+    fn configured_rootfs_must_exist_and_be_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(validate_rootfs(dir.path(), PathBuf::from("missing")).is_err());
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        assert!(validate_rootfs(dir.path(), PathBuf::from("file")).is_err());
+        std::fs::create_dir(dir.path().join("rootfs")).unwrap();
+        let root = validate_rootfs(dir.path(), PathBuf::from("rootfs/.")).unwrap();
+        assert!(root.is_absolute());
+        assert_eq!(root, dir.path().join("rootfs").canonicalize().unwrap());
     }
 
     #[test]

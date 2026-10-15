@@ -77,7 +77,7 @@ dsh-mobile-apk (Android app, Bionic)
 |--------|------|
 | **Cordis 只管接入** | 插件负责能力接入与生命周期，不参与路径语义 |
 | **后端可替换** | 换 backend 不改变 `linux_bash` 的接口与快照格式 |
-| **DSH 数据隔离** | guest 不可见 DSH Core 数据；只有用户显式选择的目录可映射进 guest |
+| **DSH 数据边界** | 默认直通路径包含推导出的 App 私有目录；集成方须审查 HOST_PATHS，不能把 rootfs 当作 DSH Core 数据的安全隔离边界 |
 | **失败不降级** | 健康检查失败时不注册 `linux_bash`，也不破坏已有 PRoot 环境 |
 | **不混用编译链** | Bionic 与 glibc 的工具链不混用；launcher 用 bionic 编译，preload 用 glibc 编译 |
 

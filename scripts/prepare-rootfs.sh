@@ -11,9 +11,9 @@
 #     point inside the rootfs keeps resolution where it belongs. Relative links
 #     need no work: they already resolve inside the guest.
 #
-#  2. Name resolution. Android has no /etc/resolv.conf, and its network stack
-#     does not let a guest use raw DNS, so the resolver configuration has to be
-#     supplied from outside. This script only writes what it is told to; the
+#  2. Name resolution. Android has no standard /etc/resolv.conf, so the guest's
+#     resolver configuration must be supplied from outside. DNS reachability
+#     depends on the device and network. This script only writes what it is told to; the
 #     DSH plugin is responsible for learning the device's DNS servers and
 #     passing them here.
 #
@@ -38,8 +38,10 @@ VERIFY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --rootfs)          ROOTFS="$2"; shift 2 ;;
-        --dns)             DNS="$2"; shift 2 ;;
+        --rootfs|--dns)
+            [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 requires a value" >&2; exit 2; }
+            case "$1" in --rootfs) ROOTFS="$2" ;; --dns) DNS="$2" ;; esac
+            shift 2 ;;
         --relative-links)  MODE=relative; shift ;;
         --dry-run)         DRY=1; shift ;;
         --verify)          VERIFY=1; shift ;;
@@ -51,81 +53,68 @@ done
 [ -n "$ROOTFS" ] || { echo "--rootfs is required" >&2; exit 2; }
 [ -d "$ROOTFS" ] || { echo "not a directory: $ROOTFS" >&2; exit 2; }
 
-# An absolute path is required: rewritten link targets must be absolute, and a
-# relative --rootfs argument would produce nonsense.
-ROOTFS="$(cd "$ROOTFS" && pwd)"
+[ "$DRY$VERIFY" != 11 ] || { echo "--dry-run and --verify are mutually exclusive" >&2; exit 2; }
+ROOTFS="$(cd "$ROOTFS" && pwd -P)"
+[ "$ROOTFS" != / ] || { echo "refusing to prepare the host root /" >&2; exit 2; }
 ROOTFS="${ROOTFS%/}"
 
-# Count absolute links that still point outside the rootfs.
-count_external_links() {
-    find "$ROOTFS" -type l 2>/dev/null | while IFS= read -r l; do
-        t=$(readlink "$l" 2>/dev/null) || continue
-        case "$t" in
-            /*) case "$t" in "$ROOTFS"/*) ;; *) echo "$l" ;; esac ;;
+# Capture find's status before entering a pipeline: unreadable trees must fail.
+links=$(find "$ROOTFS" -type l) || exit 1
+count_pending_links() {
+    printf '%s\n' "$links" | while IFS= read -r link; do
+        [ -n "$link" ] || continue
+        target=$(readlink "$link") || exit 1
+        case "$target" in
+            "$ROOTFS"|"$ROOTFS"/*) [ "$MODE" != relative ] || echo "$link" ;;
+            /*) echo "$link" ;;
         esac
     done | wc -l
 }
 
-# ── 1. absolute symlinks ────────────────────────────────────────────
 echo "== absolute symlinks under $ROOTFS"
-before=$(count_external_links)
-
-if [ "$before" -gt 0 ] && [ "$VERIFY" = 1 ]; then
-    echo "NEEDS-FIX $before absolute link(s) point outside the rootfs:"
-    find "$ROOTFS" -type l 2>/dev/null | while IFS= read -r l; do
-        t=$(readlink "$l" 2>/dev/null) || continue
-        case "$t" in
-            /*) case "$t" in "$ROOTFS"/*) ;; *) echo "  ${l#"$ROOTFS"} -> $t" ;; esac ;;
-        esac
-    done | head -10
-    exit 1
-fi
-
-if [ "$DRY" = 1 ]; then
+before=$(count_pending_links)
+if [ "$VERIFY" = 1 ]; then
+    [ "$before" -eq 0 ] || { echo "NEEDS-FIX $before absolute link(s) need rewriting"; exit 1; }
+elif [ "$DRY" = 1 ]; then
     echo "would rewrite $before absolute link(s) (mode: $MODE)"
 else
-    fixed=0
-    find "$ROOTFS" -type l 2>/dev/null | while IFS= read -r link; do
-        target=$(readlink "$link" 2>/dev/null) || continue
+    printf '%s\n' "$links" | while IFS= read -r link; do
+        [ -n "$link" ] || continue
+        target=$(readlink "$link") || exit 1
+        case "$target" in /*) ;; *) continue ;; esac
         case "$target" in
-            /*) ;;
-            *) continue ;;
+            "$ROOTFS") guest_target=/ ;;
+            "$ROOTFS"/*) guest_target="${target#"$ROOTFS"}" ;;
+            *) guest_target="$target" ;;
         esac
-        case "$target" in
-            "$ROOTFS"/*) continue ;;
-        esac
-
         if [ "$MODE" = relative ]; then
-            # Walk up from the link's directory to the common ancestor, then
-            # down to the target.
-            link_rel=$(dirname "${link#"$ROOTFS"}")
-            up=$(printf '%s' "$link_rel" | tr -cd '/' | wc -c)
-            # dirname gives /a/b for a/b/c, so the depth equals the slash count.
+            directory=$(dirname "${link#"$ROOTFS"/}")
             prefix=""
-            i=0
-            while [ "$i" -lt "$up" ]; do prefix="$prefix../"; i=$((i + 1)); done
-            new_target="$prefix${target#/}"
+            while [ "$directory" != . ]; do
+                prefix="../$prefix"
+                directory=$(dirname "$directory")
+            done
+            new_target="$prefix${guest_target#/}"
+            [ -n "$new_target" ] || new_target=.
         else
-            new_target="$ROOTFS$target"
+            new_target="$ROOTFS$guest_target"
         fi
-
-        ln -sfn "$new_target" "$link" \
-            && fixed=$((fixed + 1)) \
-            || echo "WARN: could not rewrite $link" >&2
+        [ "$target" != "$new_target" ] || continue
+        ln -sfn "$new_target" "$link" || exit 1
     done
-    after=$(count_external_links)
-    echo "rewrote $((before - after)) link(s); external links now: $after"
+    after=$(count_pending_links)
+    [ "$after" -eq 0 ] || { echo "NEEDS-FIX $after link(s) still need rewriting" >&2; exit 1; }
+    echo "rewrote $before link(s); pending links now: $after"
 fi
 
 # ── 2. resolver configuration ───────────────────────────────────────
 if [ -n "$DNS" ]; then
     if [ "$VERIFY" = 1 ]; then
-        current=$(cat "$ROOTFS/etc/resolv.conf" 2>/dev/null || true)
         for ns in $DNS; do
-            case "$current" in
-                *"$ns"*) ;;
-                *) echo "NEEDS-FIX /etc/resolv.conf is missing nameserver $ns"; exit 1 ;;
-            esac
+            awk -v ns="$ns" '$1 == "nameserver" && $2 == ns { found=1 } END { exit !found }' \
+                "$ROOTFS/etc/resolv.conf" || {
+                echo "NEEDS-FIX /etc/resolv.conf is missing nameserver $ns"; exit 1;
+            }
         done
         echo "/etc/resolv.conf ok"
     elif [ "$DRY" = 1 ]; then
@@ -134,8 +123,7 @@ if [ -n "$DNS" ]; then
         mkdir -p "$ROOTFS/etc"
         {
             echo "# Written by bionilux prepare-rootfs.sh."
-            echo "# Android has no /etc/resolv.conf and does not let a guest use"
-            echo "# raw DNS, so these servers are supplied by the host application."
+            echo "# DNS servers supplied by the host application."
             for ns in $DNS; do echo "nameserver $ns"; done
         } > "$ROOTFS/etc/resolv.conf"
         echo "wrote /etc/resolv.conf: $(echo "$DNS" | tr ' ' ',')"
@@ -149,10 +137,21 @@ for d in tmp var/tmp proc sys dev dev/shm root; do
     elif [ "$VERIFY" = 1 ]; then
         [ -d "$ROOTFS/$d" ] || { echo "NEEDS-FIX /$d missing"; exit 1; }
     else
-        mkdir -p "$ROOTFS/$d" 2>/dev/null || true
+        mkdir -p "$ROOTFS/$d"
     fi
 done
-chmod 1777 "$ROOTFS/tmp" 2>/dev/null || true
-chmod 1777 "$ROOTFS/var/tmp" 2>/dev/null || true
+for d in tmp var/tmp; do
+    if [ "$VERIFY" = 1 ]; then
+        [ "$(stat -c %a "$ROOTFS/$d")" = 1777 ] || {
+            echo "NEEDS-FIX /$d must have mode 1777"; exit 1;
+        }
+    elif [ "$DRY" = 1 ]; then
+        if [ ! -d "$ROOTFS/$d" ] || [ "$(stat -c %a "$ROOTFS/$d")" != 1777 ]; then
+            echo "would set /$d mode to 1777"
+        fi
+    else
+        chmod 1777 "$ROOTFS/$d"
+    fi
+done
 
 echo "done"

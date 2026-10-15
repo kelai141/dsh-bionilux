@@ -6,20 +6,30 @@
 # Termux and as a component of another Android app, whose user-space prefix is
 # derived from a different package name. Resolution order:
 #
-#   BIONILUX_INSTALL_ROOT > PREFIX > $HOME/.bionilux
-set -eu
+#   --root > BIONILUX_INSTALL_ROOT > PREFIX > $HOME/.bionilux
+set -euo pipefail
 
-# Explicit --root wins so a caller can install without relying on the
-# environment it happens to run in.
+HOST_PREFIX="${PREFIX:-}"
 INSTALL_ROOT="${BIONILUX_INSTALL_ROOT:-${PREFIX:-$HOME/.bionilux}}"
-
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root)
+            [ $# -ge 2 ] && [ -n "$2" ] || { echo "--root requires a directory" >&2; exit 2; }
+            INSTALL_ROOT="$2"; shift 2 ;;
+        -h|--help) echo "usage: setup [--root DIR]"; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+mkdir -p "$INSTALL_ROOT"
+INSTALL_ROOT="$(cd "$INSTALL_ROOT" && pwd -P)"
+[ "$INSTALL_ROOT" != / ] || { echo "refusing to install at /" >&2; exit 2; }
 PREFIX="$INSTALL_ROOT"
 GLIBC="$PREFIX/glibc"
 GLIBC_LIB="$GLIBC/lib"
 BIN_DIR="$PREFIX/bin"
 BOX64_DIR="$PREFIX/bionilux"
 X86_DIR="$GLIBC_LIB/x86_64-linux-gnu"
-REPO="${BIONILUX_REPO:-theonuverse/bionilux}"
+REPO="${BIONILUX_REPO:-kelai141/dsh-bionilux}"
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; N='\033[0m'
 ok()   { printf "${G}[ok]${N} %s\n" "$*"; }
@@ -31,7 +41,8 @@ die()  { printf "${R}[xx]${N} %s\n" "$*" >&2; exit 1; }
 # Package management only exists in a Termux-style environment. When bionilux
 # is installed as part of another app, the runtime is already present and this
 # step is a no-op.
-if command -v pkg >/dev/null 2>&1; then
+if command -v pkg >/dev/null 2>&1 && [ -n "$HOST_PREFIX" ] && \
+   [ "$PREFIX" = "$(cd "$HOST_PREFIX" && pwd -P)" ]; then
     info "Installing prerequisites"
     pkg update -y >/dev/null 2>&1 || warn "pkg update failed, continuing"
     pkg install -y binutils glibc-repo curl file >/dev/null 2>&1 \
@@ -47,7 +58,7 @@ if command -v pkg >/dev/null 2>&1; then
     [ -L "$GLIBC_LIB/libc.so" ] || \
         ln -sf libc.so.6 "$GLIBC_LIB/libc.so" 2>/dev/null || true
 else
-    info "No 'pkg' found: assuming the runtime is already installed under $PREFIX"
+    info "No matching pkg prefix: assuming the runtime is already installed under $PREFIX"
     [ -d "$GLIBC_LIB" ] || warn "$GLIBC_LIB does not exist yet"
 fi
 
@@ -55,10 +66,14 @@ fi
 VERSION="${BIONILUX_VERSION:-}"
 if [ -z "$VERSION" ]; then
     info "Resolving latest release"
-    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-              | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -n1) \
-              || die "Could not query GitHub API"
+    RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") \
+        || die "Could not query GitHub API"
+    VERSION=$(printf '%s\n' "$RELEASE_JSON" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | sed -n '1p')
 fi
+[ -n "$VERSION" ] || die "Release response contains no tag_name"
+case "$VERSION" in *[!a-zA-Z0-9._+-]*) die "Invalid release version: $VERSION" ;; esac
 case "$VERSION" in v*) ;; *) VERSION="v$VERSION" ;; esac
 BASE="https://github.com/$REPO/releases/download/$VERSION"
 ok "Version $VERSION"
@@ -96,7 +111,7 @@ ok "box64-glibc  → $BOX64_DIR/box64-glibc"
 ok "x86_64 libs  → $X86_DIR"
 
 printf "\n${G}bionilux $VERSION installed${N}\n\n"
-printf "  export BIONILUX_PREFIX=%s\n" "$PREFIX"
+printf "  export BIONILUX_PREFIX=%q\n" "$PREFIX"
 printf "  bionilux <binary> [args...]     run a binary\n"
 printf "  bionilux --rootfs DIR /bin/bash run a Debian rootfs\n"
 printf "  BIONILUX_DEBUG=1 bionilux ...   verbose output\n\n"

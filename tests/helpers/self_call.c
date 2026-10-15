@@ -1,6 +1,7 @@
 // Calls the bionilux launcher via execve/execvp/posix_spawn from a glibc
 // process. The launcher is bionic and must not inherit LD_PRELOAD, so this
 // catches missing strip logic. Prints "self-ok" if the launcher ran bash -c.
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,7 +49,14 @@ static void try_posix_spawn(void) {
         exit(1);
     }
     int status;
-    waitpid(pid, &status, 0);
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        perror("waitpid");
+        exit(1);
+    }
+    if (WIFEXITED(status)) exit(WEXITSTATUS(status));
+    if (WIFSIGNALED(status)) exit(128 + WTERMSIG(status));
+    exit(1);
 }
 
 int main(int argc, char **argv) {

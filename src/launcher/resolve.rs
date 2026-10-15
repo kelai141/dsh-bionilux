@@ -28,6 +28,8 @@ pub struct Execution {
     pub preload: Option<PathBuf>,
     /// Architecture of the *target*, not of the host.
     pub arch: Arch,
+    /// Architecture of the executable the kernel and its loader will run.
+    pub execution_arch: Arch,
     /// `VAR=VALUE` entries from an `env` shebang, applied to the guest env.
     pub env_overrides: Vec<(String, String)>,
 }
@@ -41,6 +43,7 @@ impl Execution {
 #[derive(Debug)]
 pub enum Error {
     NotFound(String),
+    PermissionDenied(String),
     NoPreload,
     NoBox64,
     NoLoader(String),
@@ -51,6 +54,7 @@ impl Error {
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::NotFound(_) => 127,
+            Error::PermissionDenied(_) => 126,
             _ => 1,
         }
     }
@@ -60,39 +64,92 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Error::NotFound(n) => write!(f, "command not found: {n}"),
+            Error::PermissionDenied(n) => write!(f, "permission denied: {n}"),
             Error::NoPreload => write!(
                 f,
                 "libbionilux_preload.so not found; set BIONILUX_PRELOAD or install it next to the launcher"
             ),
-            Error::NoBox64 => {
-                let hint = config()
-                    .box64
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "BIONILUX_BOX64".into());
-                write!(f, "box64 not found at {hint}")
-            }
+            Error::NoBox64 => write!(
+                f,
+                "box64 not found; set BIONILUX_BOX64 to a host glibc executable"
+            ),
             Error::NoLoader(i) => write!(f, "loader {i} not found"),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArchitecturePlan {
+    target: Arch,
+    execution: Arch,
+}
+
+fn architecture_plan(
+    target: Arch,
+    target_libc: Libc,
+    host: Arch,
+    box64: Option<&elf::ElfInfo>,
+) -> Result<ArchitecturePlan, Error> {
+    if target != host {
+        if target != Arch::X86_64 || host != Arch::Aarch64 || target_libc != Libc::Glibc {
+            return Err(Error::Unsupported(format!(
+                "cross-architecture {target:?} {target_libc:?} targets on {host:?}"
+            )));
+        }
+        let box64 = box64.ok_or(Error::NoBox64)?;
+        if Arch::from_machine(box64.machine) != Some(host) || box64.libc != Libc::Glibc {
+            return Err(Error::Unsupported(format!(
+                "box64 must be a {host:?} glibc ELF executable"
+            )));
+        }
+    }
+    Ok(ArchitecturePlan {
+        target,
+        execution: host,
+    })
+}
+
+fn execution_argv(target: &Path, args: &[String], box64: Option<&Path>) -> Vec<String> {
+    let Some(box64) = box64 else {
+        return args.to_vec();
+    };
+    let mut argv = vec![
+        box64.to_string_lossy().into_owned(),
+        target.to_string_lossy().into_owned(),
+    ];
+    argv.extend(args.iter().skip(1).cloned());
+    argv
+}
+
 /// Resolve `raw` plus its arguments into an execution plan.
 ///
 /// `guest_cwd` is the guest's logical working directory; relative targets and
 /// bare names are resolved against it.
-pub fn resolve(raw: &str, args: &[String], guest_cwd: &str) -> Result<Execution, Error> {
-    resolve_at(raw, args, guest_cwd, 0)
+pub fn resolve(
+    raw: &str,
+    args: &[String],
+    guest_cwd: &str,
+    inject_preload: bool,
+) -> Result<Execution, Error> {
+    resolve_at(raw, args, guest_cwd, 0, inject_preload)
 }
 
-fn resolve_at(raw: &str, args: &[String], guest_cwd: &str, depth: u32) -> Result<Execution, Error> {
-    let cfg = config();
+fn resolve_at(
+    raw: &str,
+    args: &[String],
+    guest_cwd: &str,
+    depth: u32,
+    inject_preload: bool,
+) -> Result<Execution, Error> {
     let target = resolve_target(raw, guest_cwd).ok_or_else(|| Error::NotFound(raw.into()))?;
     debug!("resolved: {}", target.display());
+    if !crate::launcher::rootfs::is_executable(&target) {
+        return Err(Error::PermissionDenied(raw.into()));
+    }
 
     let Some(info) = elf::analyze(&target) else {
-        return script(&target, args, guest_cwd, depth);
+        return script(&target, args, guest_cwd, depth, inject_preload);
     };
 
     if matches!(info.libc, Libc::Musl | Libc::Other) {
@@ -103,15 +160,27 @@ fn resolve_at(raw: &str, args: &[String], guest_cwd: &str, depth: u32) -> Result
         return Err(Error::Unsupported(format!("machine 0x{:x}", info.machine)));
     };
 
-    if matches!(info.libc, Libc::Bionic | Libc::Static) {
-        // A host-native binary runs as-is. A static binary for another
-        // architecture has no interpreter to redirect and no emulator.
-        if arch != Arch::host() {
-            return Err(Error::Unsupported(format!(
-                "static/foreign {arch:?} binary cannot run on a {:?} host",
-                Arch::host()
-            )));
+    let cfg = config();
+    let host = Arch::host();
+    let box64 = if arch == Arch::X86_64 && host == Arch::Aarch64 && info.libc == Libc::Glibc {
+        let path = cfg
+            .box64
+            .as_ref()
+            .filter(|p| p.exists())
+            .ok_or(Error::NoBox64)?;
+        if !crate::launcher::rootfs::is_executable(path) {
+            return Err(Error::PermissionDenied(path.display().to_string()));
         }
+        let info = elf::analyze(path)
+            .ok_or_else(|| Error::Unsupported("box64 is not an ELF executable".into()))?;
+        Some((path.clone(), info))
+    } else {
+        None
+    };
+    let architecture =
+        architecture_plan(arch, info.libc, host, box64.as_ref().map(|(_, info)| info))?;
+
+    if matches!(info.libc, Libc::Bionic | Libc::Static) {
         debug!("native");
         return Ok(Execution {
             exec_target: target.clone(),
@@ -119,50 +188,59 @@ fn resolve_at(raw: &str, args: &[String], guest_cwd: &str, depth: u32) -> Result
             argv: args.to_vec(),
             loader: None,
             preload: None,
-            arch,
+            arch: architecture.target,
+            execution_arch: architecture.execution,
             env_overrides: Vec::new(),
         });
     }
 
-    // A glibc ELF needs its loader; a foreign architecture also needs an
-    // emulator in front of it. box64 only works one way (x86_64 on aarch64).
-    let (exec_target, argv) = if arch == Arch::host() {
-        debug!("{arch:?} glibc -> native loader");
-        (target.clone(), args.to_vec())
+    let (exec_target, interp) = if let Some((path, box64_info)) = &box64 {
+        debug!(
+            "{arch:?} glibc -> {:?} box64 loader",
+            architecture.execution
+        );
+        (
+            path.clone(),
+            box64_info
+                .interpreter
+                .clone()
+                .unwrap_or_else(|| format!("/lib/{}", architecture.execution.loader_name())),
+        )
     } else {
-        let Some(box64) = cfg.box64.clone().filter(|p| p.exists()) else {
-            return Err(Error::NoBox64);
-        };
-        if Arch::host() != Arch::Aarch64 {
-            return Err(Error::Unsupported(format!(
-                "no emulator for {arch:?} targets on a {:?} host",
-                Arch::host()
-            )));
-        }
-        debug!("{arch:?} glibc on {:?} host -> box64", Arch::host());
-        // argv[0] must be box64's full path — box64 uses it to find itself.
-        let mut v = vec![
-            box64.to_string_lossy().into_owned(),
-            target.display().to_string(),
-        ];
-        v.extend(args.iter().skip(1).cloned());
-        (box64, v)
+        debug!("{arch:?} glibc -> native loader");
+        (
+            target.clone(),
+            info.interpreter
+                .clone()
+                .unwrap_or_else(|| format!("/lib/{}", architecture.execution.loader_name())),
+        )
     };
-
-    let interp = info
-        .interpreter
-        .clone()
-        .unwrap_or_else(|| format!("/lib/{}", arch.loader_name()));
-    let loader = find_loader(&interp, arch).ok_or(Error::NoLoader(interp))?;
-    let preload = find_preload().ok_or(Error::NoPreload)?;
+    // Keep Box64's own full path as argv[0], as in the pre-PR execution chain.
+    let argv = execution_argv(
+        &target,
+        args,
+        box64.as_ref().map(|(path, _)| path.as_path()),
+    );
+    let loader = if box64.is_some() {
+        find_host_loader(cfg, &interp, architecture.execution)
+    } else {
+        find_loader(&interp, architecture.execution)
+    }
+    .ok_or(Error::NoLoader(interp))?;
+    let preload = if inject_preload {
+        Some(find_preload(architecture.execution).ok_or(Error::NoPreload)?)
+    } else {
+        None
+    };
 
     Ok(Execution {
         exec_target,
         original_target: target,
         argv,
         loader: Some(loader),
-        preload: Some(preload),
-        arch,
+        preload,
+        arch: architecture.target,
+        execution_arch: architecture.execution,
         env_overrides: Vec::new(),
     })
 }
@@ -194,20 +272,14 @@ pub fn resolve_target(raw: &str, guest_cwd: &str) -> Option<PathBuf> {
     if rootfs.enabled() {
         return rootfs.search(raw, guest_cwd, &cfg.guest_path);
     }
-    host_search(raw)
+    host_search(raw, guest_cwd)
 }
 
 /// Search the launcher's own `PATH`. Only used when no rootfs is configured,
 /// where the host user space *is* the guest.
-fn host_search(name: &str) -> Option<PathBuf> {
+fn host_search(name: &str, guest_cwd: &str) -> Option<PathBuf> {
     let path = env::var("PATH").unwrap_or_default();
-    for dir in split_path_list(&path) {
-        let candidate = PathBuf::from(&dir).join(name);
-        if crate::launcher::rootfs::is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    Rootfs::current().search(name, guest_cwd, &split_path_list(&path))
 }
 
 /// Termux has neither `/bin` nor `/usr/bin`; its user space lives under
@@ -266,17 +338,49 @@ pub fn find_loader(interp: &str, arch: Arch) -> Option<PathBuf> {
     alt.exists().then_some(alt)
 }
 
+fn find_host_loader(cfg: &Config, interp: &str, arch: Arch) -> Option<PathBuf> {
+    if let Some(path) = &cfg.loader
+        && path.exists()
+    {
+        return Some(path.clone());
+    }
+    if Path::new(interp).exists() {
+        return Some(PathBuf::from(interp));
+    }
+    let name = Path::new(interp)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| arch.loader_name().to_string());
+    if let Some(runtime) = &cfg.runtime_dir {
+        let candidate = runtime.join("lib").join(&name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    let rootfs = Rootfs::from_config(cfg);
+    for dir in ["/lib", "/usr/lib", "/lib64"] {
+        if let Some(path) = rootfs.map_existing(&format!("{dir}/{name}")) {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+fn matches_arch(path: &Path, arch: Arch) -> bool {
+    elf::analyze(path).is_some_and(|info| Arch::from_machine(info.machine) == Some(arch))
+}
+
 /// Locate the preload hook library.
 ///
 /// Order matters: a library built against the rootfs' glibc must win over one
 /// built against the host's, because the guest loader resolves its versioned
 /// symbols against the guest libc.
-fn find_preload() -> Option<PathBuf> {
+fn find_preload(arch: Arch) -> Option<PathBuf> {
     let cfg = config();
     let rootfs = Rootfs::current();
 
     if let Some(p) = &cfg.preload
-        && p.exists()
+        && matches_arch(p, arch)
     {
         return Some(p.clone());
     }
@@ -284,7 +388,10 @@ fn find_preload() -> Option<PathBuf> {
     for candidate in [ROOTFS_PRELOAD_DIR, "/usr/lib", "/usr/local/lib"] {
         let logical = format!("{candidate}/libbionilux_preload.so");
         if let Some(physical) = rootfs.map_existing(&logical) {
-            return Some(PathBuf::from(physical));
+            let physical = PathBuf::from(physical);
+            if matches_arch(&physical, arch) {
+                return Some(physical);
+            }
         }
     }
 
@@ -294,7 +401,7 @@ fn find_preload() -> Option<PathBuf> {
         for _ in 0..3 {
             let Some(d) = dir else { break };
             let p = d.join("libbionilux_preload.so");
-            if p.exists() {
+            if matches_arch(&p, arch) {
                 return Some(p);
             }
             dir = d.parent();
@@ -303,7 +410,7 @@ fn find_preload() -> Option<PathBuf> {
 
     if let Some(rt) = &cfg.runtime_dir {
         let p = rt.join("lib/libbionilux_preload.so");
-        if p.exists() {
+        if matches_arch(&p, arch) {
             return Some(p);
         }
     }
@@ -311,7 +418,13 @@ fn find_preload() -> Option<PathBuf> {
 }
 
 /// Shebang script: resolve the interpreter, then rebuild argv.
-fn script(script: &Path, args: &[String], guest_cwd: &str, depth: u32) -> Result<Execution, Error> {
+fn script(
+    script: &Path,
+    args: &[String],
+    guest_cwd: &str,
+    depth: u32,
+    inject_preload: bool,
+) -> Result<Execution, Error> {
     if depth >= MAX_SHEBANG_DEPTH {
         return Err(Error::Unsupported("shebang recursion too deep".into()));
     }
@@ -319,39 +432,17 @@ fn script(script: &Path, args: &[String], guest_cwd: &str, depth: u32) -> Result
     let (interp, interp_arg) =
         parse_shebang(script).ok_or_else(|| Error::Unsupported("not ELF or shebang".into()))?;
 
-    // `#!/usr/bin/env prog` — resolve prog directly rather than running env,
-    // because env would re-resolve it and, without a rootfs, the host's
-    // native `env` would escape the rerouting.
-    let (interp, interp_args, overrides) = if Path::new(&interp).file_name() == Some("env".as_ref())
-    {
-        let arg =
-            interp_arg.ok_or_else(|| Error::Unsupported("env shebang without program".into()))?;
-        let mut words: Vec<String> = arg.split_whitespace().map(String::from).collect();
-        if words.first().map(String::as_str) == Some("-S") {
-            words.remove(0);
-        }
-        // `env VAR=VALUE prog` assigns before running the program.
-        let mut overrides = Vec::new();
-        while words[0].contains('=') && !words[0].starts_with('-') {
-            let w = words.remove(0);
-            let (k, v) = w.split_once('=').expect("checked for '='");
-            overrides.push((k.to_string(), v.to_string()));
-            if words.is_empty() {
-                break;
-            }
-        }
-        if words.is_empty() {
-            return Err(Error::Unsupported("env shebang without program".into()));
-        }
-        let prog = words.remove(0);
-        let rest = if words.is_empty() { None } else { Some(words) };
-        (prog, rest, overrides)
-    } else {
-        (interp, interp_arg.map(|a| vec![a]), Vec::new())
-    };
+    let (interp, interp_args, overrides) =
+        shebang_command(interp, interp_arg, Rootfs::current().enabled())?;
 
-    let interp_path = resolve_target(&interp, guest_cwd)
-        .ok_or_else(|| Error::Unsupported(format!("shebang interp not found: {interp}")))?;
+    let interp_path = if !interp.contains('/')
+        && let Some((_, path)) = overrides.iter().rev().find(|(key, _)| key == "PATH")
+    {
+        Rootfs::current().search(&interp, guest_cwd, &split_path_list(path))
+    } else {
+        resolve_target(&interp, guest_cwd)
+    }
+    .ok_or_else(|| Error::Unsupported(format!("shebang interp not found: {interp}")))?;
 
     let interp_str = interp_path
         .to_str()
@@ -361,9 +452,10 @@ fn script(script: &Path, args: &[String], guest_cwd: &str, depth: u32) -> Result
         std::slice::from_ref(&interp),
         guest_cwd,
         depth + 1,
+        inject_preload,
     )?;
 
-    // Start from inner.argv — preserves [BOX64, interp] for emulated targets.
+    // The interpreter owns argv[0]; a script's custom argv[0] is discarded.
     let mut argv = inner.argv.clone();
     if let Some(extra) = interp_args {
         argv.extend(extra);
@@ -378,12 +470,100 @@ fn script(script: &Path, args: &[String], guest_cwd: &str, depth: u32) -> Result
         loader: inner.loader,
         preload: inner.preload,
         arch: inner.arch,
+        execution_arch: inner.execution_arch,
         env_overrides: {
-            let mut o = inner.env_overrides;
-            o.extend(overrides);
+            let mut o = overrides;
+            o.extend(inner.env_overrides);
             o
         },
     })
+}
+
+type ShebangCommand = (String, Option<Vec<String>>, Vec<(String, String)>);
+
+fn shebang_command(
+    interp: String,
+    interp_arg: Option<String>,
+    rootfs_enabled: bool,
+) -> Result<ShebangCommand, Error> {
+    if Path::new(&interp).file_name() != Some("env".as_ref()) {
+        return Ok((interp, interp_arg.map(|arg| vec![arg]), Vec::new()));
+    }
+    let arg = interp_arg.ok_or_else(|| Error::Unsupported("env shebang without program".into()))?;
+    if arg.trim() == "-S" || arg.trim() == "--split-string=" {
+        return Err(Error::Unsupported("env shebang without program".into()));
+    }
+    if rootfs_enabled {
+        // GNU env owns -S quoting, escapes, expansion, assignments and options.
+        // Keep the kernel's single optional shebang argument intact.
+        return Ok((interp, Some(vec![arg]), Vec::new()));
+    }
+
+    // A Bionic env cannot reroute glibc children in legacy (no-rootfs) mode.
+    let mut words = if let Some(value) = arg.strip_prefix("-S") {
+        split_legacy_env_words(value)?
+    } else if let Some(value) = arg.strip_prefix("--split-string=") {
+        split_legacy_env_words(value)?
+    } else {
+        vec![arg]
+    };
+    let mut overrides = Vec::new();
+    while words
+        .first()
+        .is_some_and(|word| word.contains('=') && !word.starts_with('-'))
+    {
+        let word = words.remove(0);
+        let (key, value) = word.split_once('=').expect("checked for '='");
+        overrides.push((key.to_string(), value.to_string()));
+    }
+    if words.is_empty() || words[0].is_empty() || words[0].starts_with('-') {
+        return Err(Error::Unsupported(
+            "env shebang without supported program".into(),
+        ));
+    }
+    let program = words.remove(0);
+    Ok((program, Some(words), overrides))
+}
+
+fn split_legacy_env_words(value: &str) -> Result<Vec<String>, Error> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut started = false;
+    for ch in value.chars() {
+        if escaped {
+            word.push(ch);
+            escaped = false;
+        } else if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            started = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_some() {
+            word.push(ch);
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            started = true;
+        } else if ch.is_whitespace() {
+            if started {
+                words.push(std::mem::take(&mut word));
+                started = false;
+            }
+        } else {
+            word.push(ch);
+            started = true;
+        }
+    }
+    if escaped || quote.is_some() {
+        return Err(Error::Unsupported(
+            "unterminated env shebang quoting".into(),
+        ));
+    }
+    if started {
+        words.push(word);
+    }
+    Ok(words)
 }
 
 fn parse_shebang(path: &Path) -> Option<(String, Option<String>)> {
@@ -413,9 +593,16 @@ fn parse_shebang(path: &Path) -> Option<(String, Option<String>)> {
 ///
 /// When the host cwd already sits inside the rootfs the guest keeps it — that
 /// is how a child inherits its parent's directory without a `chdir`.
-pub fn guest_cwd_for(cfg: &Config, rootfs: &Rootfs, pwd: &Path) -> String {
-    if rootfs.enabled() && rootfs.contains(pwd) {
-        return rootfs.unmap(&pwd.to_string_lossy());
+pub fn guest_cwd_for(cfg: &Config, rootfs: &Rootfs, pwd: &Path, rerouted: bool) -> String {
+    let physical = pwd.to_string_lossy();
+    if !rootfs.enabled() {
+        return physical.into_owned();
+    }
+    if rootfs.contains(pwd) {
+        return rootfs.unmap(&physical);
+    }
+    if rerouted && rootfs.passthrough(&physical) {
+        return physical.into_owned();
     }
     cfg.guest_cwd.clone()
 }
@@ -451,6 +638,41 @@ pub fn library_path(cfg: &Config, arch: Arch) -> Vec<String> {
     let root_s = root.to_string_lossy().into_owned();
     if !dirs.contains(&root_s) {
         dirs.push(root_s);
+    }
+    dirs
+}
+
+/// Box64 runs against host glibc, while its x86 libraries remain in the guest.
+pub fn execution_library_path(cfg: &Config, target: Arch, execution: Arch) -> Vec<String> {
+    if target == execution {
+        return library_path(cfg, execution);
+    }
+    let mut dirs = Vec::new();
+    let mut push = |path: PathBuf| {
+        if path.is_dir() {
+            let path = path.to_string_lossy().into_owned();
+            if !dirs.contains(&path) {
+                dirs.push(path);
+            }
+        }
+    };
+    if let Some(runtime) = &cfg.runtime_dir {
+        push(runtime.join("lib"));
+        for dir in execution.lib_dirs() {
+            push(runtime.join(dir.trim_start_matches('/')));
+        }
+        push(runtime.join("usr/lib"));
+    }
+    if let Some(root) = &cfg.rootfs {
+        for dir in execution.lib_dirs() {
+            push(root.join(dir.trim_start_matches('/')));
+        }
+        for dir in ["lib", "usr/lib"] {
+            let path = root.join(dir);
+            if matches_arch(&path.join("libc.so.6"), execution) {
+                push(path);
+            }
+        }
     }
     dirs
 }
@@ -518,6 +740,212 @@ mod tests {
         let (interp, arg) = parse_shebang(f.path()).unwrap();
         assert_eq!(interp, "/bin/sh");
         assert!(arg.is_none());
+    }
+
+    #[test]
+    fn empty_env_split_string_is_an_error_not_a_panic() {
+        for rootfs in [false, true] {
+            for arg in ["-S", "-S   ", "--split-string="] {
+                assert!(shebang_command("/usr/bin/env".into(), Some(arg.into()), rootfs).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn guest_env_receives_original_optional_argument_for_gnu_parsing() {
+        let argument = r#"-S -u HOME NAME="two words" PATH=/custom/bin python3 -c 'print("a b")'"#;
+        let (program, arguments, overrides) =
+            shebang_command("/usr/bin/env".into(), Some(argument.into()), true).unwrap();
+        assert_eq!(program, "/usr/bin/env");
+        assert_eq!(arguments.unwrap(), vec![argument]);
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn legacy_env_split_string_preserves_quotes_and_empty_arguments() {
+        let (program, arguments, overrides) = shebang_command(
+            "/usr/bin/env".into(),
+            Some(r#"-S NAME="two words" python3 -c 'print("a b")' ''"#.into()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(program, "python3");
+        assert_eq!(arguments.unwrap(), vec!["-c", r#"print("a b")"#, ""]);
+        assert_eq!(overrides, vec![("NAME".into(), "two words".into())]);
+        assert!(split_legacy_env_words("'unterminated").is_err());
+    }
+
+    #[test]
+    fn cwd_uses_actual_host_directory_without_rootfs() {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.rootfs = None;
+        let rootfs = Rootfs::from_config(&cfg);
+        assert_eq!(
+            guest_cwd_for(&cfg, &rootfs, Path::new("/actual/cwd"), false),
+            "/actual/cwd"
+        );
+    }
+
+    #[test]
+    fn rerouted_cwd_preserves_exposed_workspace_and_guest_subdirectories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.rootfs = Some(tmp.path().join("rootfs"));
+        cfg.guest_cwd = "/".into();
+        let workspace = tmp.path().join("workspace");
+        cfg.host_paths = vec![workspace.clone()];
+        let rootfs = Rootfs::from_config(&cfg);
+        assert_eq!(
+            guest_cwd_for(&cfg, &rootfs, &workspace, true),
+            workspace.to_string_lossy()
+        );
+        assert_eq!(guest_cwd_for(&cfg, &rootfs, &workspace, false), "/");
+        assert_eq!(
+            guest_cwd_for(
+                &cfg,
+                &rootfs,
+                &cfg.rootfs.as_ref().unwrap().join("work"),
+                true
+            ),
+            "/work"
+        );
+    }
+
+    #[test]
+    fn explicit_readable_non_executable_script_fails_with_126() {
+        let script = write_temp(b"#!/bin/sh\necho not-executable\n");
+        let name = script.path().to_str().unwrap();
+        let error = resolve(name, &[name.into()], "/", false)
+            .err()
+            .expect("non-executable script must fail");
+        assert!(matches!(error, Error::PermissionDenied(_)));
+        assert_eq!(error.exit_code(), 126);
+    }
+
+    #[test]
+    fn architecture_plan_separates_target_from_kernel_execution_architecture() {
+        for arch in [Arch::Aarch64, Arch::X86_64] {
+            let plan = architecture_plan(arch, Libc::Glibc, arch, None).unwrap();
+            assert_eq!(plan.target, arch);
+            assert_eq!(plan.execution, arch);
+        }
+    }
+
+    fn arm64_box64_info() -> elf::ElfInfo {
+        elf::ElfInfo {
+            machine: elf::EM_AARCH64,
+            libc: Libc::Glibc,
+            interpreter: Some("/lib/ld-linux-aarch64.so.1".into()),
+        }
+    }
+
+    #[test]
+    fn box64_plan_uses_host_architecture_and_its_own_argv0() {
+        let box64 = arm64_box64_info();
+        let plan =
+            architecture_plan(Arch::X86_64, Libc::Glibc, Arch::Aarch64, Some(&box64)).unwrap();
+        assert_eq!(plan.target, Arch::X86_64);
+        assert_eq!(plan.execution, Arch::Aarch64);
+        let argv = execution_argv(
+            Path::new("/guest/program"),
+            &["custom-target-argv0".into(), "arg".into()],
+            Some(Path::new("/host/box64-glibc")),
+        );
+        assert_eq!(argv, vec!["/host/box64-glibc", "/guest/program", "arg"]);
+    }
+
+    #[test]
+    fn box64_plan_rejects_invalid_emulator_and_unsupported_direction() {
+        let mut box64 = arm64_box64_info();
+        assert!(matches!(
+            architecture_plan(Arch::X86_64, Libc::Glibc, Arch::Aarch64, None),
+            Err(Error::NoBox64)
+        ));
+        box64.machine = elf::EM_X86_64;
+        assert!(matches!(
+            architecture_plan(Arch::X86_64, Libc::Glibc, Arch::Aarch64, Some(&box64)),
+            Err(Error::Unsupported(_))
+        ));
+        box64.machine = elf::EM_AARCH64;
+        box64.libc = Libc::Bionic;
+        assert!(matches!(
+            architecture_plan(Arch::X86_64, Libc::Glibc, Arch::Aarch64, Some(&box64)),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            architecture_plan(Arch::Aarch64, Libc::Glibc, Arch::X86_64, Some(&box64)),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            architecture_plan(Arch::X86_64, Libc::Static, Arch::Aarch64, Some(&box64)),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn box64_host_loader_and_library_paths_do_not_use_x86_guest_libraries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.loader = None;
+        cfg.rootfs = Some(tmp.path().join("guest"));
+        cfg.runtime_dir = Some(tmp.path().join("native-runtime"));
+        let root = cfg.rootfs.as_ref().unwrap();
+        let runtime = cfg.runtime_dir.as_ref().unwrap();
+        for dir in [
+            root.join("lib/x86_64-linux-gnu"),
+            root.join("lib/aarch64-linux-gnu"),
+            runtime.join("lib"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let loader = runtime.join("lib/ld-linux-aarch64.so.1");
+        std::fs::write(&loader, b"host-loader-fixture").unwrap();
+        assert_eq!(
+            find_host_loader(
+                &cfg,
+                "/bionilux-test-missing/lib/ld-linux-aarch64.so.1",
+                Arch::Aarch64
+            ),
+            Some(loader)
+        );
+        let paths = execution_library_path(&cfg, Arch::X86_64, Arch::Aarch64);
+        assert!(paths.contains(&runtime.join("lib").display().to_string()));
+        assert!(paths.contains(&root.join("lib/aarch64-linux-gnu").display().to_string()));
+        assert!(!paths.contains(&root.join("lib/x86_64-linux-gnu").display().to_string()));
+        assert!(!paths.contains(&root.join("lib").display().to_string()));
+        assert!(
+            library_path(&cfg, Arch::X86_64)
+                .contains(&root.join("lib/x86_64-linux-gnu").display().to_string())
+        );
+    }
+
+    #[test]
+    fn no_preload_plan_and_custom_argv0_do_not_require_hook_library() {
+        let executable = env::current_exe().unwrap();
+        let name = executable.to_str().unwrap();
+        let plan = resolve(name, &["custom-argv0".into(), "arg".into()], "/", false).unwrap();
+        assert!(plan.preload.is_none());
+        assert_eq!(plan.arch, Arch::host());
+        assert_eq!(plan.execution_arch, Arch::host());
+        assert_eq!(plan.argv, vec!["custom-argv0", "arg"]);
+    }
+
+    #[test]
+    fn script_does_not_apply_original_argv0_to_its_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        let interpreter = env::current_exe().unwrap();
+        let script = write_temp(format!("#!{}\n", interpreter.display()).as_bytes());
+        std::fs::set_permissions(script.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plan = resolve(
+            script.path().to_str().unwrap(),
+            &["script-custom-argv0".into(), "arg".into()],
+            "/",
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.argv[0], interpreter.to_string_lossy());
+        assert_eq!(plan.argv[1], script.path().to_string_lossy());
+        assert_eq!(plan.argv[2], "arg");
     }
 
     // ── resolve_target ──────────────────────────────────────────────

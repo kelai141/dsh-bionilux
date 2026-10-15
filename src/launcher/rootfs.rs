@@ -140,19 +140,15 @@ impl Rootfs {
         self.root.as_ref().is_some_and(|r| dir.starts_with(r))
     }
 
-    /// Physical directory backing a guest directory, defaulting to the rootfs
-    /// root. Used for the initial `chdir`.
-    pub fn dir_for(&self, logical: &str) -> PathBuf {
-        match &self.root {
-            Some(root) => {
-                let physical = join_root(root, &normalize(logical));
-                if physical.is_dir() {
-                    physical
-                } else {
-                    root.clone()
-                }
-            }
-            None => PathBuf::from(logical),
+    /// Physical directory backing a guest directory, including host passthroughs.
+    pub fn dir_for(&self, logical: &str) -> Result<PathBuf, String> {
+        let physical = self.physical(&normalize(logical));
+        if physical.is_dir() {
+            Ok(physical)
+        } else {
+            Err(format!(
+                "working directory does not exist or is not a directory: {logical}"
+            ))
         }
     }
 
@@ -167,14 +163,16 @@ impl Rootfs {
                 .map(|d| {
                     if d.is_empty() {
                         guest_cwd.to_string()
-                    } else {
+                    } else if d.starts_with('/') {
                         d.clone()
+                    } else {
+                        join_guest(guest_cwd, d)
                     }
                 })
                 .collect()
         };
         for dir in dirs {
-            let candidate = join_guest(&dir, name);
+            let candidate = normalize(&join_guest(&dir, name));
             let physical = self.physical(&candidate);
             if is_executable(&physical) {
                 return Some(physical);
@@ -199,6 +197,7 @@ pub fn is_executable(path: &Path) -> bool {
     path.metadata()
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+        && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
 #[cfg(not(unix))]
@@ -239,6 +238,7 @@ mod tests {
             guest_home: "/root".into(),
             guest_tmp: "/tmp".into(),
             guest_cwd: "/".into(),
+            argv0: None,
             fake_root: true,
             lenient: false,
             host_paths: Vec::new(),
@@ -346,6 +346,51 @@ mod tests {
     }
 
     #[test]
+    fn search_preserves_empty_and_relative_path_entries() {
+        let (_t, rf) = rootfs_with(&["/work/local-tool", "/work/tools/relative-tool"]);
+        assert!(
+            rf.search("local-tool", "/work", &config::split_path_list(":/bin"))
+                .unwrap()
+                .ends_with("work/local-tool")
+        );
+        assert!(
+            rf.search(
+                "relative-tool",
+                "/work",
+                &config::split_path_list("tools:/bin")
+            )
+            .unwrap()
+            .ends_with("work/tools/relative-tool")
+        );
+        assert!(
+            rf.search("local-tool", "/work", &config::split_path_list("/bin:"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cwd_uses_host_passthrough_and_rejects_missing_directories() {
+        let (tmp, mut rf) = rootfs_with(&["/work/"]);
+        let host = tmp.path().join("host-workspace");
+        fs::create_dir(&host).unwrap();
+        rf.host_dirs.push(host.clone());
+        assert_eq!(rf.dir_for(host.to_str().unwrap()).unwrap(), host);
+        assert_eq!(rf.dir_for("/work").unwrap(), rf.physical("/work"));
+        assert!(rf.dir_for("/missing").is_err());
+    }
+
+    #[test]
+    fn executable_check_rejects_readable_scripts_without_execute_bits() {
+        let (_t, rf) = rootfs_with(&["/script"]);
+        let script = rf.physical("/script");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable(&script));
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable(&script));
+    }
+
+    #[test]
     fn disabled_rootfs_is_transparent() {
         let cfg = Config {
             prefix: None,
@@ -358,6 +403,7 @@ mod tests {
             guest_home: "/root".into(),
             guest_tmp: "/tmp".into(),
             guest_cwd: "/".into(),
+            argv0: None,
             fake_root: false,
             lenient: false,
             host_paths: Vec::new(),
@@ -385,6 +431,7 @@ mod tests {
             guest_home: "/root".into(),
             guest_tmp: "/tmp".into(),
             guest_cwd: "/".into(),
+            argv0: None,
             fake_root: false,
             lenient: true,
             host_paths: Vec::new(),
@@ -406,6 +453,7 @@ mod tests {
             guest_home: "/root".into(),
             guest_tmp: "/tmp".into(),
             guest_cwd: "/".into(),
+            argv0: None,
             fake_root: false,
             lenient: false,
             host_paths: vec![PathBuf::from("/sdcard")],

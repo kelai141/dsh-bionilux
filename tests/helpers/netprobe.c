@@ -60,7 +60,7 @@ static int build_query(unsigned char *buf, size_t cap, const char *name, uint16_
 	size_t n = 12;
 	const char *p = name;
 
-	if (cap < 12)
+	if (cap < 17 || !*name || strlen(name) > 253)
 		return -1;
 	buf[0] = (unsigned char)(id >> 8);
 	buf[1] = (unsigned char)(id & 0xff);
@@ -74,7 +74,7 @@ static int build_query(unsigned char *buf, size_t cap, const char *name, uint16_
 		const char *dot = strchr(p, '.');
 		size_t len = dot ? (size_t)(dot - p) : strlen(p);
 
-		if (len == 0 || len > 63 || n + len + 2 > cap)
+		if (len == 0 || len > 63 || n + 1 + len + 5 > cap)
 			return -1;
 		buf[n++] = (unsigned char)len;
 		memcpy(buf + n, p, len);
@@ -331,8 +331,8 @@ static int cmd_udp(const char *host, const char *port, const char *name, long ti
 	close(fd);
 
 	n = parse_reply(r, (size_t)n, id, &rcode, addrs, sizeof(addrs));
-	printf("probe=udp target=%s:%s name=%s status=ok ms=%ld rcode=%d answers=%d addrs=%s\n", host,
-	       port, name, dt, rcode, n < 0 ? 0 : n, n < 0 ? "-" : addrs);
+	printf("probe=udp target=%s:%s name=%s status=%s ms=%ld rcode=%d answers=%d addrs=%s\n", host,
+	       port, name, n < 0 ? "bad-reply" : "ok", dt, rcode, n < 0 ? 0 : n, n < 0 ? "-" : addrs);
 	return n > 0 ? 0 : 1;
 }
 

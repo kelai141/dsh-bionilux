@@ -37,7 +37,7 @@ is derived, not assumed.
 
 ```bash
 # One-time rootfs preparation: absolute symlinks, resolver, directories.
-scripts/prepare-rootfs.sh --rootfs /path/to/rootfs --dns <nameserver>
+sh scripts/prepare-rootfs.sh --rootfs /path/to/rootfs --dns "$DNS_SERVERS"
 
 export BIONILUX_ROOTFS=/path/to/rootfs
 bionilux /bin/bash -c 'cat /etc/os-release; apt-get update'
@@ -116,7 +116,8 @@ papered over.
   --jobserver-style=pipe` uses a pipe instead and works — verified with `-j8`
   in a kernel build.
 * **`ldconfig` is statically linked**, so no preload can map it; it writes to
-  Android's read-only `/etc`. `prepare-rootfs.sh` installs a shim.
+  Android's read-only `/etc`. `prepare-rootfs.sh` does **not** install a shim;
+  integrations must explicitly handle packages whose configuration requires it.
 * **Static binaries** are outside `LD_PRELOAD`'s reach entirely.
 
 A fresh rootfs also needs `scripts/prepare-rootfs.sh` before anything else: it
@@ -255,23 +256,41 @@ aarch64-linux-gnu-gcc -shared -fPIC -O2 -o libbionilux_preload.so src/preload/ho
     -Wl,-rpath,/usr/lib/aarch64-linux-gnu
 ```
 
-`tests/helpers/preload_paths.sh` builds and exercises the preload against the
+`bash tests/preload_paths.sh` builds and exercises the preload against the
 host glibc, so the path layer can be tested with no device attached.
 
 ## Testing
 
-Four layers. Only the last needs a device.
+Host regressions run without a device. Android acceptance and interactive behavior
+require their own device validation; host results do not establish Android compatibility.
 
 * **Unit tests** — `cargo test`. Run them on a Unix host; the project uses
   Unix-only APIs.
-* **Host hook tests** — `tests/preload_paths.sh`. Guest paths resolve inside a
-  synthetic rootfs, host files of the same name are unreachable, `..` cannot
-  escape, and a `_FORTIFY_SOURCE` build behaves identically.
-* **Acceptance** — `tests/acceptance.sh` drives a real Debian rootfs through the
+* **Host hook tests** — `bash tests/preload_paths.sh`. Checks mapped guest paths,
+  missing-file behavior, logical-root traversal and `_FORTIFY_SOURCE` parity in
+  a synthetic rootfs. These checks do not establish a security sandbox.
+* **Acceptance** — `bash tests/acceptance.sh` drives a real Debian rootfs through the
   runtime, and can run the same cases through PRoot for comparison or against a
   device over `adb`.
-* **On device** — `tests/smoke.sh` for the upstream exec/shebang cases, plus the
+* **On device** — `bash tests/smoke.sh` for the upstream exec/shebang cases, plus the
   capability table above.
+
+Additional host regressions: `bash tests/runtime.sh` exercises runtime APIs,
+concurrent subprocesses, fortified bounds, isolated-loopback DNS and native PTY
+job control; `bash tests/ubsan.sh` repeats it with non-recovering UBSan checks.
+`bash tests/make.sh` exercises direct/shell/recursive Make recipes, pipe jobserver
+FDs and a real C compiler/linker chain. After `cargo build`, set
+`BIONILUX_TEST_LAUNCHER="$PWD/target/debug/bionilux"` for the runtime/Make suites to
+use the real Rust launcher instead of the test-only native launcher.
+`bash tests/aarch64.sh` cross-compiles and runs AArch64 glibc probes under explicit
+QEMU; it does **not** validate Android/Bionic/SELinux.
+
+For preparation and supporting scripts,
+`bash tests/prepare_rootfs.sh` checks preparation, read-only modes, relocation,
+installer argument handling and benchmark failures/JSON. The latter requires
+Python 3 and a host C compiler; `tests/bench.sh --json` also requires Python 3.
+The installer defaults to releases from `kelai141/dsh-bionilux`; use
+`BIONILUX_REPO`/`BIONILUX_VERSION` to select another published release.
 
 Diagnostics kept in the tree, because each one cracked a real bug:
 `tests/helpers/netprobe.c` (interface, resolver state, raw UDP/TCP DNS),
@@ -288,6 +307,7 @@ sees behind the preload), `tests/helpers/privprobe.c` (the negative result that
 | [`docs/ROOTFS.md`](docs/ROOTFS.md) | Path mapping rules and the cases they cannot cover |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Why the runtime is built this way |
 | [`docs/STATUS.md`](docs/STATUS.md) | What works, what does not, and the evidence |
+| [`docs/REVIEW.md`](docs/REVIEW.md) | Review fixes, reproducible checks, remaining limits and Android device checklist |
 | [`docs/PERF.md`](docs/PERF.md) | Measured numbers against PRoot |
 
 ## Relationship to upstream

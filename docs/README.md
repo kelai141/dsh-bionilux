@@ -34,7 +34,7 @@
 - 与 dsh-mobile-apk 的完整链接、内嵌、打包、发布。
 - Cordis 插件本体、`linux_bash` 工具的注册与 Guard 权限模型。
 - rootfs 下载/校验/安装的 UI。
-- PTY 会话管理器（本 fork 只保证在 PTY 下行为正确）。
+- PTY 会话管理器（host 回归与 Android PTY 验收应分别记录，不推断设备兼容性）。
 
 ## 快速开始
 
@@ -45,7 +45,7 @@ cargo clippy --all-targets -- -D warnings
 
 # 设备上运行
 export BIONILUX_ROOTFS=/path/to/debian-minimal-rootfs
-export BIONILUX_BIN_PATH=$BIONILUX_ROOTFS/usr/bin
+sh scripts/prepare-rootfs.sh --rootfs "$BIONILUX_ROOTFS" --verify
 bionilux /bin/bash -c 'echo $PATH; pwd'
 ```
 
