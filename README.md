@@ -2,11 +2,39 @@
 
 Run glibc and x86_64 Linux binaries on Termux — natively, no PRoot.
 
+> **This is a fork.** It exists to be the Linux runtime component of an Android
+> app (DSH Mobile): a full Debian rootfs with working `apt`/`dpkg`, driven by a
+> Cordis plugin. It adds rootfs path semantics, removes every hardcoded Termux
+> path, and is verified on a real Android device. Start with
+> [`docs/README.md`](docs/README.md); the runtime contract is in
+> [`docs/HARDCODING.md`](docs/HARDCODING.md).
+>
+> What it is **not**: a complete VFS. See
+> [`docs/ROOTFS.md`](docs/ROOTFS.md) §7 for exactly which cases it cannot cover,
+> and [`docs/PERF.md`](docs/PERF.md) for measured numbers against PRoot.
+
 Termux uses Android's Bionic libc. Almost all released Linux binaries are
 linked against glibc and expect a dynamic linker
 (`/lib/ld-linux-aarch64.so.1`) that does not exist on Android. The kernel
 refuses them with `ENOENT`. bionilux invokes the glibc loader manually and
 keeps children on the same path with an `LD_PRELOAD` hook.
+
+## Running a Debian rootfs (this fork)
+
+```bash
+# One-time: make the rootfs usable (absolute links, resolver, directories).
+scripts/prepare-rootfs.sh --rootfs /path/to/rootfs
+
+export BIONILUX_ROOTFS=/path/to/rootfs
+bionilux /bin/bash -c 'cat /etc/os-release; apt-get update'
+
+# Health check: the plugin registers the tool only when this says yes.
+bionilux --print-config | grep -E 'ROOTFS_ENABLED|ROOTFS_LOADER'
+```
+
+Guest paths resolve inside the rootfs or not at all — a `/usr/share/...` lookup
+never falls through to the host. `..` is clamped at the guest root, and both
+`getcwd()` and `readlink()` report logical guest paths.
 
 ## Install
 
@@ -374,17 +402,31 @@ their own resources.
 
 ## Testing
 
-Three layers.
+Four layers, each runnable without an Android device except the last.
 
-Unit tests (cargo test). 12 tests in src/launcher/resolve.rs:
+Unit tests (`cargo test`).
 
-- rewrite_termux — POSIX prefix rewriting (3 tests)
-- parse_shebang — well-formed, missing arg, trailing whitespace, empty
-  file, no #!, non-UTF-8 after line 1 (7 tests)
-- find_loader — missing interpreter, glibc-dir fallback (2 tests)
+Host-level hook tests (`tests/preload_paths.sh`). Builds the preload against the
+host glibc, gives it a synthetic rootfs, and asserts that guest paths resolve
+inside it, that host files of the same name cannot be reached, that `..` cannot
+escape, and that a `_FORTIFY_SOURCE` build behaves identically. Needs no device.
 
-End-to-end smoke tests (tests/smoke.sh). 10 tests that run the real
-binary on the device:
+Acceptance tests (`tests/acceptance.sh`). Drives a real Debian rootfs through
+the full runtime in three stages — path basics, execution chain, package
+management — and can run the same cases through PRoot for comparison, or
+against a device over `adb`.
+
+```bash
+tests/acceptance.sh --launcher target/release/bionilux --rootfs /path/to/rootfs
+tests/acceptance.sh --launcher ... --rootfs ... --runtime proot   # differential
+tests/acceptance.sh --launcher ... --rootfs ... --via adb --serial emulator-5554
+```
+
+Performance (`tests/bench.sh`) reports medians and spread for both backends on
+the same machine. See [`docs/PERF.md`](docs/PERF.md) for results and caveats.
+
+Upstream's end-to-end smoke tests (`tests/smoke.sh`) still apply when bionilux is
+installed inside Termux; they run the real binary on the device:
 
 | Test | Proves |
 |------|--------|

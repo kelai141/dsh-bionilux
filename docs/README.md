@@ -1,0 +1,52 @@
+# bionilux fork — 文档索引
+
+本仓库是 [theonuverse/bionilux](https://github.com/theonuverse/bionilux) 的 fork，
+用作 **dsh-mobile-apk** 的内置组件：为 DSH Mobile 提供一个**完全独立于 dsh 的 Node.js 运行时**
+的 Debian Linux 容器运行时。
+
+> 一句话：不让 Agent 跑在 Linux 容器里，而是让 Agent 能**按需使用**一个 Linux 环境。
+
+## 文档地图
+
+| 文档 | 作用 | 稳定性 |
+|------|------|--------|
+| [CONTEXT.md](CONTEXT.md) | 领域模型：术语、边界、不变量 | 长期 |
+| [GOALS.md](GOALS.md) | 项目目标、范围、明确不做的事、验收门槛 | 长期 |
+| [STATUS.md](STATUS.md) | 当前执行状态：已完成 / 未解决 / 验证记录 | **每次提交更新** |
+| [PLAN.md](PLAN.md) | 分阶段实施计划与决策点 | 中期 |
+| [ROOTFS.md](ROOTFS.md) | rootfs 路径语义层设计（本 fork 的核心） | 中期 |
+| [HARDCODING.md](HARDCODING.md) | 运行契约：环境变量、CLI、健康检查、安装流程 | 长期 |
+| [DECISIONS.md](DECISIONS.md) | 决策记录与理由（追加式） | 追加式 |
+| [PERF.md](PERF.md) | 实测性能数据与分解 | 数据更新 |
+| [UPSTREAM.md](UPSTREAM.md) | fork 基点、patch 清单、上游同步流程 | 中期 |
+
+## 本 fork 与上游的边界
+
+**本 fork 负责：**
+
+- 去掉所有硬编码的 Termux 包名/路径，改为可配置的环境契约。
+- 实现 Debian rootfs 的**路径语义层**（绝对路径、相对路径、`*at()` dirfd、符号链接）。
+- 让 guest `PATH` / cwd / exec 链完全走 rootfs，不落回 Termux。
+- 提供可被 DSH 插件（Cordis）作为子进程调用的稳定 CLI + 环境变量契约。
+
+**本 fork 不负责（属于 dsh-mobile-apk 侧）：**
+
+- 与 dsh-mobile-apk 的完整链接、内嵌、打包、发布。
+- Cordis 插件本体、`linux_bash` 工具的注册与 Guard 权限模型。
+- rootfs 下载/校验/安装的 UI。
+- PTY 会话管理器（本 fork 只保证在 PTY 下行为正确）。
+
+## 快速开始
+
+```bash
+# 本机（Linux/macOS）跑单元测试，不需要 Android
+cargo test
+cargo clippy --all-targets -- -D warnings
+
+# 设备上运行
+export BIONILUX_ROOTFS=/path/to/debian-minimal-rootfs
+export BIONILUX_BIN_PATH=$BIONILUX_ROOTFS/usr/bin
+bionilux /bin/bash -c 'echo $PATH; pwd'
+```
+
+全部可配置项见 [HARDCODING.md](HARDCODING.md)。

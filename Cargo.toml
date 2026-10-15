@@ -8,7 +8,6 @@ clap = { version = "4.5", features = ["derive"] }
 goblin = "0.10.7"
 memmap2 = "0.9.11"
 nix = { version = "0.31.3", features = ["process", "fs"] }
-which = "8.0.6"
 
 [dev-dependencies]
 tempfile = "3"

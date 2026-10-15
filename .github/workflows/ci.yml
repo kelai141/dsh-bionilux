@@ -24,6 +24,32 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --verbose
 
+      # The whole point of this fork is that no host package path is baked in.
+      # A guest prefix is derived from the host application's package name,
+      # which is not Termux', so this must never reappear in src/.
+      - name: no hardcoded Termux paths
+        run: |
+          if grep -rn "com\.termux" src/; then
+            echo "::error::hardcoded Termux path found in src/"
+            exit 1
+          fi
+
+  preload-paths:
+    name: preload path semantics
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: run hook path tests
+        run: |
+          chmod +x tests/*.sh tests/../scripts/*.sh || true
+          tests/preload_paths.sh
+
+      - name: shellcheck (if available)
+        run: |
+          if command -v shellcheck >/dev/null; then
+            shellcheck -S warning tests/*.sh scripts/*.sh setup || true
+          fi
+
   preload:
     name: preload (aarch64-glibc)
     runs-on: ubuntu-latest

@@ -3,48 +3,47 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
-use crate::analyzer::elf::{self, EM_AARCH64, EM_X86_64, Libc};
+use crate::analyzer::elf::{self, Libc};
 use crate::debug;
+use crate::launcher::config::{Arch, Config, config, join_guest, normalize, split_path_list};
+use crate::launcher::rootfs::Rootfs;
 
-const DEFAULT_PREFIX: &str = "/data/data/com.termux/files/usr";
 const MAX_SHEBANG_DEPTH: u32 = 4;
 
-fn prefix() -> &'static str {
-    static CACHE: OnceLock<String> = OnceLock::new();
-    CACHE.get_or_init(|| env::var("PREFIX").unwrap_or_else(|_| DEFAULT_PREFIX.into()))
-}
+/// Sub-directory of a rootfs that may hold a preload built against that
+/// rootfs' own glibc. Kept short and stable: the guest must not care.
+const ROOTFS_PRELOAD_DIR: &str = "/usr/lib/bionilux";
 
-fn glibc_dir() -> PathBuf {
-    PathBuf::from(prefix()).join("glibc")
-}
-
-fn box64_path() -> PathBuf {
-    PathBuf::from(prefix()).join("bionilux/box64-glibc")
-}
-
-fn termux_bin() -> PathBuf {
-    PathBuf::from(prefix()).join("bin")
-}
-
-fn default_loader() -> PathBuf {
-    glibc_dir().join("lib/ld-linux-aarch64.so.1")
-}
-
+/// A resolved execution plan.
 pub struct Execution {
+    /// Path handed to `execve()`, already mapped out of the guest.
     pub exec_target: PathBuf,
+    /// Physical path of the user's target, used to derive the guest cwd.
     pub original_target: PathBuf,
+    /// argv[0..] as the guest should observe it.
     pub argv: Vec<String>,
+    /// glibc loader, or `None` for native execution.
     pub loader: Option<PathBuf>,
     pub preload: Option<PathBuf>,
-    pub is_x86_64: bool,
+    /// Architecture of the *target*, not of the host.
+    pub arch: Arch,
+    /// `VAR=VALUE` entries from an `env` shebang, applied to the guest env.
+    pub env_overrides: Vec<(String, String)>,
 }
 
+impl Execution {
+    pub fn is_native(&self) -> bool {
+        self.loader.is_none()
+    }
+}
+
+#[derive(Debug)]
 pub enum Error {
     NotFound(String),
     NoPreload,
     NoBox64,
+    NoLoader(String),
     Unsupported(String),
 }
 
@@ -61,40 +60,57 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Error::NotFound(n) => write!(f, "command not found: {n}"),
-            Error::NoPreload => write!(f, "libbionilux_preload.so not found"),
-            Error::NoBox64 => write!(f, "box64 not found at {}", box64_path().display()),
+            Error::NoPreload => write!(
+                f,
+                "libbionilux_preload.so not found; set BIONILUX_PRELOAD or install it next to the launcher"
+            ),
+            Error::NoBox64 => {
+                let hint = config()
+                    .box64
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "BIONILUX_BOX64".into());
+                write!(f, "box64 not found at {hint}")
+            }
+            Error::NoLoader(i) => write!(f, "loader {i} not found"),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
         }
     }
 }
 
-// Four outcomes: native, glibc-aarch64 (loader), glibc-x86_64 (box64), shebang.
-pub fn resolve(raw: &str, args: &[String]) -> Result<Execution, Error> {
-    resolve_at(raw, args, 0)
+/// Resolve `raw` plus its arguments into an execution plan.
+///
+/// `guest_cwd` is the guest's logical working directory; relative targets and
+/// bare names are resolved against it.
+pub fn resolve(raw: &str, args: &[String], guest_cwd: &str) -> Result<Execution, Error> {
+    resolve_at(raw, args, guest_cwd, 0)
 }
 
-fn resolve_at(raw: &str, args: &[String], depth: u32) -> Result<Execution, Error> {
-    let target = which::which(raw).map_err(|_| Error::NotFound(raw.into()))?;
+fn resolve_at(raw: &str, args: &[String], guest_cwd: &str, depth: u32) -> Result<Execution, Error> {
+    let cfg = config();
+    let target = resolve_target(raw, guest_cwd).ok_or_else(|| Error::NotFound(raw.into()))?;
     debug!("resolved: {}", target.display());
 
     let Some(info) = elf::analyze(&target) else {
-        return script(&target, args, depth);
+        return script(&target, args, guest_cwd, depth);
     };
 
     if matches!(info.libc, Libc::Musl | Libc::Other) {
         return Err(Error::Unsupported(format!("libc {:?}", info.libc)));
     }
 
-    if info.machine != EM_X86_64 && info.machine != EM_AARCH64 {
+    let Some(arch) = Arch::from_machine(info.machine) else {
         return Err(Error::Unsupported(format!("machine 0x{:x}", info.machine)));
-    }
+    };
 
-    let is_x86 = info.machine == EM_X86_64;
-    let is_native = matches!(info.libc, Libc::Bionic | Libc::Static);
-
-    if is_native {
-        if is_x86 {
-            return Err(Error::Unsupported("x86_64 static/bionic".into()));
+    if matches!(info.libc, Libc::Bionic | Libc::Static) {
+        // A host-native binary runs as-is. A static binary for another
+        // architecture has no interpreter to redirect and no emulator.
+        if arch != Arch::host() {
+            return Err(Error::Unsupported(format!(
+                "static/foreign {arch:?} binary cannot run on a {:?} host",
+                Arch::host()
+            )));
         }
         debug!("native");
         return Ok(Execution {
@@ -103,17 +119,27 @@ fn resolve_at(raw: &str, args: &[String], depth: u32) -> Result<Execution, Error
             argv: args.to_vec(),
             loader: None,
             preload: None,
-            is_x86_64: false,
+            arch,
+            env_overrides: Vec::new(),
         });
     }
 
-    // Needs the glibc loader; x86_64 also needs box64 in front.
-    let (exec_target, argv) = if is_x86 {
-        let box64 = box64_path();
-        if !box64.exists() {
+    // A glibc ELF needs its loader; a foreign architecture also needs an
+    // emulator in front of it. box64 only works one way (x86_64 on aarch64).
+    let (exec_target, argv) = if arch == Arch::host() {
+        debug!("{arch:?} glibc -> native loader");
+        (target.clone(), args.to_vec())
+    } else {
+        let Some(box64) = cfg.box64.clone().filter(|p| p.exists()) else {
             return Err(Error::NoBox64);
+        };
+        if Arch::host() != Arch::Aarch64 {
+            return Err(Error::Unsupported(format!(
+                "no emulator for {arch:?} targets on a {:?} host",
+                Arch::host()
+            )));
         }
-        debug!("x86_64 glibc -> box64");
+        debug!("{arch:?} glibc on {:?} host -> box64", Arch::host());
         // argv[0] must be box64's full path — box64 uses it to find itself.
         let mut v = vec![
             box64.to_string_lossy().into_owned(),
@@ -121,20 +147,13 @@ fn resolve_at(raw: &str, args: &[String], depth: u32) -> Result<Execution, Error
         ];
         v.extend(args.iter().skip(1).cloned());
         (box64, v)
-    } else {
-        debug!("aarch64 glibc -> loader");
-        (target.clone(), args.to_vec())
     };
 
-    let interp = if is_x86 {
-        default_loader().to_string_lossy().into_owned()
-    } else {
-        info.interpreter
-            .clone()
-            .unwrap_or_else(|| default_loader().to_string_lossy().into_owned())
-    };
-    let loader = find_loader(&interp)
-        .ok_or_else(|| Error::Unsupported(format!("loader {interp} missing")))?;
+    let interp = info
+        .interpreter
+        .clone()
+        .unwrap_or_else(|| format!("/lib/{}", arch.loader_name()));
+    let loader = find_loader(&interp, arch).ok_or(Error::NoLoader(interp))?;
     let preload = find_preload().ok_or(Error::NoPreload)?;
 
     Ok(Execution {
@@ -143,29 +162,133 @@ fn resolve_at(raw: &str, args: &[String], depth: u32) -> Result<Execution, Error
         argv,
         loader: Some(loader),
         preload: Some(preload),
-        is_x86_64: is_x86,
+        arch,
+        env_overrides: Vec::new(),
     })
 }
 
-// Ubuntu PT_INTERP says /lib/...; Termux stores it under $GLIBC/lib.
-fn find_loader(interp: &str) -> Option<PathBuf> {
-    let p = PathBuf::from(interp);
-    if p.exists() {
-        return Some(p);
+/// Map a user-supplied target to a physical path.
+///
+/// A name containing `/` is treated as a path, anything else as a `PATH`
+/// lookup — the same rule `execvp` uses.
+pub fn resolve_target(raw: &str, guest_cwd: &str) -> Option<PathBuf> {
+    let cfg = config();
+    let rootfs = Rootfs::current();
+
+    if raw.contains('/') {
+        let logical = if raw.starts_with('/') {
+            normalize(raw)
+        } else {
+            normalize(&join_guest(guest_cwd, raw))
+        };
+        if rootfs.enabled() {
+            return rootfs.map_existing(&logical).map(PathBuf::from);
+        }
+        let legacy = rewrite_legacy_prefix(&logical);
+        let p = PathBuf::from(&legacy);
+        // An explicit path that exists is handed to execve, which reports the
+        // real error (EACCES, ENOEXEC) instead of a misleading "not found".
+        return p.exists().then_some(p);
     }
-    let name = p.file_name()?;
-    let alt = glibc_dir().join("lib").join(name);
+
+    if rootfs.enabled() {
+        return rootfs.search(raw, guest_cwd, &cfg.guest_path);
+    }
+    host_search(raw)
+}
+
+/// Search the launcher's own `PATH`. Only used when no rootfs is configured,
+/// where the host user space *is* the guest.
+fn host_search(name: &str) -> Option<PathBuf> {
+    let path = env::var("PATH").unwrap_or_default();
+    for dir in split_path_list(&path) {
+        let candidate = PathBuf::from(&dir).join(name);
+        if crate::launcher::rootfs::is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Termux has neither `/bin` nor `/usr/bin`; its user space lives under
+/// `$PREFIX`. Applied only when no rootfs is configured, so a Debian guest
+/// keeps its real `/bin`.
+fn rewrite_legacy_prefix(path: &str) -> String {
+    let Some(prefix) = config().prefix.as_ref() else {
+        return path.to_string();
+    };
+    for dir in ["/bin/", "/usr/bin/"] {
+        if let Some(rest) = path.strip_prefix(dir) {
+            return prefix.join("bin").join(rest).to_string_lossy().into_owned();
+        }
+    }
+    path.to_string()
+}
+
+/// Locate the glibc loader for `interp` (a guest-visible path such as
+/// `/lib/ld-linux-aarch64.so.1`).
+///
+/// With a rootfs configured the loader must come from inside it: mixing a
+/// host loader with guest libraries produces a hybrid that matches neither
+/// side's expectations.
+pub fn find_loader(interp: &str, arch: Arch) -> Option<PathBuf> {
+    let cfg = config();
+    let rootfs = Rootfs::current();
+
+    if let Some(explicit) = &cfg.loader
+        && explicit.exists()
+    {
+        return Some(explicit.clone());
+    }
+
+    let name = Path::new(interp)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| arch.loader_name().to_string());
+
+    if rootfs.enabled() {
+        let mut candidates = vec![interp.to_string()];
+        for dir in ["/lib", "/usr/lib", "/lib64"] {
+            candidates.push(format!("{dir}/{name}"));
+        }
+        for candidate in candidates {
+            if let Some(physical) = rootfs.map_existing(&candidate) {
+                return Some(PathBuf::from(physical));
+            }
+        }
+        return None;
+    }
+
+    if Path::new(interp).exists() {
+        return Some(PathBuf::from(interp));
+    }
+    let alt = cfg.runtime_dir.as_ref()?.join("lib").join(&name);
     alt.exists().then_some(alt)
 }
 
+/// Locate the preload hook library.
+///
+/// Order matters: a library built against the rootfs' glibc must win over one
+/// built against the host's, because the guest loader resolves its versioned
+/// symbols against the guest libc.
 fn find_preload() -> Option<PathBuf> {
-    if let Ok(p) = env::var("BIONILUX_PRELOAD") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
+    let cfg = config();
+    let rootfs = Rootfs::current();
+
+    if let Some(p) = &cfg.preload
+        && p.exists()
+    {
+        return Some(p.clone());
+    }
+
+    for candidate in [ROOTFS_PRELOAD_DIR, "/usr/lib", "/usr/local/lib"] {
+        let logical = format!("{candidate}/libbionilux_preload.so");
+        if let Some(physical) = rootfs.map_existing(&logical) {
+            return Some(PathBuf::from(physical));
         }
     }
-    // Walk up from the current exe (dev: target/debug/bionilux -> project root).
+
+    // Development layout: target/<profile>/bionilux -> project root.
     if let Ok(exe) = env::current_exe() {
         let mut dir = exe.parent();
         for _ in 0..3 {
@@ -177,13 +300,18 @@ fn find_preload() -> Option<PathBuf> {
             dir = d.parent();
         }
     }
-    // Installed alongside glibc.
-    let p = glibc_dir().join("lib/libbionilux_preload.so");
-    p.exists().then_some(p)
+
+    if let Some(rt) = &cfg.runtime_dir {
+        let p = rt.join("lib/libbionilux_preload.so");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
-// Shebang script: resolve the interpreter, then rebuild argv.
-fn script(script: &Path, args: &[String], depth: u32) -> Result<Execution, Error> {
+/// Shebang script: resolve the interpreter, then rebuild argv.
+fn script(script: &Path, args: &[String], guest_cwd: &str, depth: u32) -> Result<Execution, Error> {
     if depth >= MAX_SHEBANG_DEPTH {
         return Err(Error::Unsupported("shebang recursion too deep".into()));
     }
@@ -191,42 +319,51 @@ fn script(script: &Path, args: &[String], depth: u32) -> Result<Execution, Error
     let (interp, interp_arg) =
         parse_shebang(script).ok_or_else(|| Error::Unsupported("not ELF or shebang".into()))?;
 
-    let interp = rewrite_termux(&interp);
-
-    // `#!/usr/bin/env prog` — resolve prog directly instead of running env,
-    // because env is native bionic and would bypass our rerouting.
-    // `-S` variant splits remaining words as separate arguments.
-    let (interp, interp_args): (String, Option<Vec<String>>) =
-        if Path::new(&interp).file_name() == Some("env".as_ref()) {
-            let arg = interp_arg
-                .ok_or_else(|| Error::Unsupported("env shebang without program".into()))?;
-            let mut words: Vec<String> = arg.split_whitespace().map(String::from).collect();
+    // `#!/usr/bin/env prog` — resolve prog directly rather than running env,
+    // because env would re-resolve it and, without a rootfs, the host's
+    // native `env` would escape the rerouting.
+    let (interp, interp_args, overrides) = if Path::new(&interp).file_name() == Some("env".as_ref())
+    {
+        let arg =
+            interp_arg.ok_or_else(|| Error::Unsupported("env shebang without program".into()))?;
+        let mut words: Vec<String> = arg.split_whitespace().map(String::from).collect();
+        if words.first().map(String::as_str) == Some("-S") {
+            words.remove(0);
+        }
+        // `env VAR=VALUE prog` assigns before running the program.
+        let mut overrides = Vec::new();
+        while words[0].contains('=') && !words[0].starts_with('-') {
+            let w = words.remove(0);
+            let (k, v) = w.split_once('=').expect("checked for '='");
+            overrides.push((k.to_string(), v.to_string()));
             if words.is_empty() {
-                return Err(Error::Unsupported("env shebang without program".into()));
+                break;
             }
-            if words[0] == "-S" {
-                words.remove(0);
-                if words.is_empty() {
-                    return Err(Error::Unsupported("env -S without program".into()));
-                }
-            }
-            let prog = words.remove(0);
-            let rest = if words.is_empty() { None } else { Some(words) };
-            (prog, rest)
-        } else {
-            (interp, interp_arg.map(|a| vec![a]))
-        };
+        }
+        if words.is_empty() {
+            return Err(Error::Unsupported("env shebang without program".into()));
+        }
+        let prog = words.remove(0);
+        let rest = if words.is_empty() { None } else { Some(words) };
+        (prog, rest, overrides)
+    } else {
+        (interp, interp_arg.map(|a| vec![a]), Vec::new())
+    };
 
-    let interp_path = which::which(&interp)
-        .map_err(|_| Error::Unsupported(format!("shebang interp not found: {interp}")))?;
+    let interp_path = resolve_target(&interp, guest_cwd)
+        .ok_or_else(|| Error::Unsupported(format!("shebang interp not found: {interp}")))?;
 
-    // Resolve the interpreter — may itself be glibc, box64-wrapped, or native.
     let interp_str = interp_path
         .to_str()
         .ok_or_else(|| Error::Unsupported("non-UTF-8 interpreter path".into()))?;
-    let inner = resolve_at(interp_str, std::slice::from_ref(&interp), depth + 1)?;
+    let inner = resolve_at(
+        interp_str,
+        std::slice::from_ref(&interp),
+        guest_cwd,
+        depth + 1,
+    )?;
 
-    // Start from inner.argv — preserves [BOX64, interp] for x86_64 interpreters.
+    // Start from inner.argv — preserves [BOX64, interp] for emulated targets.
     let mut argv = inner.argv.clone();
     if let Some(extra) = interp_args {
         argv.extend(extra);
@@ -240,19 +377,13 @@ fn script(script: &Path, args: &[String], depth: u32) -> Result<Execution, Error
         argv,
         loader: inner.loader,
         preload: inner.preload,
-        is_x86_64: inner.is_x86_64,
+        arch: inner.arch,
+        env_overrides: {
+            let mut o = inner.env_overrides;
+            o.extend(overrides);
+            o
+        },
     })
-}
-
-// Termux has no /bin or /usr/bin.
-fn rewrite_termux(p: &str) -> String {
-    let bin = termux_bin();
-    for prefix in ["/bin/", "/usr/bin/"] {
-        if let Some(rest) = p.strip_prefix(prefix) {
-            return format!("{}/{}", bin.display(), rest);
-        }
-    }
-    p.to_string()
 }
 
 fn parse_shebang(path: &Path) -> Option<(String, Option<String>)> {
@@ -278,35 +409,57 @@ fn parse_shebang(path: &Path) -> Option<(String, Option<String>)> {
     Some((interp, arg))
 }
 
+/// Guest working directory for a launch.
+///
+/// When the host cwd already sits inside the rootfs the guest keeps it — that
+/// is how a child inherits its parent's directory without a `chdir`.
+pub fn guest_cwd_for(cfg: &Config, rootfs: &Rootfs, pwd: &Path) -> String {
+    if rootfs.enabled() && rootfs.contains(pwd) {
+        return rootfs.unmap(&pwd.to_string_lossy());
+    }
+    cfg.guest_cwd.clone()
+}
+
+/// Physical directories the loader must be told about.
+///
+/// A Debian loader has the guest's `/lib/<triplet>` compiled into its default
+/// search path. Those are guest paths, so on Android they resolve against the
+/// host and find nothing. The physical equivalents are handed to the loader
+/// explicitly. Without a rootfs the host's own paths still work, so nothing is
+/// added.
+pub fn library_path(cfg: &Config, arch: Arch) -> Vec<String> {
+    let Some(root) = cfg.rootfs.as_ref() else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<String> = Vec::new();
+    let mut push = |dir: &str| {
+        let physical = root.join(dir.trim_start_matches('/'));
+        if physical.is_dir() {
+            let s = physical.to_string_lossy().into_owned();
+            if !dirs.contains(&s) {
+                dirs.push(s);
+            }
+        }
+    };
+    for dir in arch.lib_dirs() {
+        push(dir);
+    }
+    // Debian puts the loader in /lib on aarch64 and in /lib64 on x86_64.
+    push("/lib");
+    push("/usr/lib");
+    // Last resort: the rootfs root itself, for unusual layouts.
+    let root_s = root.to_string_lossy().into_owned();
+    if !dirs.contains(&root_s) {
+        dirs.push(root_s);
+    }
+    dirs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
-
-    // ── rewrite_termux ──────────────────────────────────────────────
-
-    #[test]
-    fn rewrite_bin_prefix() {
-        assert_eq!(rewrite_termux("/bin/sh"), format!("{}/bin/sh", prefix()));
-    }
-
-    #[test]
-    fn rewrite_usr_bin_prefix() {
-        assert_eq!(
-            rewrite_termux("/usr/bin/python3"),
-            format!("{}/bin/python3", prefix())
-        );
-    }
-
-    #[test]
-    fn rewrite_leaves_other_paths_alone() {
-        assert_eq!(rewrite_termux("/opt/foo/bar"), "/opt/foo/bar");
-        assert_eq!(rewrite_termux("sh"), "sh");
-        assert_eq!(rewrite_termux("/usr/local/bin/x"), "/usr/local/bin/x");
-    }
-
-    // ── parse_shebang ───────────────────────────────────────────────
 
     fn write_temp(content: &[u8]) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
@@ -314,6 +467,8 @@ mod tests {
         f.flush().unwrap();
         f
     }
+
+    // ── parse_shebang ───────────────────────────────────────────────
 
     #[test]
     fn shebang_with_arg() {
@@ -365,22 +520,46 @@ mod tests {
         assert!(arg.is_none());
     }
 
-    // ── find_loader ─────────────────────────────────────────────────
+    // ── resolve_target ──────────────────────────────────────────────
+    //
+    // With BIONILUX_ROOTFS unset (the default in this test process) the
+    // launcher behaves like upstream: the host user space is the guest.
 
     #[test]
-    fn find_loader_missing() {
-        assert!(find_loader("/nonexistent/foo/ld-fake.so").is_none());
+    fn relative_path_target_is_resolved_against_guest_cwd() {
+        let f = write_temp(b"#!/bin/sh\n");
+        let dir = f.path().parent().unwrap();
+        let name = f.path().file_name().unwrap().to_string_lossy().into_owned();
+        let found = resolve_target(&format!("./{name}"), &dir.to_string_lossy());
+        assert_eq!(found.unwrap(), f.path());
     }
 
     #[test]
-    fn find_loader_falls_back_to_glibc_dir() {
-        let loader = default_loader();
-        let fallback = glibc_dir().join("lib").join("ld-linux-aarch64.so.1");
-        let result = find_loader(&loader.to_string_lossy());
-        if fallback.exists() {
-            assert_eq!(result.as_deref(), Some(fallback.as_path()));
-        } else {
-            assert!(result.is_none());
-        }
+    fn missing_absolute_path_is_not_found() {
+        assert!(resolve_target("/nonexistent/definitely/not/here", "/").is_none());
+    }
+
+    #[test]
+    fn bare_name_uses_host_path_when_no_rootfs_is_configured() {
+        // `sh` exists on any POSIX host and must be found through PATH.
+        assert!(resolve_target("sh", "/").is_some());
+        assert!(resolve_target("bionilux-no-such-program", "/").is_none());
+    }
+
+    #[test]
+    fn legacy_prefix_rewrite_only_touches_bin_dirs() {
+        assert_eq!(rewrite_legacy_prefix("/opt/foo/bar"), "/opt/foo/bar");
+        assert_eq!(rewrite_legacy_prefix("sh"), "sh");
+        assert_eq!(
+            rewrite_legacy_prefix("/usr/local/bin/x"),
+            "/usr/local/bin/x"
+        );
+    }
+
+    // ── find_loader ─────────────────────────────────────────────────
+
+    #[test]
+    fn find_loader_missing_outside_any_rootfs() {
+        assert!(find_loader("/nonexistent/foo/ld-fake.so", Arch::Aarch64).is_none());
     }
 }

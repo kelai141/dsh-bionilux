@@ -1,0 +1,17 @@
+# Normalize line endings for everyone. Shell scripts and C sources are built
+# and executed on Linux (CI, devices), where a CRLF checkout breaks the shebang
+# and `#!/usr/bin/env bash` resolution.
+* text=auto
+
+*.sh    text eol=lf
+setup   text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.md    text eol=lf
+
+# Binary artefacts that must never be normalized.
+*.so    binary
+*.tar.xz binary
