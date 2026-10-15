@@ -148,3 +148,59 @@ strace 看不出来——它只显示 syscall 的返回值，而改写发生在�
 （`BIONILUX_DEBUG=1` 下看不到对应的 `map:` 行），因此子 make 报
 `make: /usr/bin/make: No such file or directory`。简单 Makefile 与所有走 shell 的命令不受影响。
 这是下一步的头号问题。
+## 10. 修正与补充（第二轮 arm64 真机验证）
+
+### 10.1 GNU make 的直接执行路径已修复（`eaccess`）
+
+之前记为"内核递归构建时 make 直接 exec 绕过预载"，根因找到了：GNU make 用
+`eaccess()` 判断配方命令是否可执行，而 glibc 的 `euidaccess`/`eaccess` 是**用户态实现**
+（不能用 `access(2)` 系统调用，那个测的是真实 uid），于是**自己内部 `stat()`** 路径。
+这个内部调用绕过预载 → 落到宿主机 → `ENOENT` → make 直接报错并**放弃，不 fork**。
+
+证据：strace 显示失败配方里**没有 clone/fork/execve**，而是恰好一次
+`newfstatat(AT_FDCWD, "/usr/bin/make", ...) = -1 ENOENT`（未映射的 guest 路径）。
+走 shell 的配方不受影响，所以只有直接执行路径坏——递归构建正是死在这里。
+
+修复：钩 `eaccess`/`euidaccess` 做路径映射。修好后 make 直接执行路径恢复正常。
+同时按符号扫描补齐：`execvpe`、`remove`、`lchmod`、`statfs64`、`scandir64`、`scandirat`、
+`posix_spawn_file_actions_addopen`/`_addchdir_np`。扫描工具留在
+`tests/helpers/unhooked-symbols.sh`。
+
+### 10.2 并行 make 是可以的（此前结论有误）
+
+第 8 节曾说 `mkfifo` 被 SELinux 拒绝、所以并行构建只能 `-j1`。**这是错的**：
+GNU make 的 jobserver 还支持管道模式，`make -jN --jobserver-style=pipe` 完全可用，
+已在 `-j8` 下验证（`Waiting for unfinished jobs` 说明确实并行）。先前只用了默认的
+FIFO 模式才失败。
+
+### 10.3 新 rootfs 必须先跑 `prepare-rootfs.sh`
+
+重建 rootfs 后漏跑了这一步，症状是 `awk`、`which` 找不到：Debian rootfs 里是**绝对符号
+链接**（`/usr/bin/awk -> /etc/alternatives/awk`），内核会拿它去**宿主机根**解析。
+脚本把它们改写成 rootfs 绝对路径（本次改写 32 个链接，且可重复执行）。
+注意它必须从**宿主侧**跑并传 `--rootfs <物理路径>`；在 guest 内部跑会扫错树。
+（脚本本身在仓库里是 LF；Windows 工作区检出成 CRLF 时，Android 的 `sh` 会拒绝 `set -eu`，
+推送到设备前需先转成 LF。）
+
+### 10.4 内核模块构建（KernelSU）——环境已证明可用，剩两个上游问题
+
+在 guest 里对 KernelSU（`tiann/KernelSU`，commit `200818c`）做了完整尝试：
+
+| 阶段 | 结果 |
+|---|---|
+| `git clone` 源码 | 通过 |
+| `apt` 装 `build-essential`/`git`/`linux-headers-arm64`/`strace` | 通过 |
+| `apt` 装 `linux-source-6.12`（145 MB）并解包 | 通过 |
+| `make defconfig` / `make modules_prepare -j8 --jobserver-style=pipe` | 通过 |
+| 用真源码树编 KernelSU 模块 | 编过 12+ 个 `.o`（`core/init.o`、`feature/*`、`hook/*`、`hook/arm64/*`），随后失败 |
+
+**剩下两个都不是运行时的问题**：
+
+1. `infra/file_wrapper.c` 要 `security/selinux/include/objsec.h`，而它又 `#include "flask.h"`
+   —— `flask.h` 是**构建时生成**的文件（由 `security/selinux` 子系统生成），所以需要一个
+   已经构建过的内核树，不只是 `modules_prepare`。
+2. `hook/syscall_hook_manager.c` 用的 `register_trace_sys_enter` 与新内核（6.12）的
+   tracepoint 签名不兼容 —— 这是 KernelSU 与内核版本的源码兼容问题。
+
+结论：容器能跑完整的内核构建流程（配置、prepare、并行编译、Kbuild 递归），
+`.ko` 未产出是内核树/上游兼容性所致，与 bionilux 无关。

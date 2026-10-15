@@ -111,11 +111,18 @@ papered over.
 * **Hard links are refused** device-wide — including inside the app's own
   private directory. `dpkg` needs `link()` for its backup step, so the preload
   falls back to copying.
-* **`mkfifo()` fails with `EACCES`** for the shell UID (SELinux). `make -j` uses
-  a named pipe for its jobserver, so parallel make must be `-j1`.
+* **`mkfifo()` fails with `EACCES`** for the shell UID (SELinux), so GNU make
+  cannot create its default FIFO jobserver. It does not need to: `make -jN
+  --jobserver-style=pipe` uses a pipe instead and works — verified with `-j8`
+  in a kernel build.
 * **`ldconfig` is statically linked**, so no preload can map it; it writes to
   Android's read-only `/etc`. `prepare-rootfs.sh` installs a shim.
 * **Static binaries** are outside `LD_PRELOAD`'s reach entirely.
+
+A fresh rootfs also needs `scripts/prepare-rootfs.sh` before anything else: it
+rewrites the **absolute** symlinks a Debian rootfs contains, which the kernel
+otherwise resolves against the *host* root — that is what makes `/usr/bin/awk`
+and `/usr/bin/which` work at all.
 
 **`LD_PRELOAD` reaches only public, PLT-crossing functions.** glibc's *internal*
 calls never leave the library, so anything libc does for itself resolves against
@@ -130,12 +137,16 @@ the host. Each case is handled at the public API the program actually calls:
 | `dlopen` of a path | `dlopen` — a language runtime's extension module, PAM, NSS plugins |
 | `readlink("/proc/self/fd/N")` | the physical path is used internally, the guest path is presented |
 
-**GNU make's direct `exec` path.** When a recipe or `$(shell ...)` command
-contains no shell metacharacter, make execs it itself rather than through
-`/bin/sh`. In the kernel's recursive build this path was observed to bypass the
-preload, so a `make`-based kernel build does not complete. Simple makefiles and
-every command that goes through a shell are unaffected. This is the next thing
-to fix.
+**Where the preload cannot reach.** The one class that needed an extra idea is
+`eaccess()`/`euidaccess()`: glibc implements it in user space — it cannot use
+the `access(2)` syscall, which tests the real uid, so it `stat()`s the path
+itself and compares the mode bits. That stat is an internal call no preload can
+see, so an absolute guest path reached the host and reported `ENOENT`. GNU make
+uses `eaccess()` to decide whether a recipe command is executable, and when it
+says no, make reports "No such file or directory" and gives up **without
+forking** — a syscall trace of the failing recipe contains no `clone`, `fork` or
+`execve` at all. Recipes whose command went through a shell were unaffected, so
+only make's direct-exec path broke. Mapping the path fixes it.
 
 ## How it works
 
