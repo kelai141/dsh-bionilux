@@ -91,13 +91,17 @@ FAKE_ROOT=1
 ```bash
 # 1. 解压到暂存目录，校验 manifest 里的 SHA-256
 # 2. 处理 rootfs（必需：绝对符号链接、DNS、必需目录）
-scripts/prepare-rootfs.sh --rootfs "$STAGE" --dns "$DNS_SERVERS"
-scripts/prepare-rootfs.sh --rootfs "$STAGE" --verify    # 失败则不要启用
+sh scripts/prepare-rootfs.sh --rootfs "$STAGE" --relative-links --dns "$DNS_SERVERS"
+sh scripts/prepare-rootfs.sh --rootfs "$STAGE" --relative-links --verify    # 失败则不要启用
 # 3. 原子 rename 到正式位置，再启用
 ```
 
+暂存目录之后要 rename，必须使用 `--relative-links`；默认绝对模式仍保留，
+但只能在最终物理位置准备，之后不能直接搬移。相对模式下 guest 的 readlink 会看到相对目标。
+`--verify` 和 `--dry-run` 不修改文件或权限；准备失败则不得启用。
+
 `--dns` 的取值必须来自**设备当前网络**（Android 无 `/etc/resolv.conf`），
-详见 [STATUS.md](STATUS.md) §4.1。
+详见 [STATUS.md](STATUS.md) §9 的设备验证记录；网络可达性仍需按设备检查。
 
 ## 6. 卸载
 

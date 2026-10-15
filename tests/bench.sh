@@ -16,7 +16,7 @@
 # environment. Numbers from different devices are not comparable, and a device
 # that translates x86_64 through a native bridge is not comparable to one that
 # runs it natively.
-set -u
+set -euo pipefail
 
 LAUNCHER=""
 ROOTFS=""
@@ -29,22 +29,40 @@ usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --launcher) LAUNCHER="$2"; shift 2 ;;
-        --rootfs)   ROOTFS="$2";   shift 2 ;;
-        --runtime)  RUNTIMES="$(echo "$2" | tr ',' ' ')"; shift 2 ;;
-        --runs)     RUNS="$2";     shift 2 ;;
-        --json)     JSON="$2";     shift 2 ;;
-        --log-dir)  LOG_DIR="$2";  shift 2 ;;
+        --launcher|--rootfs|--runtime|--runs|--json|--log-dir)
+            [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 requires a value" >&2; exit 2; }
+            case "$1" in
+                --launcher) LAUNCHER="$2" ;; --rootfs) ROOTFS="$2" ;;
+                --runtime) RUNTIMES="${2//,/ }" ;; --runs) RUNS="$2" ;;
+                --json) JSON="$2" ;; --log-dir) LOG_DIR="$2" ;;
+            esac
+            shift 2 ;;
         -h|--help)  usage ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
 done
 
-[ -n "$LAUNCHER" ] || usage
+case "$RUNS" in ''|*[!0-9]*) echo "--runs must be a positive integer" >&2; exit 2 ;; esac
+RUNS=$((10#$RUNS))
+[ "$RUNS" -gt 0 ] || { echo "--runs must be positive" >&2; exit 2; }
+[ "$RUNTIMES" != both ] || RUNTIMES="bionilux proot"
+[ -n "$RUNTIMES" ] || usage
+for runtime in $RUNTIMES; do
+    case "$runtime" in
+        bionilux)
+            [ -n "$LAUNCHER" ] && [ -x "$LAUNCHER" ] || { echo "--launcher must name an executable" >&2; exit 2; } ;;
+        proot) PROOT_BIN="$(command -v proot)" || { echo "proot not installed" >&2; exit 2; } ;;
+        *) echo "unknown runtime: $runtime" >&2; exit 2 ;;
+    esac
+done
+if [ -n "$JSON" ]; then
+    command -v python3 >/dev/null || { echo "--json requires python3" >&2; exit 2; }
+fi
 [ -n "$ROOTFS" ] || usage
-[ -x "$LAUNCHER" ] || { echo "launcher not executable: $LAUNCHER" >&2; exit 2; }
 [ -d "$ROOTFS" ] || { echo "not a directory: $ROOTFS" >&2; exit 2; }
-LAUNCHER="$(cd "$(dirname "$LAUNCHER")" && pwd)/$(basename "$LAUNCHER")"
+if [ -n "$LAUNCHER" ]; then
+    LAUNCHER="$(cd "$(dirname "$LAUNCHER")" && pwd)/$(basename "$LAUNCHER")"
+fi
 ROOTFS="$(cd "$ROOTFS" && pwd)"
 mkdir -p "$LOG_DIR"
 
@@ -54,17 +72,23 @@ GUEST_ENV=(
 )
 
 # ─── measurement ────────────────────────────────────────────────────
-# Milliseconds for one guest command, using bash's EPOCHREALTIME so no
-# external timer process is needed inside the measured region.
+# Milliseconds for one successful guest command, including launcher startup.
 time_guest() {
-    local runtime="$1" cmd="$2" start end
-    start=$(date +%s%N)
+    local runtime="$1" cmd="set -e; set -o pipefail; $2" start end rc
+    start=$(date +%s%N) || return $?
     case "$runtime" in
         bionilux) "$LAUNCHER" --rootfs "$ROOTFS" --guest-cwd / /bin/bash -c "$cmd" ;;
-        proot)    env -i "${GUEST_ENV[@]}" proot -r "$ROOTFS" -0 -w / \
+        proot)    env -i "${GUEST_ENV[@]}" "$PROOT_BIN" -r "$ROOTFS" -0 -w / \
                       /bin/bash -c "$cmd" ;;
+        *) echo "unknown runtime: $runtime" >&2; return 2 ;;
     esac >/dev/null 2>&1
-    end=$(date +%s%N)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "$runtime command failed (exit $rc): $cmd" >&2
+        return "$rc"
+    fi
+    end=$(date +%s%N) || return $?
+    case "$start$end" in *[!0-9]*) echo "date must support nanosecond timestamps" >&2; return 1 ;; esac
     echo $(( (end - start) / 1000000 ))
 }
 
@@ -86,9 +110,9 @@ spread() {
 measure() {
     local runtime="$1" name="$2" cmd="$3"
     local samples=() i ms
-    time_guest "$runtime" "$cmd" >/dev/null
+    time_guest "$runtime" "$cmd" >/dev/null || return $?
     for i in $(seq 1 "$RUNS"); do
-        ms=$(time_guest "$runtime" "$cmd")
+        ms=$(time_guest "$runtime" "$cmd") || return $?
         samples+=("$ms")
     done
     local med spr
@@ -138,14 +162,10 @@ printf 'runtime benchmark: %s runs per case (median, after one warm-up)\n' "$RUN
 printf 'launcher: %s\nrootfs:   %s\n' "$LAUNCHER" "$ROOTFS"
 
 for runtime in $RUNTIMES; do
-    if [ "$runtime" = proot ] && ! command -v proot >/dev/null; then
-        echo "proot not installed, skipping"
-        continue
-    fi
     printf '\n== %s ==\n' "$runtime"
     for entry in "${CASE_NAMES[@]}"; do
         name="${entry%%=*}"
-        measure "$runtime" "$name" "$(case_cmd "$name")"
+        measure "$runtime" "$name" "$(case_cmd "$name")" || exit 1
     done
 done
 
@@ -179,16 +199,18 @@ for rt in $RUNTIMES; do
 done
 
 if [ -n "$JSON" ]; then
-    {
-        printf '{\n  "runs": %s,\n  "launcher": "%s",\n  "rootfs": "%s",\n  "results": [\n' \
-            "$RUNS" "$LAUNCHER" "$ROOTFS"
-        first=1
-        awk -F'\t' '{
-            if (!first) printf ",\n"
-            first=0
-            printf "    {\"runtime\": \"%s\", \"case\": \"%s\", \"median_ms\": %s, \"spread_ms\": %s}", $1, $2, $3, $4
-        } END { printf "\n" }' "$LOG_DIR/raw.tsv"
-        printf '  ]\n}\n'
-    } > "$JSON"
+    python3 - "$JSON" "$RUNS" "$LAUNCHER" "$ROOTFS" "$LOG_DIR/raw.tsv" <<'PY'
+import csv
+import json
+import sys
+path, runs, launcher, rootfs, raw = sys.argv[1:]
+with open(raw, newline="") as stream:
+    results = [dict(runtime=r, case=c, median_ms=int(m), spread_ms=int(s))
+               for r, c, m, s, samples in csv.reader(stream, delimiter="\t")]
+with open(path, "w") as stream:
+    json.dump(dict(runs=int(runs), launcher=launcher, rootfs=rootfs, results=results), stream, indent=2)
+    stream.write("\n")
+PY
+    [ $? -eq 0 ] || exit 1
     echo "wrote $JSON"
 fi

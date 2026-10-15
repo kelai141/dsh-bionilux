@@ -12,14 +12,18 @@
 | PRoot | Ubuntu 发行版包 `proot`（默认，未额外调优） |
 | rootfs | 同一份 Debian 13 (trixie) minimal（`debootstrap --variant=minbase`），已用 `scripts/prepare-rootfs.sh` 处理 |
 | 命令 | 两个后端跑**完全相同**的 guest 命令 |
-| 环境 | 两侧都用同一份 `env -i`（PATH/HOME/TMPDIR/TERM/LANG），避免 host 环境差异污染结果 |
+| 环境 | PRoot 使用 `env -i`；bionilux 由 launcher 构造 guest 环境，不能宣称两侧宿主环境完全一致 |
 | 采样 | 每例 1 次预热丢弃 + 5 次采样，报**中位数**与**极差** |
 | 复现 | `tests/bench.sh --launcher ... --rootfs ... --runs 5` |
 
 > 数据来自 WSL2，不是手机。Android 上的绝对数字会不同；比值受 CPU、内核、文件系统影响。
 > 本机 x86_64 是原生执行；被测的 Android 模拟器走 native bridge，**不能**用于性能结论。
 
-## 2. 结果（中位数）
+这些是历史采样，不是本次修复后重新测得的结果。旧脚本没有拒绝失败的命令，
+因此数值应重新验证后再用于后端选择。`cold_start` 也经过预热且由 Bash 包装，
+不是严格的冷缓存、裸 `/bin/true` 启动测量；差分成本不是独立 syscall 成本。
+
+## 2. 历史结果（中位数）
 
 | 用例 | bionilux | PRoot | 比值 |
 |---|---|---|---|

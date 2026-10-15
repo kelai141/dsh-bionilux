@@ -7,7 +7,7 @@
 # single runtime agreeing with itself proves nothing.
 #
 #   tests/acceptance.sh --launcher ./bionilux --rootfs /path/to/rootfs
-#   tests/acceptance.sh ... --runtime both        # differential run
+#   bash tests/acceptance.sh ... --runtime both   # local sequential comparison
 #   tests/acceptance.sh ... --stage a             # path basics only
 #
 # Stage A  guest paths, cwd, PATH, symlinks, no host leakage
@@ -35,31 +35,46 @@ usage() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --launcher) LAUNCHER="$2"; shift 2 ;;
-        --rootfs)   ROOTFS="$2";   shift 2 ;;
-        --runtime)  RUNTIME="$2";  shift 2 ;;
-        --stage)    STAGE="$2";    shift 2 ;;
-        --log-dir)  LOG_DIR="$2";  shift 2 ;;
-        --via)      VIA="$2";      shift 2 ;;
-        --adb)      ADB="$2";      shift 2 ;;
-        --serial)   SERIAL="$2";   shift 2 ;;
+        --launcher|--rootfs|--runtime|--stage|--log-dir|--via|--adb|--serial)
+            [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 requires a value" >&2; exit 2; }
+            case "$1" in
+                --launcher) LAUNCHER="$2" ;; --rootfs) ROOTFS="$2" ;;
+                --runtime) RUNTIME="$2" ;; --stage) STAGE="$2" ;;
+                --log-dir) LOG_DIR="$2" ;; --via) VIA="$2" ;;
+                --adb) ADB="$2" ;; --serial) SERIAL="$2" ;;
+            esac
+            shift 2 ;;
         -h|--help)  usage ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
 done
 
-[ -n "$LAUNCHER" ] || { echo "--launcher is required" >&2; exit 2; }
+case "$RUNTIME" in bionilux|proot|both) ;; *) echo "unknown runtime: $RUNTIME" >&2; exit 2 ;; esac
+case "$VIA" in local|adb) ;; *) echo "unknown transport: $VIA" >&2; exit 2 ;; esac
+case "$STAGE" in a|b|c|all) ;; *) echo "unknown stage: $STAGE" >&2; exit 2 ;; esac
+if [ "$VIA" = adb ] && [ "$RUNTIME" != bionilux ]; then
+    echo "ADB transport supports only --runtime bionilux; compare PRoot locally" >&2
+    exit 2
+fi
+if [ "$RUNTIME" != bionilux ]; then
+    PROOT_BIN="$(command -v proot)" || { echo "proot not found" >&2; exit 2; }
+fi
+if [ "$RUNTIME" != proot ]; then
+    [ -n "$LAUNCHER" ] || { echo "--launcher is required" >&2; exit 2; }
+fi
 [ -n "$ROOTFS" ]   || { echo "--rootfs is required" >&2; exit 2; }
 if [ "$VIA" = adb ]; then
     [ -n "$SERIAL" ] || { echo "--serial is required with --via adb" >&2; exit 2; }
-    command -v "${ADB%% *}" >/dev/null || { echo "adb not found: $ADB" >&2; exit 2; }
+    command -v "$ADB" >/dev/null || { echo "adb not found: $ADB" >&2; exit 2; }
 else
-    [ -x "$LAUNCHER" ] || { echo "launcher not executable: $LAUNCHER" >&2; exit 2; }
+    if [ "$RUNTIME" != proot ]; then
+        [ -x "$LAUNCHER" ] || { echo "launcher not executable: $LAUNCHER" >&2; exit 2; }
+        LAUNCHER="$(cd "$(dirname "$LAUNCHER")" && pwd)/$(basename "$LAUNCHER")"
+    fi
     [ -d "$ROOTFS" ]   || { echo "rootfs not a directory: $ROOTFS" >&2; exit 2; }
-    LAUNCHER="$(cd "$(dirname "$LAUNCHER")" && pwd)/$(basename "$LAUNCHER")"
     ROOTFS="$(cd "$ROOTFS" && pwd)"
 fi
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" || exit 1
 
 G='\033[0;32m' R='\033[0;31m' Y='\033[1;33m' N='\033[0m'
 pass() { printf "${G}[PASS]${N} %s\n" "$*"; }
@@ -78,10 +93,8 @@ SKIPPED=""
 #   local  the launcher runs on this machine
 #   adb    the launcher runs on a device, reached with `adb shell`
 #
-# Both backends are given the same environment, so a difference in the output
-# is a difference in path semantics rather than in what the host happened to
-# export. bionilux supplies a clean guest environment on its own; PRoot would
-# otherwise inherit the host's.
+# PRoot receives explicit guest defaults. bionilux constructs its own guest
+# environment; BIONILUX_* overrides can intentionally change those defaults.
 GUEST_ENV=(
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     "HOME=/root"
@@ -108,12 +121,17 @@ guest_local() {
             ;;
         proot)
             GUEST_OUT="$(env -i "${GUEST_ENV[@]}" \
-                proot -r "$ROOTFS" -0 -w / "${PROOT_ARGS[@]}" /bin/bash -c "$cmd" 2>&1)"
+                "$PROOT_BIN" -r "$ROOTFS" -0 -w / "${PROOT_ARGS[@]}" /bin/bash -c "$cmd" 2>&1)"
             GUEST_RC=$?
             ;;
         *)
             echo "unknown runtime: $RUNTIME" >&2; exit 2 ;;
     esac
+}
+
+quote_remote() {
+    local value=${1//\'/\'\\\'\'}
+    printf "'%s'" "$value"
 }
 
 # The command is base64 encoded and written into the rootfs, so no quoting
@@ -122,12 +140,13 @@ guest_local() {
 guest_adb() {
     local cmd="$1" b64
     b64="$(printf '%s' "$cmd" | base64 | tr -d '\n')"
-    local script="$ROOTFS/tmp/bn-case.sh"
+    local script="$ROOTFS/tmp/bn-case-$$.sh"
     local out
     out="$("$ADB" -s "$SERIAL" shell \
-        "printf %s $b64 | base64 -d > $script && \
-         $LAUNCHER --rootfs $ROOTFS --guest-cwd / /bin/bash /tmp/bn-case.sh; \
-         echo \"__RC=\$?\"" 2>&1)"
+        "printf %s $b64 | base64 -d > $(quote_remote "$script") && \
+         $(quote_remote "$LAUNCHER") --rootfs $(quote_remote "$ROOTFS") --guest-cwd / /bin/bash /tmp/bn-case-$$.sh; \
+         rc=\$?; rm -f $(quote_remote "$script"); printf '\\n__RC=%s\\n' \"\$rc\"" 2>&1)"
+    out="${out//$'\r'/}"
     GUEST_RC="$(printf '%s\n' "$out" | sed -n 's/^__RC=//p' | tail -n1)"
     GUEST_OUT="$(printf '%s\n' "$out" | sed '/^__RC=/d')"
     # adb shell reports the device shell's status; normalise CRLF it may add.
@@ -139,7 +158,7 @@ check() { # check <case-name> <command> <expected>
     local name="$1" cmd="$2" want="$3"
     guest "$cmd"
     record "$name" "$cmd"
-    if [ "$GUEST_OUT" = "$want" ]; then
+    if [ "$GUEST_RC" = 0 ] && [ "$GUEST_OUT" = "$want" ]; then
         pass "$name"
     else
         fail "$name: want '$want', got '$GUEST_OUT' (rc=$GUEST_RC)"
@@ -163,8 +182,8 @@ check_contains() { # check_contains <case-name> <command> <substring>
     local name="$1" cmd="$2" want="$3"
     guest "$cmd"
     record "$name" "$cmd"
-    case "$GUEST_OUT" in
-        *"$want"*) pass "$name" ;;
+    case "$GUEST_RC:$GUEST_OUT" in
+        0:*"$want"*) pass "$name" ;;
         *) fail "$name: '$want' not found in '$GUEST_OUT'"; FAILED_CASES="$FAILED_CASES $name" ;;
     esac
 }
@@ -183,6 +202,15 @@ record() {
     } > "$LOG_DIR/$RUNTIME.$1.log"
 }
 
+if [ "$VIA" = adb ]; then
+    "$ADB" -s "$SERIAL" shell \
+        "test -x $(quote_remote "$LAUNCHER") && test -d $(quote_remote "$ROOTFS")" || {
+        echo "device launcher/rootfs preflight failed" >&2; exit 2;
+    }
+fi
+ROOTFS="${ROOTFS%/}"
+[ -n "$ROOTFS" ] || { echo "refusing to use host root /" >&2; exit 2; }
+
 # ─── host-only markers ──────────────────────────────────────────────
 # Created on the host, and deliberately absent from the rootfs afterwards, so
 # a fallback to host paths shows up as a leak instead of a subtle difference.
@@ -199,14 +227,14 @@ host_root() {
     if [ "$VIA" = adb ]; then printf '/data/local/tmp'; else printf '/tmp'; fi
 }
 
-HOST_MARKER="$(host_root)/bionilux-host-only"
-HOST_SIBLING="$(host_root)/bionilux-acceptance-sibling"
-host_cmd "echo host > $HOST_MARKER" >/dev/null 2>&1 || true
-host_cmd "echo host > $HOST_SIBLING" >/dev/null 2>&1 || true
+HOST_MARKER="$(host_root)/bionilux-host-only-$$"
+HOST_SIBLING="$(dirname "$ROOTFS")/bionilux-acceptance-sibling-$$"
 cleanup_markers() {
-    host_cmd "rm -f $HOST_MARKER $HOST_SIBLING" >/dev/null 2>&1 || true
+    host_cmd "rm -f $(quote_remote "$HOST_MARKER") $(quote_remote "$HOST_SIBLING")" >/dev/null 2>&1 || true
 }
 trap cleanup_markers EXIT
+host_cmd "echo host > $(quote_remote "$HOST_MARKER")" >/dev/null 2>&1 || exit 1
+host_cmd "echo host > $(quote_remote "$HOST_SIBLING")" >/dev/null 2>&1 || exit 1
 
 # ─── stage A: guest paths ───────────────────────────────────────────
 stage_a() {
@@ -228,7 +256,7 @@ stage_a() {
     check "a09_dotdot"         'cd /usr/bin && cd ../share && printf "%s\n" "$PWD"' "/usr/share"
     check "a10_dotdot_root"    'cd / && cd .. && printf "%s\n" "$PWD"'             "/"
     check "a10b_dotdot_clamped" 'cd / && cd ../../.. && printf "%s\n" "$PWD"'      "/"
-    check "a10c_no_escape" 'cd / && test -e ../bionilux-acceptance-sibling && echo LEAK || echo clean' "clean"
+    check "a10c_no_escape" 'cd / && test -e ../'"$(basename "$HOST_SIBLING")"' && echo LEAK || echo clean' "clean"
 
     # Symlinks: Debian's /bin is a symlink into /usr.
     check "a11_symlink"        'readlink -f /bin/ls'  "/usr/bin/ls"
@@ -246,10 +274,10 @@ stage_a() {
 
     # No host leakage. On a device the "host" is Android, i.e. exactly what a
     # guest must not be able to reach.
-    check "a15_no_leak_tmp" 'test -e '"$HOST_MARKER"' && echo LEAK || echo clean' "clean"
+    check "a15_no_leak_tmp" 'test -e '"$(quote_remote "$HOST_MARKER")"' && echo LEAK || echo clean' "clean"
 
     # A host file next to the rootfs, reachable only by a ".." escape.
-    check "a16_no_escape_to_host" 'cd / && test -e '"$HOST_SIBLING"' && echo LEAK || echo clean' "clean"
+    check "a16_no_escape_to_host" 'cd / && test -e '"$(quote_remote "$HOST_SIBLING")"' && echo LEAK || echo clean' "clean"
 
     # Linux file systems the kernel owns stay visible.
     check "a17_proc"       'test -r /proc/self/status && echo yes'  "yes"
@@ -268,7 +296,7 @@ stage_a() {
 
     # Writes land inside the guest.
     check "a19_write"      'echo hi > /tmp/bn-a19 && cat /tmp/bn-a19' "hi"
-    if host_cmd "test -f $ROOTFS/tmp/bn-a19 && echo yes" | grep -q yes; then
+    if host_cmd "test -f $(quote_remote "$ROOTFS/tmp/bn-a19") && echo yes" | grep -q yes; then
         pass "a20_write_inside_rootfs"
     else
         fail "a20_write_inside_rootfs: file missing from $ROOTFS/tmp"
@@ -322,7 +350,7 @@ check_excludes() { # check_excludes <case-name> <command> <forbidden-substring>
     record "$name" "$cmd"
     case "$GUEST_OUT" in
         *"$bad"*) fail "$name: found '$bad' in '$GUEST_OUT'"; FAILED_CASES="$FAILED_CASES $name" ;;
-        *) pass "$name" ;;
+        *) if [ "$GUEST_RC" = 0 ]; then pass "$name"; else fail "$name: exit $GUEST_RC"; FAILED_CASES="$FAILED_CASES $name"; fi ;;
     esac
 }
 
@@ -338,8 +366,10 @@ stage_c() {
 
     info "apt-get update (needs a working resolver inside the guest)"
     check "c01_apt_update_no_fetch_errors" \
-        'out=$(apt-get update 2>&1); case "$out" in
-             *"Failed to fetch"*|*"Temporary failure resolving"*|*"Could not resolve"*) echo FETCH-FAILED ;;
+        'out=$(apt-get -o APT::Update::Error-Mode=any update 2>&1); rc=$?
+         if [ "$rc" -ne 0 ]; then printf "%s\n" "$out"; exit "$rc"; fi
+         case "$out" in
+             *"Failed to fetch"*|*"Temporary failure resolving"*|*"Could not resolve"*) echo FETCH-FAILED; exit 1 ;;
              *) echo fetch-ok ;;
          esac' "fetch-ok"
 
@@ -352,7 +382,7 @@ stage_c() {
         check "c02_apt_install" \
             'apt-get install -y --no-install-recommends hello >/dev/null 2>&1 && echo installed' "installed"
 
-        if host_cmd "test -e $ROOTFS/usr/bin/hello && echo yes" | grep -q yes; then
+        if host_cmd "test -e $(quote_remote "$ROOTFS/usr/bin/hello") && echo yes" | grep -q yes; then
             pass "c03_package_files_present"
         else
             fail "c03_package_files_present: /usr/bin/hello missing from the rootfs"
@@ -366,7 +396,7 @@ stage_c() {
     fi
 
     # dpkg's own state must be coherent. This needs no network.
-    check "c06_dpkg_audit" 'dpkg --audit >/dev/null && echo audit-ok' "audit-ok"
+    check "c06_dpkg_audit" 'out=$(dpkg --audit 2>&1) && test -z "$out" && echo audit-ok' "audit-ok"
 
     # The resolver itself, once more directly.
     if guest_has_dns; then
@@ -380,32 +410,45 @@ stage_c() {
 # assertions so "cannot test" never looks like "tested and passed".
 guest_has_dns() {
     guest 'getent hosts deb.debian.org >/dev/null 2>&1 && echo dns-ok'
-    case "$GUEST_OUT" in
-        *dns-ok*) return 0 ;;
+    case "$GUEST_RC:$GUEST_OUT" in
+        0:dns-ok) return 0 ;;
         *) return 1 ;;
     esac
 }
 
 # ─── run ────────────────────────────────────────────────────────────
-section "runtime identity"
-guest 'uname -m; cat /etc/debian_version 2>/dev/null; echo "uid=$(id -u)"'
-printf '%s\n' "$GUEST_OUT"
-record "identity" "uname -m; cat /etc/debian_version; id -u"
+run_runtime() {
+    FAILED=0
+    FAILED_CASES=""
+    SKIPPED=""
+    section "runtime identity"
+    guest 'uname -m; cat /etc/debian_version 2>/dev/null; echo "uid=$(id -u)"'
+    printf '%s\n' "$GUEST_OUT"
+    record "identity" "uname -m; cat /etc/debian_version; id -u"
 
-case "$STAGE" in
-    a)   stage_a ;;
-    b)   stage_b ;;
-    c)   stage_c ;;
-    all) stage_a; stage_b; stage_c ;;
-    *)   echo "unknown stage: $STAGE" >&2; exit 2 ;;
-esac
+    case "$STAGE" in
+        a)   stage_a ;;
+        b)   stage_b ;;
+        c)   stage_c ;;
+        all) stage_a; stage_b; stage_c ;;
+        *)   echo "unknown stage: $STAGE" >&2; exit 2 ;;
+    esac
 
-section "summary ($RUNTIME)"
-[ -n "$SKIPPED" ] && printf "${Y}skipped (not verifiable here):${N}%s\n" "$SKIPPED"
-if [ "$FAILED" -eq 0 ]; then
-    printf "${G}all cases passed${N}\n"
-    exit 0
-else
-    printf "${R}%d case(s) failed:${N}%s\n" "$FAILED" "$FAILED_CASES"
-    exit 1
-fi
+    section "summary ($RUNTIME)"
+    [ -n "$SKIPPED" ] && printf "${Y}skipped (not verifiable here):${N}%s\n" "$SKIPPED"
+    if [ "$FAILED" -eq 0 ]; then
+        printf "${G}all cases passed${N}\n"
+        return 0
+    else
+        printf "${R}%d case(s) failed:${N}%s\n" "$FAILED" "$FAILED_CASES"
+        return 1
+    fi
+}
+
+RUNTIMES="$RUNTIME"
+[ "$RUNTIME" != both ] || RUNTIMES="bionilux proot"
+RESULT=0
+for RUNTIME in $RUNTIMES; do
+    run_runtime || RESULT=1
+done
+exit "$RESULT"

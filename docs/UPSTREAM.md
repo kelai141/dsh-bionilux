@@ -53,9 +53,9 @@ git fetch upstream
 git log --oneline upstream/main ^HEAD          # 看有哪些新提交
 git rebase upstream/main                       # 冲突集中在上面 patch 清单里的文件
 cargo test && cargo clippy --all-targets -- -D warnings
-tests/preload_paths.sh                         # 无需设备
-tests/acceptance.sh --launcher ... --rootfs ... --stage all
-tests/bench.sh --launcher ... --rootfs ...     # 记录性能是否漂移
+bash tests/preload_paths.sh                    # 无需设备
+bash tests/acceptance.sh --launcher ... --rootfs ... --stage all
+bash tests/bench.sh --launcher ... --rootfs ...     # 记录性能是否漂移
 ```
 
 **rebase 后必须重跑**：`preload_paths.sh`（hook 层）、`acceptance.sh` 阶段 A（映射语义）、
@@ -65,6 +65,6 @@ tests/bench.sh --launcher ... --rootfs ...     # 记录性能是否漂移
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| glibc 内部符号可见性变化 | 某些入口从可拦截变为不可拦截 | `preload_paths.sh` 覆盖 `_FORTIFY_SOURCE` 变体与 NSS 路径，能早期发现 |
+| glibc 内部符号可见性变化 | 某些入口从可拦截变为不可拦截 | `preload_paths.sh` 覆盖 `_FORTIFY_SOURCE`；`runtime.sh` 补充 hosts/group 等 API 回归，不代表完整 NSS 覆盖 |
 | 上游 `/etc` 特例逻辑变化 | 与本 fork 的统一映射层语义冲突 | 本 fork 已删除该特例；rebase 时不要重新引入 |
 | box64 行为变化 | 跨架构路径回归 | 本 fork 的同架构分支不依赖 box64；x86_64 宿主上不受影响 |

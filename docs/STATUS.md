@@ -2,7 +2,8 @@
 
 > 本文件随每次提交更新。只写**有证据**的事，没验证的明确标注。
 
-最后更新基线：本轮工作结束时的工作区状态。
+记录说明：第 1–6 节保留早期 x86_64 验证历史，不作为当前 ARM64 阻塞清单。
+当前已记录的 ARM64 设备结果与 GNU make 修正见第 9–10 节；本次 host 回归不新增设备兼容性结论。
 
 ## 1. 总体
 
@@ -123,8 +124,8 @@ strace 看不出来——它只显示 syscall 的返回值，而改写发生在�
 | 现象 | 根因 | 规避 |
 |---|---|---|
 | 创建硬链接一律 `EPERM` | 设备策略（连 App 自己的私有目录也一样） | `link`/`linkat` 回退为复制；dpkg 依赖此 |
-| `mkfifo()` 返回 `EACCES` | SELinux | `make` 的 jobserver 用命名管道，并行构建只能 `-j1` |
-| `ldconfig` 写入只读的 `/etc` | 它是**静态链接**的，预载无法介入 | `prepare-rootfs.sh` 装 shim |
+| `mkfifo()` 返回 `EACCES` | SELinux | 默认 FIFO 受限；改用 `--jobserver-style=pipe`，见 §10.2 |
+| `ldconfig` 写入只读的 `/etc` | 它是**静态链接**的，预载无法介入 | 脚本不安装 shim；集成方需显式处理依赖 ldconfig 的配置步骤 |
 | 静态链接的程序完全不生效 | 无 `PT_INTERP`/无 `NEEDED` | 无法规避 |
 
 ## 9. 本轮 arm64 真机验证（vivo V2425A，Android 16 / SDK 36，SELinux enforcing）
@@ -143,7 +144,7 @@ strace 看不出来——它只显示 syscall 的返回值，而改写发生在�
 | `cargo test` | 34 passed（WSL Linux） |
 | `cargo fmt --check` / `cargo clippy` | 通过 |
 
-**仍未完成**：kernel（如 KernelSU 模块）级别的 `make` 递归构建。当配方或 `$(shell ...)`
+**历史问题（已由 §10.1 更正）**：kernel（如 KernelSU 模块）级别的 `make` 递归构建。当配方或 `$(shell ...)`
 里没有 shell 元字符时，GNU make 会**自己** exec 而不经过 `/bin/sh`；实测这条路径绕过了预载
 （`BIONILUX_DEBUG=1` 下看不到对应的 `map:` 行），因此子 make 报
 `make: /usr/bin/make: No such file or directory`。简单 Makefile 与所有走 shell 的命令不受影响。
@@ -179,8 +180,7 @@ FIFO 模式才失败。
 链接**（`/usr/bin/awk -> /etc/alternatives/awk`），内核会拿它去**宿主机根**解析。
 脚本把它们改写成 rootfs 绝对路径（本次改写 32 个链接，且可重复执行）。
 注意它必须从**宿主侧**跑并传 `--rootfs <物理路径>`；在 guest 内部跑会扫错树。
-（脚本本身在仓库里是 LF；Windows 工作区检出成 CRLF 时，Android 的 `sh` 会拒绝 `set -eu`，
-推送到设备前需先转成 LF。）
+（脚本由 .gitattributes 固定为 LF；推送到设备前仍应确认传输未转换行尾。）
 
 ### 10.4 内核模块构建（KernelSU）——环境已证明可用，剩两个上游问题
 

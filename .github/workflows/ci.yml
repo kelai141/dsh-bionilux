@@ -23,6 +23,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --verbose
+      - name: native launcher Make and interactive regressions
+        run: |
+          cargo build --locked
+          BIONILUX_TEST_LAUNCHER="$PWD/target/debug/bionilux" bash tests/make.sh
+          BIONILUX_TEST_LAUNCHER="$PWD/target/debug/bionilux" bash tests/runtime.sh
 
       # The whole point of this fork is that no host package path is baked in.
       # A guest prefix is derived from the host application's package name,
@@ -41,8 +46,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: run hook path tests
         run: |
-          chmod +x tests/*.sh tests/../scripts/*.sh || true
-          tests/preload_paths.sh
+          bash tests/preload_paths.sh
+          bash tests/runtime.sh
+          bash tests/ubsan.sh
+          bash tests/make.sh
+          bash tests/prepare_rootfs.sh
 
       - name: shellcheck (if available)
         run: |
@@ -59,15 +67,18 @@ jobs:
       - name: install cross toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
 
       - name: build
         run: |
           aarch64-linux-gnu-gcc -shared -fPIC -O2 \
             -o libbionilux_preload.so \
-            src/preload/hooks.c \
+            src/preload/hooks.c -pthread -ldl \
             -Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1 \
             -Wl,-rpath,/usr/lib/aarch64-linux-gnu
+
+      - name: AArch64 glibc QEMU regressions (not Android)
+        run: bash tests/aarch64.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -140,7 +151,7 @@ jobs:
       - name: fetch ubuntu 26.04 base rootfs (amd64)
         run: |
           set -eux
-          curl -fLO http://cdimage.ubuntu.com/ubuntu-base/resolute/daily/current/resolute-base-amd64.tar.gz
+          curl -fLO https://cdimage.ubuntu.com/ubuntu-base/resolute/daily/current/resolute-base-amd64.tar.gz
           mkdir rootfs
           tar -xzf resolute-base-amd64.tar.gz -C rootfs
 
@@ -162,7 +173,7 @@ jobs:
 
   release:
     name: release
-    needs: [preload, bionilux, box64, x86-libs]
+    needs: [test, preload-paths, preload, bionilux, box64, x86-libs]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, 'rc')
     permissions:

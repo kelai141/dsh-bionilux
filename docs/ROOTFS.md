@@ -88,10 +88,14 @@ unmap("/data/data/<pkg>/files/linux/<id>/rootfs/usr/bin/bash") -> "/usr/bin/bash
 处理方式（D-006）：
 
 ```bash
-scripts/prepare-rootfs.sh --rootfs DIR              # 改写为 rootfs 内绝对路径（默认，保真 guest 语义）
-scripts/prepare-rootfs.sh --rootfs DIR --relative-links   # 改写为相对路径（可搬移，但 guest 看到相对目标）
-scripts/prepare-rootfs.sh --rootfs DIR --verify      # 安装门槛：仍有外指链接则失败
+sh scripts/prepare-rootfs.sh --rootfs DIR              # 改写为 rootfs 内绝对路径（默认，保真 guest 语义）
+sh scripts/prepare-rootfs.sh --rootfs DIR --relative-links   # 改写为相对路径（可搬移，但 guest 看到相对目标）
+sh scripts/prepare-rootfs.sh --rootfs DIR --verify      # 安装门槛：仍有外指链接则失败
 ```
+
+默认绝对模式保留原有行为：链接绑定当前 rootfs 的物理位置。
+准备后还要移动/原子 rename 的暂存树应使用 `--relative-links`；此选项也会转换
+当前树内已准备的绝对链接。根目录下的链接使用零层 `..`，避免指向 rootfs 外。
 
 > 为什么不在运行时补救：`open("/usr/lib/os-release")` 经映射后由**内核**去解析链接目标，
 > 用户态 hook 看不到这一步。`openat2(RESOLVE_IN_ROOT)` 能让内核在 rootfs 内解析（D-003），
@@ -106,21 +110,16 @@ scripts/prepare-rootfs.sh --rootfs DIR --verify      # 安装门槛：仍有外�
 | `/dev/shm` | **例外**：映射进 rootfs。Android 没有 tmpfs shm，只有这样才能让 POSIX shm 工作 |
 | `/tmp` | 映射到 rootfs 内 `/tmp` |
 | `/sys` | 不映射 |
-| DNS | ⚠️ **Android 上需要插件补**，见下方 §6.1 |
+| DNS | 安装方提供 guest resolver 配置，并按设备验证，见 §6.1 |
 | CA 证书 | 从 rootfs 推导；不再写死宿主路径 |
 
-### 6.1 DNS（Android 上的已知缺口）
+### 6.1 DNS（按设备验证）
 
-- **现象**（真机实测）：guest 内 `getent hosts deb.debian.org` 失败；`apt-get update` 报
-  `Temporary failure resolving`。
-- **已排除**：rootfs 权限（`dpkg --audit` 通过）、nsswitch（`hosts: files dns` 正确）、
-  NSS 模块加载（模块是独立 DSO，走 PLT，能被映射——`getent passwd _apt` 正常工作）。
-- **设备的 DNS** 是 `198.18.0.2, 116.228.111.118, 180.168.255.18`，从 guest 内全部不可达。
-- **推断原因**（未证实到 syscall 级）：Android 不提供 `/etc/resolv.conf`，且不允许应用使用裸
-  DNS；解析须经 netd 的 DNS 代理，而 glibc 的 resolver 不会说该协议。
-- **需要插件补**（不属于本仓库）：在 Android 侧提供一个 loopback DNS 转发（用 Bionic 的
-  `getaddrinfo` 解析），guest 的 `resolv.conf` 指向 `127.0.0.1`；
-  `prepare-rootfs.sh --dns` 已是这条路径的接口。
+早期 x86_64 环境曾发生解析失败；当时对 Android 裸 DNS 限制的推断不能视为普遍结论。
+后续 ARM64 设备记录了成功的 guest DNS 与 HTTPS（见 STATUS.md §9）。
+preload 使用 guest 配置进行解析；安装方仍须提供当前网络可达的 DNS 服务器，
+并实际验证解析与 HTTPS，不应把“写入 resolv.conf”当作网络可用的证据。
+本脚本不提供 DNS 转发器。
 
 > 注意：`apt-get update` 在 DNS 完全失败时仍返回 **0**（把索引下载失败当 warning）。
 > 因此"退出码为 0"不能作为网络可用的证据 —— 见 D-009。

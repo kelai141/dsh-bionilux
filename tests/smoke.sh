@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 # bionilux end-to-end smoke tests. Run from the project root in a native
 # Termux shell. Requires bionilux built, preload present, glibc installed.
 set -u
@@ -36,7 +36,7 @@ if [ "$PROJECT/src/preload/hooks.c" -nt "$PRELOAD" ]; then
     exit 1
 fi
 
-BOX64="$PREFIX/bionilux/box64-glibc"
+BOX64="${BIONILUX_BOX64:-${BIONILUX_PREFIX:-${PREFIX:-$(dirname "$GLIBC")}}/bionilux/box64-glibc}"
 [ -x "$BOX64" ] || info "box64-glibc not installed at $BOX64 (x86 tests skipped)"
 
 # ─── build test helpers (aarch64-glibc) ─────────────────────────────
@@ -61,16 +61,18 @@ build_glibc_bin "$PROJECT/tests/helpers/fexecve.c"   "$TMP/fexecve_test" || exit
 pass "built 3 helpers"
 
 # ─── 1. execle with multiple args + custom envp ─────────────────────
-out=$(BIONILUX_DEBUG= "$BIONILUX" "$TMP/execle_test" 2>/dev/null || true)
-if [ "$out" = "hello" ]; then
+out=$(BIONILUX_DEBUG= "$BIONILUX" "$TMP/execle_test" 2>/dev/null)
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "hello" ]; then
     pass "execle (multi-arg + envp)"
 else
     fail "execle (multi-arg + envp): got '$out'"
 fi
 
 # ─── 2. fexecve on the helper's own path ────────────────────────────
-out=$(BIONILUX_DEBUG= "$BIONILUX" "$TMP/fexecve_test" 2>/dev/null || true)
-if [ "$out" = "fexecve-ok" ]; then
+out=$(BIONILUX_DEBUG= "$BIONILUX" "$TMP/fexecve_test" 2>/dev/null)
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "fexecve-ok" ]; then
     pass "fexecve"
 else
     fail "fexecve: got '$out'"
@@ -79,8 +81,9 @@ fi
 # ─── 3. launcher self-call from glibc process ───────────────────────
 for mode in execve execvp posix_spawn; do
     out=$(BIONILUX_DEBUG= "$BIONILUX" "$GLIBC/bin/bash" -c \
-          "$TMP/self_call $mode 2>/dev/null" 2>/dev/null || true)
-    if [ "$out" = "self-ok" ]; then
+          "\"$TMP/self_call\" $mode 2>/dev/null" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ] && [ "$out" = "self-ok" ]; then
         pass "launcher self-call: $mode"
     else
         fail "launcher self-call: $mode (got '$out')"
@@ -93,8 +96,9 @@ cat > "$TMP/envS.sh" <<'EOF'
 echo "env-S-ok"
 EOF
 chmod +x "$TMP/envS.sh"
-out=$("$BIONILUX" "$TMP/envS.sh" 2>/dev/null || true)
-if [ "$out" = "env-S-ok" ]; then
+out=$("$BIONILUX" "$TMP/envS.sh" 2>/dev/null)
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "env-S-ok" ]; then
     pass "shebang env -S"
 else
     fail "shebang env -S: got '$out'"
@@ -103,8 +107,9 @@ fi
 # ─── 5. shebang recursion limit ─────────────────────────────────────
 printf '#!%s/loop\n' "$TMP" > "$TMP/loop"
 chmod +x "$TMP/loop"
-out=$("$BIONILUX" "$TMP/loop" 2>&1 || true)
-if echo "$out" | grep -q "recursion too deep"; then
+out=$("$BIONILUX" "$TMP/loop" 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "recursion too deep"; then
     pass "shebang recursion limit"
 else
     fail "shebang recursion limit: got '$out'"
@@ -113,8 +118,9 @@ fi
 # ─── 6. missing path → shell ENOENT ─────────────────────────────────
 # Distinguish shell's "No such file or directory" from launcher's
 # "command not found": only the former proves the hook passed through.
-out=$("$BIONILUX" "$GLIBC/bin/bash" -c '/no/such/path' 2>&1 || true)
-if echo "$out" | grep -q "No such file or directory"; then
+out=$("$BIONILUX" "$GLIBC/bin/bash" -c '/no/such/path' 2>&1)
+rc=$?
+if [ "$rc" -eq 127 ] && echo "$out" | grep -q "No such file or directory"; then
     pass "missing path -> shell ENOENT"
 else
     fail "missing path -> shell ENOENT (got '$out')"
@@ -128,7 +134,7 @@ if [ -x "$BOX64" ] && [ -f "$HOME/server/bedrock_server" ]; then
     if [ $rc -eq 124 ]; then
         pass "box64 chain (bedrock_server ran >3s)"
     else
-        info "box64 chain: server exited rc=$rc (may be normal)"
+        fail "box64 chain: server exited rc=$rc before timeout"
     fi
 fi
 
