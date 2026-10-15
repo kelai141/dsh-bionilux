@@ -338,6 +338,15 @@ static char **strip_ld_preload(char *const envp[]) {
     return ev;
 }
 
+// The PATH to search for a bare command name: execvpe() resolves against the
+// environment it was given, not the ambient one.
+static const char *bn_path_from(char *const envp[]) {
+    if (envp)
+        for (size_t i = 0; envp[i]; i++)
+            if (strncmp(envp[i], "PATH=", 5) == 0) return envp[i] + 5;
+    return getenv("PATH");
+}
+
 // Resolve a bare command name against the *guest's* PATH.
 //
 // libc's execvp() and posix_spawnp() search the host's PATH, which holds
@@ -345,10 +354,8 @@ static char **strip_ld_preload(char *const envp[]) {
 // all or would run the host's program. GNU make execs recipe commands this
 // way, so a kernel build fails as `make: awk: No such file or directory`.
 // Fills `out` with a guest absolute path and returns 1 on success.
-static int bn_which(const char *name, char *out, size_t size) {
+static int bn_which(const char *name, const char *path, char *out, size_t size) {
     if (!name || !*name) return 0;
-
-    const char *path = getenv("PATH");
     if (!path || !*path) path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
     for (const char *p = path; *p; ) {
@@ -385,7 +392,10 @@ static int reroute(const char *target, char *const argv[], char *const envp[],
 
     char resolved[PATH_MAX];
     if (!strchr(target, '/')) {
-        if (!bn_which(target, resolved, sizeof resolved)) { errno = ENOENT; return -1; }
+        if (!bn_which(target, bn_path_from(envp), resolved, sizeof resolved)) {
+            errno = ENOENT;
+            return -1;
+        }
         target = resolved;
     }
 
@@ -444,6 +454,7 @@ static int exec_launcher(const char *path, char *const argv[], char *const envp[
 
 // ── exec* family ───────────────────────────────────────────────────
 int execve(const char *path, char *const argv[], char *const envp[]) {
+    DBG("HOOK execve(%s)\n", path ? path : "(null)");
     if (is_launcher(path, getenv("BIONILUX_BINARY_PATH")))
         return exec_launcher(path, argv, envp);
     const char *l; char **av, **ev;
@@ -461,6 +472,7 @@ int execvp(const char *file, char *const argv[]) {
     typedef int (*fn_t)(const char *, char *const[]);
     static fn_t real;
     REAL(real, "execvp");
+    DBG("HOOK execvp(%s)\n", file ? file : "(null)");
     if (is_launcher(file, getenv("BIONILUX_BINARY_PATH")))
         return exec_launcher(file, argv, environ);
     const char *l; char **av, **ev;
@@ -468,6 +480,28 @@ int execvp(const char *file, char *const argv[]) {
     if (r < 0) return -1;
     if (r) return run_rerouted(l, av, ev);
     return real(file, argv);
+}
+
+// execvpe() is a separate public symbol, not an alias of execvp(): it searches
+// the PATH taken from the environment it was given. GNU make calls it for every
+// recipe, handing each child its own environment, so leaving it to libc made
+// make's direct-exec path — the one used whenever a command has no shell
+// metacharacter — resolve on the host and fail with ENOENT. That is what broke
+// a recursive kernel build as `make: /usr/bin/make: No such file or directory`.
+int execvpe(const char *file, char *const argv[], char *const envp[]) {
+    if (is_launcher(file, getenv("BIONILUX_BINARY_PATH")))
+        return exec_launcher(file, argv, envp);
+    const char *l; char **av, **ev;
+    int r = reroute(file, argv, envp, &l, &av, &ev);
+    if (r < 0) return -1;
+    if (r) return run_rerouted(l, av, ev);
+
+    typedef int (*fn_t)(const char *, char *const[], char *const[]);
+    static fn_t real;
+    REAL(real, "execvpe");
+    if (real) return real(file, argv, envp);
+    errno = ENOSYS;
+    return -1;
 }
 
 // va_list -> argv. Pointer so the caller's position advances on aarch64
@@ -605,6 +639,7 @@ static int spawn_impl(int search_path, pid_t *pid, const char *path,
                       char *const argv[], char *const envp[]) {
     spawn_fn plain = spawn_plain();
     if (!plain) { errno = ENOSYS; return -1; }
+    DBG("HOOK spawn(p=%d, %s)\n", search_path, path ? path : "(null)");
 
     if (is_launcher(path, getenv("BIONILUX_BINARY_PATH"))) {
         char **clean = strip_ld_preload(envp);
@@ -861,6 +896,34 @@ int fstat64(int fd, struct stat64 *st) {
 int access(const char *path, int mode) {
     typedef int (*fn_t)(const char *, int);
     static fn_t real; REAL(real, "access");
+    char buf[PATH_MAX];
+    return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
+}
+
+// glibc implements euidaccess()/eaccess() in user space: it cannot use the
+// access(2) syscall, because that tests the *real* uid, so it stat()s the path
+// itself and compares the mode bits against the effective uid. That stat is an
+// internal call no preload can see, so an absolute guest path reaches the host
+// and reports ENOENT.
+//
+// GNU make uses eaccess() to decide whether a recipe command is executable.
+// When it says no, make reports "No such file or directory" and gives up
+// without ever forking — observed as a recipe failing with no clone in its
+// syscall trace. That broke make's direct-exec path (any recipe or $(shell ...)
+// command without shell metacharacters) and with it a kernel build. Mapping the
+// path here lets the real eaccess() stat the physical file, which exists.
+int euidaccess(const char *path, int mode) {
+    typedef int (*fn_t)(const char *, int);
+    static fn_t real; REAL(real, "euidaccess");
+    if (!real) { errno = ENOSYS; return -1; }
+    char buf[PATH_MAX];
+    return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
+}
+
+int eaccess(const char *path, int mode) {
+    typedef int (*fn_t)(const char *, int);
+    static fn_t real; REAL(real, "eaccess");
+    if (!real) return euidaccess(path, mode);
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
 }
@@ -1590,6 +1653,70 @@ int statfs(const char *path, struct statfs *st) {
     static fn_t real; REAL(real, "statfs");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
+}
+
+int statfs64(const char *path, struct statfs64 *st) {
+    typedef int (*fn_t)(const char *, struct statfs64 *);
+    static fn_t real; REAL(real, "statfs64");
+    char buf[PATH_MAX];
+    return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
+}
+
+int remove(const char *path) {
+    typedef int (*fn_t)(const char *);
+    static fn_t real; REAL(real, "remove");
+    char buf[PATH_MAX];
+    return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf));
+}
+
+int lchmod(const char *path, mode_t mode) {
+    typedef int (*fn_t)(const char *, mode_t);
+    static fn_t real; REAL(real, "lchmod");
+    char buf[PATH_MAX];
+    return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
+}
+
+int scandirat(int dirfd, const char *path, struct dirent ***namelist,
+              int (*filter)(const struct dirent *),
+              int (*compar)(const struct dirent **, const struct dirent **)) {
+    typedef int (*fn_t)(int, const char *, struct dirent ***,
+                        int (*)(const struct dirent *),
+                        int (*)(const struct dirent **, const struct dirent **));
+    static fn_t real; REAL(real, "scandirat");
+    char buf[PATH_MAX];
+    return real(dirfd, bn_resolve(dirfd, path, buf, sizeof buf), namelist, filter, compar);
+}
+
+int scandir64(const char *path, struct dirent64 ***namelist,
+              int (*filter)(const struct dirent64 *),
+              int (*compar)(const struct dirent64 **, const struct dirent64 **)) {
+    typedef int (*fn_t)(const char *, struct dirent64 ***,
+                        int (*)(const struct dirent64 *),
+                        int (*)(const struct dirent64 **, const struct dirent64 **));
+    static fn_t real; REAL(real, "scandir64");
+    char buf[PATH_MAX];
+    return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), namelist, filter, compar);
+}
+
+// A file action holds a path that the spawned child will open or chdir to. The
+// child is the launcher, which expects a physical path, so the guest path has
+// to be mapped here — the action object is opaque and cannot be fixed later.
+int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t *fa, int fd,
+                                     const char *path, int oflag, mode_t mode) {
+    typedef int (*fn_t)(posix_spawn_file_actions_t *, int, const char *, int, mode_t);
+    static fn_t real; REAL(real, "posix_spawn_file_actions_addopen");
+    if (!real) { errno = ENOSYS; return -1; }
+    char buf[PATH_MAX];
+    return real(fa, fd, bn_resolve(AT_FDCWD, path, buf, sizeof buf), oflag, mode);
+}
+
+int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *fa,
+                                         const char *path) {
+    typedef int (*fn_t)(posix_spawn_file_actions_t *, const char *);
+    static fn_t real; REAL(real, "posix_spawn_file_actions_addchdir_np");
+    if (!real) { errno = ENOSYS; return -1; }
+    char buf[PATH_MAX];
+    return real(fa, bn_resolve(AT_FDCWD, path, buf, sizeof buf));
 }
 
 // ── getifaddrs fallback via SIOCGIFCONF ────────────────────────────

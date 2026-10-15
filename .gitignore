@@ -13,3 +13,8 @@ tests/helpers/*.bin
 .vscode/
 .idea/
 *.swp
+# Scratch scripts and local build artifacts
+tmp-*
+/armroot.tar.gz
+/bn-pre-aarch64.so
+COMMIT_MSG_TMP.txt

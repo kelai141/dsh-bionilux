@@ -371,14 +371,19 @@ mod tests {
 
     #[test]
     fn app_private_dir_is_derived_from_the_install_prefix() {
-        // The shape both Termux and the host application use.
+        // The host application's layout: the guest prefix lives under its own
+        // private `files` directory.
         assert_eq!(
             app_private_dir(Some(Path::new("/data/data/com.example.app/files/usr"))),
             Some(PathBuf::from("/data/data/com.example.app"))
         );
+        // A deeper prefix still resolves to the application directory rather
+        // than to the guest prefix itself.
         assert_eq!(
-            app_private_dir(Some(Path::new("/data/data/com.termux/files/usr"))),
-            Some(PathBuf::from("/data/data/com.termux"))
+            app_private_dir(Some(Path::new(
+                "/data/user/0/com.example.other/files/linux/rootfs"
+            ))),
+            Some(PathBuf::from("/data/user/0/com.example.other"))
         );
         // A prefix with no `files` component has no app directory to expose.
         assert_eq!(app_private_dir(Some(Path::new("/opt/bionilux"))), None);
