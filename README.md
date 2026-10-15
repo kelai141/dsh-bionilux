@@ -1,187 +1,178 @@
-# bionilux
+# bionilux — the DSH Mobile Linux runtime
 
-Run glibc and x86_64 Linux binaries on Termux — natively, no PRoot.
+**This is DSH Mobile's Linux runtime.** It hosts a full Debian user space inside
+an Android app process: real `apt`/`dpkg`, working DNS and TLS, native-speed
+glibc execution, and no PRoot. It is a *component* of DSH Mobile, driven by a
+Cordis plugin — not a standalone Termux utility.
 
-Termux uses Android's Bionic libc. Almost all released Linux binaries are
-linked against glibc and expect a dynamic linker
-(`/lib/ld-linux-aarch64.so.1`) that does not exist on Android. The kernel
-refuses them with `ENOENT`. bionilux invokes the glibc loader manually and
-keeps children on the same path with an `LD_PRELOAD` hook.
+This repository is a fork of [`theonuverse/bionilux`](https://github.com/theonuverse/bionilux).
+Upstream solves "run one glibc binary on Termux". This fork solves "be the Linux
+runtime of an Android app": the guest is a `rootfs` with its own path semantics,
+the launcher takes no hardcoded host path, and the Android directories the app
+must reach are configuration, not constants.
 
-## Install
+> **Definition.** bionilux runs the *guest's* user space, not the host's. A path
+> the guest names is resolved inside its rootfs or not at all; the host file
+> system of the same name is never a fallback.
 
-Prebuilt binaries from the latest GitHub release. Launcher, preload,
-box64-glibc, and x86_64 runtime libs all come from our own releases.
+Verified on a real arm64 device (vivo V2425A, Android 16 / SDK 36, SELinux
+enforcing, no root) and on an x86_64 emulator.
 
-```bash
-curl -fsSL theonuverse.github.io/bionilux/setup | bash
-```
+## What this fork adds over upstream
 
-Pin a version with `BIONILUX_VERSION=v0.4.2`. Uninstall:
+| Area | Change |
+|------|--------|
+| Path semantics | A rootfs is the guest's `/`. Guest paths never fall through to the host, `..` is clamped at the guest root, and `getcwd()`/`readlink()` report guest paths. |
+| No hardcoded paths | Every Termux path is derived from the install prefix. The same build runs from Termux's `$PREFIX` or from an app's private `files/` directory. |
+| Android directories | `/sdcard`, `/storage/emulated/0` and the host app's private data directory are reachable through their own names, configured by `--host-path` / `BIONILUX_HOST_PATHS`. |
+| DNS | Resolved from the *guest's* `/etc/resolv.conf` and `/etc/hosts` by the preload. Without this, glibc reads the host's files, finds none, and every lookup fails with `EAI_AGAIN`. |
+| Package management | `apt-get update` and `apt-get install` work, including the debconf frontends, `dpkg`'s postinst scripts and `ca-certificates`. |
+| Identity | The guest is told it is root, consistently: `getuid()` and `stat()` agree, so `git`, `dpkg` and `tar` accept their own working trees. |
+| Native paths | `--print-config`, `--rootfs`, `--guest-cwd`, `--host-path`, `--no-android-paths`. |
 
-```bash
-rm -f "$PREFIX/bin/bionilux" "$PREFIX/glibc/lib/libbionilux_preload.so"
-rm -rf "$PREFIX/bionilux"
-```
+## Quick start
 
-## Build from source
-
-Requires Termux with `glibc-repo`, `glibc`, `clang`, `rust` and `git`.
-
-```bash
-git clone https://github.com/theonuverse/bionilux
-cd bionilux
-
-# Preload (glibc)
-export GLIBC="$PREFIX/glibc"
-clang --target=aarch64-linux-gnu -shared -fPIC -O2 -nostdlib \
-      -isystem "$GLIBC/include" \
-      -o libbionilux_preload.so src/preload/hooks.c \
-      "$GLIBC/lib/libc.so.6" "$GLIBC/lib/libdl.so.2" \
-      -Wl,--dynamic-linker="$GLIBC/lib/ld-linux-aarch64.so.1" \
-      -Wl,-rpath,"$GLIBC/lib"
-
-# Launcher (bionic)
-cargo build --release
-```
-
-Install what you just built:
+The runtime is installed under a prefix the app owns; `PREFIX/files/...` layout
+is derived, not assumed.
 
 ```bash
-install -m755 target/release/bionilux "$PREFIX/bin/bionilux"
-install -m755 libbionilux_preload.so "$GLIBC/lib/"
+# One-time rootfs preparation: absolute symlinks, resolver, directories.
+scripts/prepare-rootfs.sh --rootfs /path/to/rootfs --dns <nameserver>
+
+export BIONILUX_ROOTFS=/path/to/rootfs
+bionilux /bin/bash -c 'cat /etc/os-release; apt-get update'
+
+# Health check: the plugin registers the tool only when this says yes.
+bionilux --print-config | grep -E 'ROOTFS_ENABLED|ROOTFS_LOADER'
 ```
 
-## x86_64 support (optional)
-
-The launcher itself handles aarch64 glibc binaries. To also run x86_64
-binaries, you need two extra pieces: `box64-glibc` (the aarch64-glibc
-build of box64) and the x86_64 runtime libraries it loads.
-
-Fetch both from the latest release:
+Reaching the Android side of the device:
 
 ```bash
-VERSION=$(curl -fsSL https://api.github.com/repos/theonuverse/bionilux/releases/latest \
-          | grep -oP '"tag_name":\s*"\K[^"]+')
-BASE="https://github.com/theonuverse/bionilux/releases/download/$VERSION"
-
-# box64-glibc
-mkdir -p "$PREFIX/bionilux"
-curl -fSL -o "$PREFIX/bionilux/box64-glibc" "$BASE/box64-glibc"
-chmod 755 "$PREFIX/bionilux/box64-glibc"
-
-# x86_64 runtime libraries
-cd /tmp
-curl -fSL -o x86_64-libs.tar.xz "$BASE/x86_64-libs.tar.xz"
-rm -rf "$PREFIX/glibc/lib/x86_64-linux-gnu"
-tar -xf x86_64-libs.tar.xz -C "$PREFIX/glibc/lib"
-rm x86_64-libs.tar.xz
+bionilux --rootfs "$R" --host-path /data/local/tmp /bin/sh -c 'ls /data/local/tmp'
+bionilux --rootfs "$R" --no-android-paths /bin/sh -c 'ls /sdcard'   # refused
 ```
 
-After that, `bionilux ./some_x86_64_binary` works transparently. The
-installer (`setup`) does all of the above automatically.
-
-## Usage
+With the runtime installed inside an app's own `files/` directory, the guest
+sees that private directory under its **own absolute Android path** — so the app
+and the guest share one copy of the data:
 
 ```bash
-bionilux <binary> [args...]
+# runtime at /data/data/<pkg>/files/bnrt, PREFIX=/data/data/<pkg>/files/usr
+bionilux --rootfs "$R" --print-config | grep HOST_PATHS
+#   HOST_PATHS=/data/data/<pkg>
+bionilux --rootfs "$R" /bin/sh -c 'cat /data/data/<pkg>/files/app-state.json'
 ```
 
-Examples:
+## Guest path semantics
 
-```bash
-bionilux ./my_binary                     # glibc or x86_64, auto-detected
-bionilux $PREFIX/glibc/bin/bash          # glibc shell
-BIONILUX_DEBUG=1 bionilux ./my_app       # verbose
-BIONILUX_CHDIR_TO_BINARY=1 bionilux ./server
+* Only absolute paths are rewritten; a path already inside the rootfs is left
+  alone, so nothing is prefixed twice.
+* `/proc`, `/sys` and `/dev` stay with the host kernel. `/dev/shm` is the
+  exception, because POSIX shared memory must land somewhere writable.
+* Relative paths without `..` pass through: the physical working directory is
+  already inside the rootfs. A relative path containing `..` is resolved against
+  the *guest* working directory first, with `..` clamped at the guest root.
+* A path that is missing from the rootfs is still rewritten, so the kernel
+  reports `ENOENT` instead of quietly exposing the host's file of that name.
+
+Configuration, in `--print-config` order:
+
+| Option | Environment | Purpose |
+|--------|-------------|---------|
+| `--rootfs DIR` | `BIONILUX_ROOTFS` | The guest's `/` |
+| `--guest-cwd DIR` | `BIONILUX_GUEST_CWD` | The guest's initial working directory |
+| `--host-path DIR` | `BIONILUX_HOST_PATHS` | A host directory the guest reaches by its own path (repeatable) |
+| `--no-android-paths` | `BIONILUX_ANDROID_PATHS=0` | Drop the `/sdcard` defaults |
+| `--print-config` | — | Resolved configuration, for health checks |
+
+## Verified on device
+
+| Capability | Evidence |
+|------------|----------|
+| Debian rootfs runs | Debian 13 trixie, glibc 2.41, `HOST_ARCH=Aarch64` |
+| DNS | `getent hosts deb.debian.org` -> `146.75.114.132` |
+| HTTPS + trust store | `curl -sS -o /dev/null -w '%{http_code}' https://github.com` -> `200`, no `GIT_SSL_NO_VERIFY` |
+| Package management | `apt-get update` fetched 9.7 MB; `build-essential`, `git`, `ca-certificates`, `strace` install |
+| Toolchain | gcc 14.2.0, git 2.47.3, make 4.4.1 |
+| Source control | `git clone`, `git status`, `git log` on a fresh clone |
+| Traversal | `find` over the guest's `/etc`, `/usr`, `/var` and a cloned repo |
+| Android public storage | guest writes `/sdcard/bn-visible.txt`, readable by the host |
+| Android private data | guest reads and writes the app's own `files/` directory by its native path |
+
+## Known limitations
+
+Some are Android platform facts, some are inherent to doing this with
+`LD_PRELOAD` rather than a kernel sandbox. They are documented rather than
+papered over.
+
+**Platform restrictions (not fixable in the runtime).**
+
+* **Hard links are refused** device-wide — including inside the app's own
+  private directory. `dpkg` needs `link()` for its backup step, so the preload
+  falls back to copying.
+* **`mkfifo()` fails with `EACCES`** for the shell UID (SELinux), so GNU make
+  cannot create its default FIFO jobserver. It does not need to: `make -jN
+  --jobserver-style=pipe` uses a pipe instead and works — verified with `-j8`
+  in a kernel build.
+* **`ldconfig` is statically linked**, so no preload can map it; it writes to
+  Android's read-only `/etc`. `prepare-rootfs.sh` installs a shim.
+* **Static binaries** are outside `LD_PRELOAD`'s reach entirely.
+
+A fresh rootfs also needs `scripts/prepare-rootfs.sh` before anything else: it
+rewrites the **absolute** symlinks a Debian rootfs contains, which the kernel
+otherwise resolves against the *host* root — that is what makes `/usr/bin/awk`
+and `/usr/bin/which` work at all.
+
+**`LD_PRELOAD` reaches only public, PLT-crossing functions.** glibc's *internal*
+calls never leave the library, so anything libc does for itself resolves against
+the host. Each case is handled at the public API the program actually calls:
+
+| Bypassed internally | Handled by |
+|---------------------|-----------|
+| `/etc/resolv.conf`, `/etc/hosts` | `getaddrinfo`, `gethostbyname*` resolve with the guest's files |
+| `/etc/passwd`, `/etc/group` | `getpwnam*`, `getpwuid*`, `getgrnam*`, `getgrgid*` |
+| `/bin/sh` for `system`/`popen` | `system`, `popen`, `pclose` |
+| `mkstemp`'s own `open` | `mkstemp`/`mkostemp`/`mkstemps` and their `64` spellings |
+| `dlopen` of a path | `dlopen` — a language runtime's extension module, PAM, NSS plugins |
+| `readlink("/proc/self/fd/N")` | the physical path is used internally, the guest path is presented |
+
+**Where the preload cannot reach.** The one class that needed an extra idea is
+`eaccess()`/`euidaccess()`: glibc implements it in user space — it cannot use
+the `access(2)` syscall, which tests the real uid, so it `stat()`s the path
+itself and compares the mode bits. That stat is an internal call no preload can
+see, so an absolute guest path reached the host and reported `ENOENT`. GNU make
+uses `eaccess()` to decide whether a recipe command is executable, and when it
+says no, make reports "No such file or directory" and gives up **without
+forking** — a syscall trace of the failing recipe contains no `clone`, `fork` or
+`execve` at all. Recipes whose command went through a shell were unaffected, so
+only make's direct-exec path broke. Mapping the path fixes it.
+
+## How it works
+
+Termux uses Android's Bionic libc. Released Linux binaries are linked against
+glibc and expect a dynamic linker (`/lib/ld-linux-aarch64.so.1`) that does not
+exist on Android, so the kernel refuses them with `ENOENT`. The fix is to invoke
+the glibc loader by hand and keep every child on the same path:
+
+```
+kernel reads ELF header -> PT_INTERP missing -> ENOENT
+bionilux: execve(ld-linux-aarch64.so.1, --argv0 target target ..., env)
+          with LD_PRELOAD=<our hooks> and a rootfs-aware environment
 ```
 
-To enter a glibc shell where every child you spawn is rerouted through
-bionilux automatically:
+Two components:
 
-```bash
-bionilux $PREFIX/glibc/bin/bash
-```
+* **The launcher** — a small Rust binary built for Bionic. It reads the target's
+  ELF header, decides on an interpreter, and calls `execve()`.
+* **The preload library** — built for glibc, injected into every guest process.
+  It reroutes `exec*`/`posix_spawn*` so children stay in the guest, gives the
+  guest its own view of the file system, and implements the public APIs that the
+  blocked libc internals stand in for.
 
-Environment variables:
-
-| Variable | Purpose |
-|----------|---------|
-| `BIONILUX_DEBUG` | Print debug lines to stderr |
-| `BIONILUX_PRELOAD` | Override preload .so path |
-| `BIONILUX_CHDIR_TO_BINARY` | chdir to target's directory before exec |
-
-## The problem
-
-On Linux, running a program looks like this:
-
-```
-kernel reads ELF header
-    ↓
-sees PT_INTERP = /lib/ld-linux-aarch64.so.1
-    ↓
-loads ld.so, ld.so loads libc.so.6 + program
-    ↓
-program starts
-```
-
-On Termux the kernel reads the header, tries to load the interpreter, does
-not find it, and returns `ENOENT`:
-
-```
-bash: ./myapp: cannot execute: required file not found
-```
-
-Three layers to the problem:
-
-1. Missing interpreter. The glibc loader is not at the path the binary
-   expects.
-2. Missing libraries. The binary needs glibc's `libc.so.6`, `libm.so.6`,
-   `libpthread.so.0`, not Bionic's.
-3. Missing kernel ABI. This part actually works — Bionic and glibc use the
-   same Linux syscalls on Android. The problem is entirely in userspace.
-
-## How it can be solved
-
-Three approaches on Termux:
-
-PRoot / proot-distro. A ptrace-based sandbox. Intercepts every syscall and
-simulates a full root filesystem. Transparent and general, but 2x to 10x
-slower because every syscall goes through ptrace. Crippling for CPU-bound
-work.
-
-Recompile against Bionic. Fastest possible, but not general. You cannot
-recompile a proprietary benchmark or a released vendor binary.
-
-Ship glibc as a second libc and invoke its loader manually. Termux already
-offers glibc through `glibc-repo`. Invoking `ld-linux-aarch64.so.1`
-manually solves the first process but not its children — the child's
-`execve` hits the same missing-interpreter problem.
-
-bionilux uses the third approach, plus one extra ingredient: an
-`LD_PRELOAD` hook that reroutes child exec calls through the launcher
-again. Native speed, no ptrace, no sandbox. The trade-off is that it does
-not virtualize the filesystem — programs that hardcode Linux paths like
-`/etc/resolv.conf` need targeted redirection, which we handle for the
-important cases (DNS and NSS).
-
-## How bionilux works
-
-Two components plus one external dependency.
-
-The launcher, a small Rust binary compiled for Bionic. It parses the
-target's ELF header, decides which interpreter or emulator to use,
-then calls `execve()` on it.
-
-The preload library, a shared library compiled for glibc. Injected via
-`LD_PRELOAD` into every glibc process bionilux starts. It hooks `exec*`, `posix_spawn*`, `open*`, and `readlink*` so that children of the target process are themselves rerouted, and so `/etc/*` accesses from programs that hardcode Linux paths redirect to `$GLIBC/etc/*` where the file exists. glibc's own DNS and NSS resolution already works under Termux and does not depend on this hook.
-
-Box64 (glibc build), used only when the target is x86_64. Box64 is itself
-an aarch64-glibc binary; bionilux starts it through the same loader path,
-and Box64 does the rest.
-
-Termux's native binaries keep running natively. Termux never sees a glibc
-preload — the bionic launcher strips it before calling itself.
+No `ptrace`, no sandbox: guest code runs at native speed. The trade-off is that
+the file system is not virtualised for libc's internal use, which is why the
+table above exists.
 
 ## Architecture
 
@@ -198,277 +189,114 @@ bionic     aarch64     x86_64        shebang
    │          ▼           ▼             │
    │      ld-linux   ld-linux +         │
    │      +preload   box64 +preload     │
-   │          │           │             │
    ▼          ▼           ▼             ▼
 execve    target      x86_64 bin    interpreter
 native    runs        runs under    resolved and
                       box64         rerun
 ```
 
-The launcher is a decision tree with four outputs:
+With a rootfs configured, the launcher additionally maps the target into it and
+exports the guest environment before the loader runs.
 
-| Detected | Action |
-|----------|--------|
-| aarch64 bionic or static ELF | `execve(target)` — natively |
-| aarch64 glibc ELF | loader + preload |
-| x86_64 glibc ELF | loader + box64 + preload |
-| shebang script | parse interpreter, resolve, recurse |
+## Preload hooks
 
-## Detailed operation
+The constructor resolves symbols with `dlsym(RTLD_NEXT, ...)` and hooks:
 
-### aarch64 glibc binary
+**Process**
 
-```
-bionilux ./my_glibc_app arg1 arg2
-```
+| Hook | Behaviour |
+|------|-----------|
+| `execve`, `execv`, `execvp`, `execl*`, `fexecve`, `execveat` | Reroute through the launcher; a bare name is resolved against the **guest's** `PATH`, never the host's |
+| `posix_spawn`, `posix_spawnp` | Same reroute, into the launcher |
+| `system`, `popen`, `pclose` | Run `/bin/sh -c` through the launcher with `LD_PRELOAD` stripped |
+| `fork`, `vfork` | Keep the guest environment coherent |
 
-1. main.rs resolves the target to an absolute path via which().
-2. elf::analyze() reads the header:
-   machine = 0xB7 (aarch64), libc = Glibc, interpreter = /lib/ld-linux-aarch64.so.1.
-3. resolve() looks up the loader: /lib/ld-linux-aarch64.so.1 does not
-   exist, falls back to $GLIBC/lib/ld-linux-aarch64.so.1. Finds the
-   preload library. Builds argv with the absolute target path first.
-4. env::build_target_env() sets LD_PRELOAD to our .so,
-   BIONILUX_TARGET_EXE to the target, BIONILUX_BINARY_PATH to the
-   launcher.
-5. exec::execute() calls:
-   execve($GLIBC/lib/ld-linux-aarch64.so.1,
-          [ld.so, --argv0, target, target, arg1, arg2],
-          env)
-6. Kernel loads ld.so. ld.so sees LD_PRELOAD, loads our hook, then loads
-   libc.so.6, libm.so.6 and friends from $GLIBC/lib/.
-7. Our constructor prints "Injection successful".
-8. ld.so jumps to the target's _start. The program runs.
+**File system**
 
-If the program spawns a child with execvp("ls", ...):
+| Hook | Behaviour |
+|------|-----------|
+| `open*`, `openat*`, `creat`, `creat64` | Map the guest path into the rootfs |
+| `stat`, `lstat`, `stat64`, `fstatat*`, `statx`, `fstat`, `fstat64` | Map the path, then report the guest's own identity for the owner |
+| `opendir`, `scandir`, `scandirat`, `readdir` | Map the path |
+| `mkdir`, `rmdir`, `unlink`, `unlinkat`, `remove`, `rename*`, `link`, `linkat`, `symlink*` | Map the path; `link`/`linkat` copy when the platform refuses hard links |
+| `chmod`, `fchmod`, `fchmodat`, `chown`, `lchown`, `fchownat`, `utime*`, `utimensat`, `lutimes`, `truncate`, `truncate64` | Map the path |
+| `mkstemp`, `mkostemp`, `mkstemps`, `mkostemps` (+ `64` spellings), `mkdtemp`, `mkfifo*`, `mknod*` | Map the template, creating it here because libc's internal `open`/`mkdir` would not be intercepted |
+| `readlink`, `readlinkat`, `realpath`, `__realpath_chk`, `getcwd`, `chdir`, `fchdir` | Present the guest's view of the path |
+| `statfs`, `statfs64`, `statvfs`, `statvfs64` | Map the path |
+| `dlopen` | Map an absolute library path |
+| `access`, `faccessat` | Map the path |
 
-9. The hook's reroute() sees target = "ls" and builds
-   [bionilux, "ls"], stripping LD_PRELOAD from env.
-10. execve(bionilux, ...) is called.
-11. bionilux runs again, resolves "ls" to /data/.../usr/bin/ls, sees
-    libc = Bionic, and calls execve(ls) directly.
-12. ls runs.
+**Identity and name resolution**
 
-The chain stops because the child is Bionic.
+| Hook | Behaviour |
+|------|-----------|
+| `getuid`, `geteuid`, `getgid`, `getegid`, `getres*id` | Report the guest's (virtual) identity |
+| `setuid`, `setgid`, `setre*id`, `setres*id`, `setgroups` | Record the request and succeed; the host uid cannot change |
+| `getpwnam*`, `getpwuid*`, `getgrnam*`, `getgrgid*` | Read the guest's `/etc/passwd` and `/etc/group` |
+| `getaddrinfo`, `gethostbyname*` | Query using the guest's resolver, then hand numeric addresses back to glibc so it keeps its service and socket semantics |
 
-### x86_64 glibc binary
+`va_list` is a struct on aarch64, not an array — the `execl*` conversions take a
+pointer so the caller's position advances. That bug only appeared on hardware.
 
-```
-bionilux ./x86_64_server
-```
+## Build from source
 
-Same first four steps, except machine = 0x3E (x86_64). Then:
+The launcher is Rust; the preload is C. On Windows the MSVC host has no
+`link.exe`, so build with the self-contained GNU host toolchain and the Android
+NDK linker:
 
-5. resolve() sees x86_64. Checks that $PREFIX/bionilux/box64-glibc
-   exists. Builds argv with box64's full path as argv[0]. Box64 uses
-   argv[0] to find its own directory — a bare "box64" crashes it with
-   strlen(NULL) inside libc.
-6. execve(ld.so, [ld.so, --argv0, box64-path, box64-path, server, args...], env)
-7. ld.so loads box64-glibc. Our preload is also injected, prints
-   "Injection successful".
-8. Box64 initializes Dynarec, sets up x86_64 memory, loads server. It
-   prints "Warning, cannot pre-load libbionilux_preload.so" — expected:
-   the preload is aarch64 and cannot enter an x86_64 process. Box64
-   ignores it and continues.
-9. server runs under emulation.
+```bash
+# Launcher (aarch64 Android)
+cargo +stable-x86_64-pc-windows-gnu build --release --target aarch64-linux-android
+#   CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=<ndk>/aarch64-linux-android24-clang.cmd
 
-The preload's purpose here is only for the intermediate aarch64 stage
-(box64's own process), which may call lscpu or uname on the host.
-
-### Shebang script
-
-`/tmp/greet.sh`:
-
-```
-#!/usr/bin/env -S python3 -u
-print("hello")
+# Preload (aarch64 glibc)
+aarch64-linux-gnu-gcc -shared -fPIC -O2 -o libbionilux_preload.so src/preload/hooks.c \
+    -Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1 \
+    -Wl,-rpath,/usr/lib/aarch64-linux-gnu
 ```
 
-1. elf::analyze() returns None (not ELF).
-2. resolve_at() falls into script().
-3. parse_shebang() reads the first line:
-   interp = /usr/bin/env, arg = "-S python3 -u".
-4. rewrite_termux("/usr/bin/env") -> $PREFIX/bin/env.
-5. Basename is "env", so we parse the argument list: strip -S, first word
-   is python3, remaining is ["-u"].
-6. which("python3") -> interpreter path. Recurse: resolve python3 itself.
-7. Resulting argv is [python3, "-u", script, args...].
-8. execve(loader, [loader, --argv0, python3, python3, "-u", script, ...], env).
-
-This handles the common #!/usr/bin/env PROGRAM shebang and the -S
-variant.
-
-## Implementation
-
-### Launcher (Rust, bionic)
-
-| File | Role |
-|------|------|
-| src/main.rs | CLI entry, calls resolver, calls exec |
-| src/debug.rs | BIONILUX_DEBUG-gated debug!() macro |
-| src/analyzer/elf.rs | ELF header + PT_INTERP via goblin |
-| src/launcher/resolve.rs | Decision tree + shebang + loader/preload lookup |
-| src/launcher/env.rs | Build env for target |
-| src/launcher/exec.rs | execve with --argv0 |
-
-### Detection
-
-elf.rs reads the ELF header via mmap and returns:
-
-machine: 0x3E (x86_64), 0xB7 (aarch64), or anything else (rejected).
-libc: Bionic, Glibc, Musl, Static, Other.
-interpreter: the PT_INTERP string, if present.
-
-Classification:
-
-| PT_INTERP | Class |
-|-----------|-------|
-| absent | Static |
-| /system/bin/linker64 | Bionic |
-| contains ld-linux | Glibc |
-| contains ld-musl | Musl |
-| anything else | Other |
-
-Musl and Other are rejected with a clear error — ABI-incompatible with
-glibc, cannot be routed through the same loader.
-
-### Preload hooks
-
-When a glibc process starts under bionilux, LD_PRELOAD injects our .so.
-The constructor resolves symbols via dlsym(RTLD_NEXT, ...) and hooks:
-
-exec family:
-
-| Hook | Behavior |
-|------|----------|
-| execve | Reroute glibc targets through launcher; strip LD_PRELOAD if target is the launcher itself |
-| execv | execve(path, argv, environ) |
-| execvp | PATH resolution then reroute |
-| execl, execle, execlp | Convert va_list to argv[], delegate |
-| fexecve | Resolve /proc/self/fd/N to real path, then execve |
-| execveat | Same for AT_EMPTY_PATH; absolute/AT_FDCWD paths go through execve |
-| posix_spawn, posix_spawnp | Same reroute logic |
-
-Note on aarch64: va_list is a struct, not an array. Our va_to_argv takes
-a pointer so the caller's position advances correctly. This was a real bug
-we only caught on hardware — x86_64 tests passed, aarch64 crashed.
-
-open family:
-
-| Hook | Behavior |
-|------|----------|
-| open, open64, openat, openat64 | Redirect /etc/resolv.conf, /etc/hosts, /etc/nsswitch.conf, /etc/* to $GLIBC/etc/* if the target exists |
-
-This is a safety net for programs that open `/etc/*` directly instead of going through glibc's NSS. glibc itself resolves DNS and NSS correctly under Termux's glibc-repo, tested with a `getaddrinfo` helper on the device.
-
-readlink family:
-
-| Hook | Behavior |
-|------|----------|
-| readlink | If path is /proc/self/exe, return BIONILUX_TARGET_EXE |
-| readlinkat | Same for the at-variant |
-
-Without this, readlink("/proc/self/exe") inside the target returns the
-loader's path. Programs like Node.js, Python, and Go use this to locate
-their own resources.
+`tests/helpers/preload_paths.sh` builds and exercises the preload against the
+host glibc, so the path layer can be tested with no device attached.
 
 ## Testing
 
-Three layers.
+Four layers. Only the last needs a device.
 
-Unit tests (cargo test). 12 tests in src/launcher/resolve.rs:
+* **Unit tests** — `cargo test`. Run them on a Unix host; the project uses
+  Unix-only APIs.
+* **Host hook tests** — `tests/preload_paths.sh`. Guest paths resolve inside a
+  synthetic rootfs, host files of the same name are unreachable, `..` cannot
+  escape, and a `_FORTIFY_SOURCE` build behaves identically.
+* **Acceptance** — `tests/acceptance.sh` drives a real Debian rootfs through the
+  runtime, and can run the same cases through PRoot for comparison or against a
+  device over `adb`.
+* **On device** — `tests/smoke.sh` for the upstream exec/shebang cases, plus the
+  capability table above.
 
-- rewrite_termux — POSIX prefix rewriting (3 tests)
-- parse_shebang — well-formed, missing arg, trailing whitespace, empty
-  file, no #!, non-UTF-8 after line 1 (7 tests)
-- find_loader — missing interpreter, glibc-dir fallback (2 tests)
+Diagnostics kept in the tree, because each one cracked a real bug:
+`tests/helpers/netprobe.c` (interface, resolver state, raw UDP/TCP DNS),
+`tests/helpers/ftsprobe.c` (what `fts(3)` — and therefore `find` and `rm -rf` —
+sees behind the preload), `tests/helpers/privprobe.c` (the negative result that
+`GLIBC_PRIVATE` symbols cannot be interposed).
 
-End-to-end smoke tests (tests/smoke.sh). 10 tests that run the real
-binary on the device:
+## Documentation
 
-| Test | Proves |
-|------|--------|
-| execle (multi-arg + envp) | The va_list-on-aarch64 fix |
-| fexecve | /proc/self/fd/N resolution |
-| launcher self-call: execve | LD_PRELOAD stripped when target == launcher |
-| launcher self-call: execvp | Same, via execvp |
-| launcher self-call: posix_spawn | Same, via posix_spawn |
-| shebang env -S | #!/usr/bin/env -S prog arg parses |
-| shebang recursion limit | Self-referencing scripts error cleanly |
-| missing path -> 127 | Nonexistent paths get ENOENT from shell |
-| box64 chain | bedrock_server runs >= 3s through full chain |
+| Document | Contents |
+|----------|----------|
+| [`docs/README.md`](docs/README.md) | Orientation and reading order |
+| [`docs/HARDCODING.md`](docs/HARDCODING.md) | The runtime contract: what may be hardcoded and what must be derived |
+| [`docs/ROOTFS.md`](docs/ROOTFS.md) | Path mapping rules and the cases they cannot cover |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Why the runtime is built this way |
+| [`docs/STATUS.md`](docs/STATUS.md) | What works, what does not, and the evidence |
+| [`docs/PERF.md`](docs/PERF.md) | Measured numbers against PRoot |
 
-Run from the project root in a native Termux shell:
+## Relationship to upstream
 
-```bash
-cargo test
-tests/smoke.sh
-```
+Upstream bionilux runs a glibc binary on Termux; this fork runs a Debian guest
+inside an app. The ELF classification, loader invocation and child-rerouting
+design are upstream's. Everything about the guest file system, the guest
+identity, name resolution, package management and Android path access is this
+fork's, and it is tested on a device rather than on a desktop.
 
-Real-world verification: Geekbench 7 (aarch64 glibc preview) runs a full
-single-core and multi-core suite without crashes. Minecraft Bedrock Server
-(x86_64) starts and generates a world through box64.
-
-## How we know it works
-
-Every layer of the routing has a test:
-
-| Layer | Verified by |
-|-------|-------------|
-| ELF classification | cargo test (via rewrite_termux, parse_shebang) |
-| Loader lookup | find_loader unit tests |
-| Preload injection | smoke test: execle, fexecve |
-| Child rerouting | smoke test: launcher self-call (3 variants), box64 chain |
-| /proc/self/exe fix | smoke test: bedrock_server (uses it) |
-| Shebang handling | smoke test: env -S, recursion limit |
-| ENOENT semantics | smoke test: missing path -> 127 |
-| /etc/* redirection | manual: no-op for glibc DNS (getaddrinfo works without it); covers hardcoded `/etc/*` opens in third-party binaries |
-
-Additionally: cargo clippy -- -D warnings passes with zero lints. Each
-change went through two reviewers across the development cycle. The
-preload is cross-compiled with clang against the actual Termux glibc
-sysroot; the launcher is compiled with cargo for Termux's bionic
-toolchain. Both are exercised together in the smoke tests, which run the
-real binaries end-to-end.
-
-## Known limitations
-
-These are documented design choices, not bugs.
-
-Bare-name execvp / posix_spawnp: a missing program is reported after exec
-(exit 127) instead of synchronously via ENOENT. Absolute paths behave
-correctly.
-
-execveat(dirfd, relative_path): bypasses the hook, runs natively. Rare
-pattern.
-
-Native interpreters: a shebang script whose interpreter is a bionic
-binary (Termux sh, bash, python) runs without the preload. If that
-interpreter spawns a glibc child, the child is not rerouted.
-
-Target argv[0]: always the resolved path, not the caller's original. Login
-shells (-bash) and exec -a name see the full path.
-
-User LD_PRELOAD: dropped for rerouted children. Unavoidable — a bionic
-launcher cannot load a glibc preload.
-
-musl: rejected at detection. ABI-incompatible with glibc.
-
-No VFS virtualization. bionilux redirects /etc/* accesses to $GLIBC/etc/*
-when the target exists, but does not simulate a full Linux root filesystem.
-Programs that hardcode /var/run/ or /usr/share/ will not find them.
-
-For full filesystem virtualization, use PRoot or proot-distro. bionilux is
-the fast path for programs that already work with a shared /etc.
-
-## Disclaimer
-
-The idea, the architecture, the choice of approach, and the direction of
-every design decision are mine. Code and text were written with AI
-assistance; the AI also helped find and fix bugs across the review cycles.
-Every change was validated by building and running the project on a real
-device.
-
-## License
-
-MIT
+`x86_64` support through `box64-glibc` is inherited from upstream and unchanged;
+this fork does not depend on it.
