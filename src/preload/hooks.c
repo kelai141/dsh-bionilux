@@ -37,10 +37,13 @@
 #include <spawn.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -51,6 +54,7 @@
 #include <utime.h>
 
 extern char **environ;
+extern void __chk_fail(void) __attribute__((noreturn));
 
 // ── debug ──────────────────────────────────────────────────────────
 static int bionilux_debug(void) {
@@ -71,9 +75,32 @@ static int bionilux_debug(void) {
     do { if (!(var)) (var) = (__typeof__(var))dlsym(RTLD_NEXT, name); } while (0)
 
 // ── configuration ──────────────────────────────────────────────────
+// Keep runtime identity even when a tool calls clearenv() (notably env -i).
+// These are configuration paths/flags only, never arbitrary user environment.
+static struct { const char *key; char *entry; } bn_context[] = {
+    {"BIONILUX_ROOTFS=", NULL}, {"BIONILUX_PREFIX=", NULL},
+    {"BIONILUX_RUNTIME_DIR=", NULL}, {"BIONILUX_HOST_PATHS=", NULL},
+    {"BIONILUX_ANDROID_PATHS=", NULL}, {"BIONILUX_BOX64=", NULL},
+    {"BIONILUX_PRELOAD=", NULL}, {"BIONILUX_LOADER=", NULL},
+    {"BIONILUX_GUEST_PATH=", NULL}, {"BIONILUX_GUEST_HOME=", NULL},
+    {"BIONILUX_GUEST_TMP=", NULL}, {"BIONILUX_GUEST_CWD=", NULL},
+    {"BIONILUX_FAKE_ROOT=", NULL}, {"BIONILUX_LENIENT=", NULL},
+    {"BIONILUX_BINARY_PATH=", NULL}, {"BIONILUX_DNS=", NULL},
+    {"BIONILUX_DNS_SERVERS=", NULL}
+};
+
 static const char *bn_env(const char *name) {
     const char *v = getenv(name);
-    return (v && *v) ? v : NULL;
+    if (v) return *v ? v : NULL;
+    size_t len = strlen(name);
+    for (size_t i = 0; i < sizeof bn_context / sizeof bn_context[0]; i++) {
+        if (bn_context[i].entry && strlen(bn_context[i].key) == len + 1 &&
+            !strncmp(bn_context[i].key, name, len)) {
+            v = bn_context[i].entry + len + 1;
+            return *v ? v : NULL;
+        }
+    }
+    return NULL;
 }
 
 static const char *bn_rootfs(void) {
@@ -103,8 +130,8 @@ static int bn_lenient(void) {
 // The identity the guest is told it has. Declared here because stat() reports
 // it as the owner of every file; the setuid()/setgid() family assigns it, and
 // the reasoning is documented in the fake root section further down.
-static uid_t bn_vruid, bn_veuid, bn_vsuid;
-static gid_t bn_vrgid, bn_vegid, bn_vsgid;
+static _Atomic uid_t bn_vruid, bn_veuid, bn_vsuid;
+static _Atomic gid_t bn_vrgid, bn_vegid, bn_vsgid;
 
 // The host owns every file as the app's own uid, so a file the guest itself
 // created reports that uid rather than the guest's identity. Any caller that
@@ -231,6 +258,12 @@ static void bn_normalize(const char *in, char *out, size_t size) {
         memcpy(out + o, seg, copy);
         o += copy;
     }
+    size_t input_len = in ? strlen(in) : 0;
+    const char *last = in ? strrchr(in, '/') : NULL;
+    last = last ? last + 1 : in;
+    int directory = input_len && (in[input_len - 1] == '/' ||
+        (last && (!strcmp(last, ".") || !strcmp(last, ".."))));
+    if (directory && o > 1 && out[o - 1] != '/' && o + 1 < size) out[o++] = '/';
     if (o == 0) out[o++] = absolute ? '/' : '.';
     out[o < size ? o : size - 1] = '\0';
 }
@@ -277,7 +310,7 @@ static int bn_has_dotdot(const char *path) {
 // The process's physical working directory, bypassing our own unmapping hook.
 static int bn_physical_cwd(char *buf, size_t size) {
     typedef char *(*fn_t)(char *, size_t);
-    static fn_t real;
+    static _Thread_local fn_t real;
     REAL(real, "getcwd");
     return real && real(buf, size) != NULL;
 }
@@ -310,7 +343,10 @@ static const char *bn_resolve(int dirfd, const char *path, char *buf, size_t siz
 
     char logical_base[PATH_MAX];
     const char *logical = bn_unmap(base, logical_base, sizeof logical_base);
-    if (logical == base) logical = "/";  // outside the guest: treat as the root
+    if (logical == base) {
+        if (bn_passthrough(base)) return path;
+        logical = "/";
+    }
 
     char joined[PATH_MAX];
     int n = snprintf(joined, sizeof joined, "%s/%s", logical, path);
@@ -326,58 +362,111 @@ static int is_launcher(const char *path, const char *launcher) {
     return launcher && path && strcmp(path, launcher) == 0;
 }
 
+// A caller may supply a minimal child environment. Keep only the runtime's
+// own configuration when absent from envp; never inherit arbitrary host values.
 static char **strip_ld_preload(char *const envp[]) {
     size_t envc = 0;
     while (envp && envp[envc]) envc++;
-    char **ev = malloc((envc + 1) * sizeof *ev);
+    const char *preload = NULL;
+    for (size_t i = 0; i < envc; i++)
+        if (!strncmp(envp[i], "LD_PRELOAD=", 11)) preload = envp[i] + 11;
+    size_t slots = envc + sizeof bn_context / sizeof bn_context[0] + 2;
+    size_t extra = preload ? sizeof "BIONILUX_INTERNAL_PRELOAD=" + strlen(preload) : 0;
+    char **ev = malloc(slots * sizeof *ev + extra);
     if (!ev) return NULL;
     size_t j = 0;
     for (size_t i = 0; i < envc; i++)
-        if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0) ev[j++] = envp[i];
+        if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0 &&
+            strncmp(envp[i], "BIONILUX_INTERNAL_PRELOAD=", sizeof "BIONILUX_INTERNAL_PRELOAD=" - 1) != 0) ev[j++] = envp[i];
+    if (preload) {
+        char *saved = (char *)(ev + slots);
+        snprintf(saved, extra, "BIONILUX_INTERNAL_PRELOAD=%s", preload);
+        ev[j++] = saved;
+    }
+    for (size_t key = 0; key < sizeof bn_context / sizeof bn_context[0]; key++) {
+        size_t len = strlen(bn_context[key].key);
+        int provided = 0;
+        for (size_t i = 0; i < envc; i++)
+            if (!strncmp(envp[i], bn_context[key].key, len)) { provided = 1; break; }
+        if (provided) continue;
+        char *entry = bn_context[key].entry;
+        for (size_t i = 0; environ && environ[i]; i++)
+            if (!strncmp(environ[i], bn_context[key].key, len)) { entry = environ[i]; break; }
+        if (entry) ev[j++] = entry;
+    }
     ev[j] = NULL;
     return ev;
 }
 
-// The PATH to search for a bare command name: execvpe() resolves against the
-// environment it was given, not the ambient one.
-static const char *bn_path_from(char *const envp[]) {
-    if (envp)
-        for (size_t i = 0; envp[i]; i++)
-            if (strncmp(envp[i], "PATH=", 5) == 0) return envp[i] + 5;
-    return getenv("PATH");
-}
+static int bn_check_interpreter(const char *script, unsigned depth);
 
-// Resolve a bare command name against the *guest's* PATH.
-//
-// libc's execvp() and posix_spawnp() search the host's PATH, which holds
-// Android's binaries: a guest name such as "awk" would either not be found at
-// all or would run the host's program. GNU make execs recipe commands this
-// way, so a kernel build fails as `make: awk: No such file or directory`.
-// Fills `out` with a guest absolute path and returns 1 on success.
+// As with glibc execvpe(), search the caller's PATH, not envp's PATH.
 static int bn_which(const char *name, const char *path, char *out, size_t size) {
-    if (!name || !*name) return 0;
-    if (!path || !*path) path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
-    for (const char *p = path; *p; ) {
+    if (!name || !*name) { errno = ENOENT; return 0; }
+    if (!path) path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    int denied = 0;
+    for (const char *p = path; ; ) {
         const char *end = strchr(p, ':');
         size_t len = end ? (size_t)(end - p) : strlen(p);
-
-        // An empty component means the current directory.
-        char cand[PATH_MAX];
-        int n = len ? snprintf(cand, sizeof cand, "%.*s/", (int)len, p)
-                    : snprintf(cand, sizeof cand, "%s", "");
-        if (n > 0 && (size_t)n < sizeof cand) {
-            int m = snprintf(out, size, "%s%s", cand, name);
-            if (m > 0 && (size_t)m < size) {
-                char mapped[PATH_MAX];
-                const char *probe = bn_resolve(AT_FDCWD, out, mapped, sizeof mapped);
-                if (access(probe, X_OK) == 0) return 1;
+        int n = len ? snprintf(out, size, "%.*s/%s", (int)len, p, name)
+                    : snprintf(out, size, "./%s", name);
+        if (n > 0 && (size_t)n < size) {
+            if (bn_check_interpreter(out, 0) == 0 || errno == ENOEXEC) return 1;
+            switch (errno) {
+                case EACCES: denied = 1; break;
+                case ENOENT: case ENOTDIR: case ESTALE: case ENODEV: case ETIMEDOUT: break;
+                default: return 0;
             }
         }
         if (!end) break;
         p = end + 1;
     }
+    errno = denied ? EACCES : ENOENT;
     return 0;
+}
+
+// Fail before replacing the caller if the kernel-level shebang interpreter
+// cannot execute. env's optional program is deliberately left to env itself.
+static int bn_check_interpreter(const char *script, unsigned depth) {
+    typedef int (*open_fn)(const char *, int, ...);
+    static _Thread_local open_fn real_open;
+    REAL(real_open, "open");
+    char mapped[PATH_MAX], line[PATH_MAX];
+    const char *physical = bn_resolve(AT_FDCWD, script, mapped, sizeof mapped);
+    if (access(physical, X_OK) != 0) return -1;
+    struct stat st;
+    if (stat(physical, &st) != 0) return -1;
+    if (!S_ISREG(st.st_mode)) { errno = EACCES; return -1; }
+    int fd = real_open ? real_open(physical, O_RDONLY | O_CLOEXEC | O_NONBLOCK) : -1;
+    if (fd < 0) return -1;
+    ssize_t got;
+    do { got = read(fd, line, sizeof line - 1); } while (got < 0 && errno == EINTR);
+    int saved = errno;
+    close(fd);
+    if (got < 0) { errno = saved; return -1; }
+    if (got >= 4 && !memcmp(line, "\177ELF", 4)) return 0;
+    if (got < 2 || line[0] != '#' || line[1] != '!') { errno = ENOEXEC; return -1; }
+    if (depth >= 4) { errno = ELOOP; return -1; }
+    line[got] = '\0';
+    char *start = line + 2;
+    while (*start == ' ' || *start == '\t') start++;
+    char *end = start;
+    while (*end && *end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') end++;
+    *end = '\0';
+    if (!*start) { errno = ENOEXEC; return -1; }
+    char legacy[PATH_MAX];
+    const char *prefix = bn_env("BIONILUX_PREFIX");
+    if (!bn_rootfs() && prefix) {
+        const char *rest = NULL;
+        if (!strncmp(start, "/bin/", 5)) rest = start + 5;
+        else if (!strncmp(start, "/usr/bin/", 9)) rest = start + 9;
+        if (rest) {
+            int n = snprintf(legacy, sizeof legacy, "%s/bin/%s", prefix, rest);
+            if (n < 0 || (size_t)n >= sizeof legacy) { errno = ENAMETOOLONG; return -1; }
+            start = legacy;
+        }
+    }
+    return bn_check_interpreter(start, depth + 1);
 }
 
 // Build [launcher, target, argv[1..]] with a stripped envp.
@@ -385,42 +474,79 @@ static int bn_which(const char *name, const char *path, char *out, size_t size) 
 // kernel untouched, and -1 when `target` cannot be resolved at all — a bare
 // name that is not in the guest's PATH must not fall through to libc, which
 // would then search the host's.
-static int reroute(const char *target, char *const argv[], char *const envp[],
+static int reroute(int search_path, const char *target, char *const argv[], char *const envp[],
                    const char **launcher, char ***nargv, char ***nenvp) {
-    *launcher = getenv("BIONILUX_BINARY_PATH");
+    *launcher = bn_env("BIONILUX_BINARY_PATH");
     if (!*launcher || !target || is_launcher(target, *launcher)) return 0;
 
     char resolved[PATH_MAX];
     if (!strchr(target, '/')) {
-        if (!bn_which(target, bn_path_from(envp), resolved, sizeof resolved)) {
-            errno = ENOENT;
-            return -1;
+        if (search_path) {
+            if (!bn_which(target, getenv("PATH"), resolved, sizeof resolved)) return -1;
+        } else {
+            int n = snprintf(resolved, sizeof resolved, "./%s", target);
+            if (n < 0 || (size_t)n >= sizeof resolved) { errno = ENAMETOOLONG; return -1; }
         }
         target = resolved;
     }
 
-    // A path that cannot be executed is handed to the kernel, which reports
-    // the real reason (EACCES, ENOTDIR, ENOENT) instead of a generic 127.
+    // Report pre-exec errors to the caller, not as a launcher child exit.
+    int shell_fallback = 0;
     // The probe must use the mapped path: an absolute guest path does not
     // exist on the host.
     if (strchr(target, '/')) {
         char buf[PATH_MAX];
         const char *probe = bn_resolve(AT_FDCWD, target, buf, sizeof buf);
-        if (access(probe, X_OK) != 0) return 0;
+        if (access(probe, X_OK) != 0) return -1;
+        struct stat st;
+        if (stat(probe, &st) != 0) return -1;
+        if (!S_ISREG(st.st_mode)) { errno = EACCES; return -1; }
+        typedef int (*open_fn)(const char *, int, ...);
+        static _Thread_local open_fn real_open;
+        REAL(real_open, "open");
+        int fd = real_open ? real_open(probe, O_RDONLY | O_CLOEXEC | O_NONBLOCK) : -1;
+        if (fd >= 0) {
+            unsigned char magic[4];
+            ssize_t got;
+            do { got = read(fd, magic, sizeof magic); } while (got < 0 && errno == EINTR);
+            close(fd);
+            if (got >= 2 && magic[0] == '#' && magic[1] == '!') {
+                if (bn_check_interpreter(probe, 0) != 0) {
+                    if (errno != ENOEXEC || search_path != 1) return -1;
+                    shell_fallback = 1;
+                }
+            }
+            if (got >= 0 && !(got >= 2 && magic[0] == '#' && magic[1] == '!') &&
+                !(got == 4 && memcmp(magic, "\177ELF", 4) == 0)) {
+                if (search_path != 1) { errno = ENOEXEC; return -1; }
+                shell_fallback = 1;
+            }
+        }
     }
 
     size_t argc = 0;
     while (argv && argv[argc]) argc++;
     size_t n = argc ? argc : 1;
 
-    char **av = malloc((n + 2) * sizeof *av);
+    const char *original_argv0 = shell_fallback ? "/bin/sh" : (argc ? argv[0] : "");
+    size_t target_len = strlen(target) + 1;
+    size_t argv0_len = strlen(original_argv0) + 1;
+    char **av = malloc((n + 6) * sizeof *av + target_len + argv0_len);
     char **ev = strip_ld_preload(envp);
-    if (!av || !ev) { free(av); free(ev); return 0; }
+    if (!av || !ev) { free(av); free(ev); errno = ENOMEM; return -1; }
 
     av[0] = (char *)*launcher;
-    av[1] = (char *)target;
-    for (size_t i = 1; i < argc; i++) av[i + 1] = argv[i];
-    av[n + 1] = NULL;
+    av[1] = "--argv0";
+    av[2] = (char *)(av + n + 6);
+    memcpy(av[2], original_argv0, argv0_len);
+    av[3] = "--";
+    // Both strings may originate in a caller's stack; own them until exec/spawn.
+    av[4] = av[2] + argv0_len;
+    memcpy(av[4], target, target_len);
+    size_t offset = 4;
+    if (shell_fallback) { av[5] = av[4]; av[4] = "/bin/sh"; offset++; }
+    for (size_t i = 1; i < argc; i++) av[i + offset] = argv[i];
+    av[n + offset] = NULL;
 
     *nargv = av;
     *nenvp = ev;
@@ -430,7 +556,7 @@ static int reroute(const char *target, char *const argv[], char *const envp[],
 
 static int real_execve(const char *p, char *const a[], char *const e[]) {
     typedef int (*fn_t)(const char *, char *const[], char *const[]);
-    static fn_t fn;
+    static _Thread_local fn_t fn;
     REAL(fn, "execve");
     return fn(p, a, e);
 }
@@ -445,7 +571,8 @@ static int run_rerouted(const char *launcher, char **av, char **ev) {
 
 static int exec_launcher(const char *path, char *const argv[], char *const envp[]) {
     char **clean = strip_ld_preload(envp);
-    int r = real_execve(path, argv, clean ? clean : envp);
+    if (!clean) { errno = ENOMEM; return -1; }
+    int r = real_execve(path, argv, clean);
     int e = errno;
     free(clean);
     errno = e;
@@ -454,11 +581,11 @@ static int exec_launcher(const char *path, char *const argv[], char *const envp[
 
 // ── exec* family ───────────────────────────────────────────────────
 int execve(const char *path, char *const argv[], char *const envp[]) {
-    DBG("HOOK execve(%s)\n", path ? path : "(null)");
-    if (is_launcher(path, getenv("BIONILUX_BINARY_PATH")))
+    DBG("HOOK execve(%s)\n", path);
+    if (is_launcher(path, bn_env("BIONILUX_BINARY_PATH")))
         return exec_launcher(path, argv, envp);
     const char *l; char **av, **ev;
-    int r = reroute(path, argv, envp, &l, &av, &ev);
+    int r = reroute(0, path, argv, envp, &l, &av, &ev);
     if (r < 0) return -1;
     if (r) return run_rerouted(l, av, ev);
     return real_execve(path, argv, envp);
@@ -470,34 +597,34 @@ int execv(const char *path, char *const argv[]) {
 
 int execvp(const char *file, char *const argv[]) {
     typedef int (*fn_t)(const char *, char *const[]);
-    static fn_t real;
+    static _Thread_local fn_t real;
     REAL(real, "execvp");
-    DBG("HOOK execvp(%s)\n", file ? file : "(null)");
-    if (is_launcher(file, getenv("BIONILUX_BINARY_PATH")))
+    DBG("HOOK execvp(%s)\n", file);
+    if (is_launcher(file, bn_env("BIONILUX_BINARY_PATH")))
         return exec_launcher(file, argv, environ);
     const char *l; char **av, **ev;
-    int r = reroute(file, argv, environ, &l, &av, &ev);
+    int r = reroute(1, file, argv, environ, &l, &av, &ev);
     if (r < 0) return -1;
     if (r) return run_rerouted(l, av, ev);
     return real(file, argv);
 }
 
 // execvpe() is a separate public symbol, not an alias of execvp(): it searches
-// the PATH taken from the environment it was given. GNU make calls it for every
+// the caller's PATH (envp supplies only the child's environment). GNU make calls it for every
 // recipe, handing each child its own environment, so leaving it to libc made
 // make's direct-exec path — the one used whenever a command has no shell
 // metacharacter — resolve on the host and fail with ENOENT. That is what broke
 // a recursive kernel build as `make: /usr/bin/make: No such file or directory`.
 int execvpe(const char *file, char *const argv[], char *const envp[]) {
-    if (is_launcher(file, getenv("BIONILUX_BINARY_PATH")))
+    if (is_launcher(file, bn_env("BIONILUX_BINARY_PATH")))
         return exec_launcher(file, argv, envp);
     const char *l; char **av, **ev;
-    int r = reroute(file, argv, envp, &l, &av, &ev);
+    int r = reroute(1, file, argv, envp, &l, &av, &ev);
     if (r < 0) return -1;
     if (r) return run_rerouted(l, av, ev);
 
     typedef int (*fn_t)(const char *, char *const[], char *const[]);
-    static fn_t real;
+    static _Thread_local fn_t real;
     REAL(real, "execvpe");
     if (real) return real(file, argv, envp);
     errno = ENOSYS;
@@ -561,7 +688,7 @@ static ssize_t resolve_fd_path(int fd, char *buf, size_t size) {
     // a relative argument against this result would then hand a logical path
     // to code that expects a host path.
     typedef ssize_t (*fn_t)(int, const char *, char *, size_t);
-    static fn_t real; REAL(real, "readlinkat");
+    static _Thread_local fn_t real; REAL(real, "readlinkat");
     if (!real) return -1;
     char link[64];
     int n = snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
@@ -576,9 +703,9 @@ static ssize_t resolve_fd_path(int fd, char *buf, size_t size) {
 
 int fexecve(int fd, char *const argv[], char *const envp[]) {
     typedef int (*fn_t)(int, char *const[], char *const[]);
-    static fn_t real;
+    static _Thread_local fn_t real;
     REAL(real, "fexecve");
-    if (getenv("BIONILUX_BINARY_PATH")) {
+    if (bn_env("BIONILUX_BINARY_PATH")) {
         char path[PATH_MAX];
         if (resolve_fd_path(fd, path, sizeof path) > 0)
             return execve(path, argv, envp);
@@ -590,33 +717,26 @@ int fexecve(int fd, char *const argv[], char *const envp[]) {
 int execveat(int dirfd, const char *path, char *const argv[],
              char *const envp[], int flags) {
     typedef int (*fn_t)(int, const char *, char *const[], char *const[], int);
-    static fn_t real;
+    static _Thread_local fn_t real;
     REAL(real, "execveat");
-    if (getenv("BIONILUX_BINARY_PATH")) {
-        if ((flags & AT_EMPTY_PATH) && path[0] == '\0') {
-            char fd_path[PATH_MAX];
-            if (resolve_fd_path(dirfd, fd_path, sizeof fd_path) > 0)
-                return execve(fd_path, argv, envp);
-        } else if (path[0] == '/' || dirfd == AT_FDCWD) {
-            return execve(path, argv, envp);
+    if (flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)) { errno = EINVAL; return -1; }
+    if (bn_env("BIONILUX_BINARY_PATH")) {
+        if (!*path) {
+            if (flags & AT_EMPTY_PATH) return fexecve(dirfd, argv, envp);
         } else {
-            // Relative to a directory fd. Upstream let this reach the kernel,
-            // which resolved it against host paths; joining the fd's real path
-            // keeps the child inside the guest.
-            char dir[PATH_MAX];
-            char joined[PATH_MAX];
-            if (resolve_fd_path(dirfd, dir, sizeof dir) > 0) {
-                int n = snprintf(joined, sizeof joined, "%s/%s", dir, path);
-                if (n > 0 && (size_t)n < sizeof joined) {
-                    char resolved[PATH_MAX];
-                    if (realpath(joined, resolved)) {
-                        char probe[PATH_MAX];
-                        // Only accept the result if it is already physical:
-                        // anything else would escape the guest.
-                        if ((bn_rootfs() == NULL || bn_map(resolved, probe, sizeof probe) == resolved))
-                            return execve(resolved, argv, envp);
-                    }
-                }
+            char mapped[PATH_MAX];
+            const char *target = bn_resolve(dirfd, path, mapped, sizeof mapped);
+            if (flags & AT_SYMLINK_NOFOLLOW) {
+                struct stat st;
+                if (fstatat(dirfd, target, &st, AT_SYMLINK_NOFOLLOW) != 0) return -1;
+                if (S_ISLNK(st.st_mode)) { errno = ELOOP; return -1; }
+            }
+            if (*target == '/' || dirfd == AT_FDCWD) return execve(target, argv, envp);
+            char base[PATH_MAX], joined[PATH_MAX];
+            if (resolve_fd_path(dirfd, base, sizeof base) > 0) {
+                int n = snprintf(joined, sizeof joined, "%s/%s", base, target);
+                if (n < 0 || (size_t)n >= sizeof joined) { errno = ENAMETOOLONG; return -1; }
+                return execve(joined, argv, envp);
             }
         }
     }
@@ -629,7 +749,7 @@ typedef int (*spawn_fn)(pid_t *, const char *, const posix_spawn_file_actions_t 
                         const posix_spawnattr_t *, char *const[], char *const[]);
 
 static spawn_fn spawn_plain(void) {
-    static spawn_fn fn;
+    static _Thread_local spawn_fn fn;
     REAL(fn, "posix_spawn");
     return fn;
 }
@@ -638,19 +758,20 @@ static int spawn_impl(int search_path, pid_t *pid, const char *path,
                       const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
                       char *const argv[], char *const envp[]) {
     spawn_fn plain = spawn_plain();
-    if (!plain) { errno = ENOSYS; return -1; }
+    if (!plain) return ENOSYS;
     DBG("HOOK spawn(p=%d, %s)\n", search_path, path ? path : "(null)");
 
-    if (is_launcher(path, getenv("BIONILUX_BINARY_PATH"))) {
+    if (is_launcher(path, bn_env("BIONILUX_BINARY_PATH"))) {
         char **clean = strip_ld_preload(envp);
-        int r = plain(pid, path, fa, attr, argv, clean ? clean : envp);
+        if (!clean) return ENOMEM;
+        int r = plain(pid, path, fa, attr, argv, clean);
         int e = errno; free(clean); errno = e;
         return r;
     }
 
     const char *l; char **av, **ev;
-    int re = reroute(path, argv, envp, &l, &av, &ev);
-    if (re < 0) return -1;
+    int re = reroute(search_path ? 2 : 0, path, argv, envp, &l, &av, &ev);
+    if (re < 0) return errno;
     if (re) {
         int r = plain(pid, l, fa, attr, av, ev);
         int e = errno; free(av); free(ev); errno = e;
@@ -660,10 +781,10 @@ static int spawn_impl(int search_path, pid_t *pid, const char *path,
     if (search_path) {
         typedef int (*fn_t)(pid_t *, const char *, const posix_spawn_file_actions_t *,
                             const posix_spawnattr_t *, char *const[], char *const[]);
-        static fn_t real;
+        static _Thread_local fn_t real;
         REAL(real, "posix_spawnp");
         if (real) return real(pid, path, fa, attr, argv, envp);
-        errno = ENOSYS; return -1;
+        return ENOSYS;
     }
     return plain(pid, path, fa, attr, argv, envp);
 }
@@ -691,7 +812,7 @@ typedef int (*open_fn)(const char *, int, ...);
 typedef int (*openat_fn)(int, const char *, int, ...);
 
 int open(const char *path, int flags, ...) {
-    static open_fn real; REAL(real, "open");
+    static _Thread_local open_fn real; REAL(real, "open");
     char buf[PATH_MAX];
     const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
     if (open_uses_mode(flags)) {
@@ -703,7 +824,7 @@ int open(const char *path, int flags, ...) {
 }
 
 int open64(const char *path, int flags, ...) {
-    static open_fn real; REAL(real, "open64");
+    static _Thread_local open_fn real; REAL(real, "open64");
     char buf[PATH_MAX];
     const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
     if (open_uses_mode(flags)) {
@@ -716,13 +837,13 @@ int open64(const char *path, int flags, ...) {
 
 // _FORTIFY_SOURCE rewrites open() with a literal path into __open_2.
 int __open_2(const char *path, int flags) {
-    static open_fn real; REAL(real, "__open_2");
+    static _Thread_local open_fn real; REAL(real, "__open_2");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), flags);
 }
 
 int __open64_2(const char *path, int flags) {
-    static open_fn real; REAL(real, "__open64_2");
+    static _Thread_local open_fn real; REAL(real, "__open64_2");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), flags);
 }
@@ -738,7 +859,7 @@ int creat(const char *path, mode_t mode) {
 // *host*. Mapping it here is what makes those loads find the guest's copy.
 void *dlopen(const char *filename, int flags) {
     typedef void *(*fn_t)(const char *, int);
-    static fn_t real; REAL(real, "dlopen");
+    static _Thread_local fn_t real; REAL(real, "dlopen");
     if (!real) { errno = ENOSYS; return NULL; }
     if (!filename || !*filename || !bn_rootfs()) return real(filename, flags);
     char buf[PATH_MAX];
@@ -750,7 +871,7 @@ int creat64(const char *path, mode_t mode) {
 }
 
 int openat(int dirfd, const char *path, int flags, ...) {
-    static openat_fn real; REAL(real, "openat");
+    static _Thread_local openat_fn real; REAL(real, "openat");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     if (open_uses_mode(flags)) {
@@ -762,7 +883,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
 }
 
 int openat64(int dirfd, const char *path, int flags, ...) {
-    static openat_fn real; REAL(real, "openat64");
+    static _Thread_local openat_fn real; REAL(real, "openat64");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     if (open_uses_mode(flags)) {
@@ -774,14 +895,14 @@ int openat64(int dirfd, const char *path, int flags, ...) {
 }
 
 int __openat_2(int dirfd, const char *path, int flags) {
-    static openat_fn real; REAL(real, "__openat_2");
+    static _Thread_local openat_fn real; REAL(real, "__openat_2");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     return real(dirfd, t, flags);
 }
 
 int __openat64_2(int dirfd, const char *path, int flags) {
-    static openat_fn real; REAL(real, "__openat64_2");
+    static _Thread_local openat_fn real; REAL(real, "__openat64_2");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     return real(dirfd, t, flags);
@@ -791,21 +912,21 @@ int __openat64_2(int dirfd, const char *path, int flags) {
 // callers cannot be intercepted, so both layers matter.
 FILE *fopen(const char *path, const char *mode) {
     typedef FILE *(*fn_t)(const char *, const char *);
-    static fn_t real; REAL(real, "fopen");
+    static _Thread_local fn_t real; REAL(real, "fopen");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
 }
 
 FILE *fopen64(const char *path, const char *mode) {
     typedef FILE *(*fn_t)(const char *, const char *);
-    static fn_t real; REAL(real, "fopen64");
+    static _Thread_local fn_t real; REAL(real, "fopen64");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
 }
 
 FILE *freopen(const char *path, const char *mode, FILE *stream) {
     typedef FILE *(*fn_t)(const char *, const char *, FILE *);
-    static fn_t real; REAL(real, "freopen");
+    static _Thread_local fn_t real; REAL(real, "freopen");
     if (!path) return real(NULL, mode, stream);
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode, stream);
@@ -813,7 +934,7 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
 
 DIR *opendir(const char *path) {
     typedef DIR *(*fn_t)(const char *);
-    static fn_t real; REAL(real, "opendir");
+    static _Thread_local fn_t real; REAL(real, "opendir");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf));
 }
@@ -821,7 +942,7 @@ DIR *opendir(const char *path) {
 // ── stat / access ──────────────────────────────────────────────────
 int stat(const char *path, struct stat *st) {
     typedef int (*fn_t)(const char *, struct stat *);
-    static fn_t real; REAL(real, "stat");
+    static _Thread_local fn_t real; REAL(real, "stat");
     char buf[PATH_MAX];
     int rc = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
     if (rc == 0) BN_VIRT_STAT(*st);
@@ -830,7 +951,7 @@ int stat(const char *path, struct stat *st) {
 
 int lstat(const char *path, struct stat *st) {
     typedef int (*fn_t)(const char *, struct stat *);
-    static fn_t real; REAL(real, "lstat");
+    static _Thread_local fn_t real; REAL(real, "lstat");
     char buf[PATH_MAX];
     int rc = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
     if (rc == 0) BN_VIRT_STAT(*st);
@@ -839,7 +960,7 @@ int lstat(const char *path, struct stat *st) {
 
 int stat64(const char *path, struct stat64 *st) {
     typedef int (*fn_t)(const char *, struct stat64 *);
-    static fn_t real; REAL(real, "stat64");
+    static _Thread_local fn_t real; REAL(real, "stat64");
     char buf[PATH_MAX];
     int rc = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
     if (rc == 0) BN_VIRT_STAT(*st);
@@ -848,7 +969,7 @@ int stat64(const char *path, struct stat64 *st) {
 
 int lstat64(const char *path, struct stat64 *st) {
     typedef int (*fn_t)(const char *, struct stat64 *);
-    static fn_t real; REAL(real, "lstat64");
+    static _Thread_local fn_t real; REAL(real, "lstat64");
     char buf[PATH_MAX];
     int rc = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
     if (rc == 0) BN_VIRT_STAT(*st);
@@ -857,7 +978,7 @@ int lstat64(const char *path, struct stat64 *st) {
 
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
     typedef int (*fn_t)(int, const char *, struct stat *, int);
-    static fn_t real; REAL(real, "fstatat");
+    static _Thread_local fn_t real; REAL(real, "fstatat");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     int rc = real(dirfd, t, st, flags);
@@ -867,7 +988,7 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
 
 int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
     typedef int (*fn_t)(int, const char *, struct stat64 *, int);
-    static fn_t real; REAL(real, "fstatat64");
+    static _Thread_local fn_t real; REAL(real, "fstatat64");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     int rc = real(dirfd, t, st, flags);
@@ -879,7 +1000,7 @@ int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
 // opened, or a program that stats a file both ways sees two different owners.
 int fstat(int fd, struct stat *st) {
     typedef int (*fn_t)(int, struct stat *);
-    static fn_t real; REAL(real, "fstat");
+    static _Thread_local fn_t real; REAL(real, "fstat");
     int rc = real(fd, st);
     if (rc == 0) BN_VIRT_STAT(*st);
     return rc;
@@ -887,7 +1008,7 @@ int fstat(int fd, struct stat *st) {
 
 int fstat64(int fd, struct stat64 *st) {
     typedef int (*fn_t)(int, struct stat64 *);
-    static fn_t real; REAL(real, "fstat64");
+    static _Thread_local fn_t real; REAL(real, "fstat64");
     int rc = real(fd, st);
     if (rc == 0) BN_VIRT_STAT(*st);
     return rc;
@@ -895,7 +1016,7 @@ int fstat64(int fd, struct stat64 *st) {
 
 int access(const char *path, int mode) {
     typedef int (*fn_t)(const char *, int);
-    static fn_t real; REAL(real, "access");
+    static _Thread_local fn_t real; REAL(real, "access");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
 }
@@ -914,7 +1035,7 @@ int access(const char *path, int mode) {
 // path here lets the real eaccess() stat the physical file, which exists.
 int euidaccess(const char *path, int mode) {
     typedef int (*fn_t)(const char *, int);
-    static fn_t real; REAL(real, "euidaccess");
+    static _Thread_local fn_t real; REAL(real, "euidaccess");
     if (!real) { errno = ENOSYS; return -1; }
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
@@ -922,7 +1043,7 @@ int euidaccess(const char *path, int mode) {
 
 int eaccess(const char *path, int mode) {
     typedef int (*fn_t)(const char *, int);
-    static fn_t real; REAL(real, "eaccess");
+    static _Thread_local fn_t real; REAL(real, "eaccess");
     if (!real) return euidaccess(path, mode);
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
@@ -933,7 +1054,7 @@ int eaccess(const char *path, int mode) {
 int statx(int dirfd, const char *path, int flags, unsigned int mask,
           struct statx *st) {
     typedef int (*fn_t)(int, const char *, int, unsigned int, struct statx *);
-    static fn_t real;
+    static _Thread_local fn_t real;
     REAL(real, "statx");
     if (!real) { errno = ENOSYS; return -1; }
     char buf[PATH_MAX];
@@ -947,7 +1068,7 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
 
 int faccessat(int dirfd, const char *path, int mode, int flags) {
     typedef int (*fn_t)(int, const char *, int, int);
-    static fn_t real; REAL(real, "faccessat");
+    static _Thread_local fn_t real; REAL(real, "faccessat");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     return real(dirfd, t, mode, flags);
@@ -955,14 +1076,14 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
 
 int statvfs(const char *path, struct statvfs *st) {
     typedef int (*fn_t)(const char *, struct statvfs *);
-    static fn_t real; REAL(real, "statvfs");
+    static _Thread_local fn_t real; REAL(real, "statvfs");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
 }
 
 int statvfs64(const char *path, struct statvfs64 *st) {
     typedef int (*fn_t)(const char *, struct statvfs64 *);
-    static fn_t real; REAL(real, "statvfs64");
+    static _Thread_local fn_t real; REAL(real, "statvfs64");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
 }
@@ -970,14 +1091,14 @@ int statvfs64(const char *path, struct statvfs64 *st) {
 // ── directory and file operations ──────────────────────────────────
 int chdir(const char *path) {
     typedef int (*fn_t)(const char *);
-    static fn_t real; REAL(real, "chdir");
+    static _Thread_local fn_t real; REAL(real, "chdir");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf));
 }
 
 char *getcwd(char *buf, size_t size) {
     typedef char *(*fn_t)(char *, size_t);
-    static fn_t real; REAL(real, "getcwd");
+    static _Thread_local fn_t real; REAL(real, "getcwd");
     char *r = real(buf, size);
     if (!r) return r;
     char mapped[PATH_MAX];
@@ -999,13 +1120,13 @@ char *getcwd(char *buf, size_t size) {
 
 // _FORTIFY_SOURCE rewrites getcwd(buf, sizeof buf) into __getcwd_chk.
 char *__getcwd_chk(char *buf, size_t size, size_t buflen) {
-    (void)buflen;
+    if (size > buflen) __chk_fail();
     return getcwd(buf, size);
 }
 
 int chmod(const char *path, mode_t mode) {
     typedef int (*fn_t)(const char *, mode_t);
-    static fn_t real; REAL(real, "chmod");
+    static _Thread_local fn_t real; REAL(real, "chmod");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
 }
@@ -1014,14 +1135,14 @@ int chmod(const char *path, mode_t mode) {
 // actually matters for dpkg and package maintainer scripts.
 int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     typedef int (*fn_t)(int, const char *, mode_t, int);
-    static fn_t real; REAL(real, "fchmodat");
+    static _Thread_local fn_t real; REAL(real, "fchmodat");
     char buf[PATH_MAX];
     return real(dirfd, bn_resolve(dirfd, path, buf, sizeof buf), mode, flags);
 }
 
 int fchmodat2(int dirfd, const char *path, mode_t mode, int flags) {
     typedef int (*fn_t)(int, const char *, mode_t, int);
-    static fn_t real; REAL(real, "fchmodat2");
+    static _Thread_local fn_t real; REAL(real, "fchmodat2");
     if (!real) { errno = ENOSYS; return -1; }
     char buf[PATH_MAX];
     return real(dirfd, bn_resolve(dirfd, path, buf, sizeof buf), mode, flags);
@@ -1029,42 +1150,42 @@ int fchmodat2(int dirfd, const char *path, mode_t mode, int flags) {
 
 int truncate(const char *path, off_t length) {
     typedef int (*fn_t)(const char *, off_t);
-    static fn_t real; REAL(real, "truncate");
+    static _Thread_local fn_t real; REAL(real, "truncate");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), length);
 }
 
 int truncate64(const char *path, off64_t length) {
     typedef int (*fn_t)(const char *, off64_t);
-    static fn_t real; REAL(real, "truncate64");
+    static _Thread_local fn_t real; REAL(real, "truncate64");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), length);
 }
 
 int mknod(const char *path, mode_t mode, dev_t dev) {
     typedef int (*fn_t)(const char *, mode_t, dev_t);
-    static fn_t real; REAL(real, "mknod");
+    static _Thread_local fn_t real; REAL(real, "mknod");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode, dev);
 }
 
 int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
     typedef int (*fn_t)(int, const char *, mode_t, dev_t);
-    static fn_t real; REAL(real, "mknodat");
+    static _Thread_local fn_t real; REAL(real, "mknodat");
     char buf[PATH_MAX];
     return real(dirfd, bn_resolve(dirfd, path, buf, sizeof buf), mode, dev);
 }
 
 int mkdir(const char *path, mode_t mode) {
     typedef int (*fn_t)(const char *, mode_t);
-    static fn_t real; REAL(real, "mkdir");
+    static _Thread_local fn_t real; REAL(real, "mkdir");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
 }
 
 int mkdirat(int dirfd, const char *path, mode_t mode) {
     typedef int (*fn_t)(int, const char *, mode_t);
-    static fn_t real; REAL(real, "mkdirat");
+    static _Thread_local fn_t real; REAL(real, "mkdirat");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     return real(dirfd, t, mode);
@@ -1072,21 +1193,21 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
 
 int rmdir(const char *path) {
     typedef int (*fn_t)(const char *);
-    static fn_t real; REAL(real, "rmdir");
+    static _Thread_local fn_t real; REAL(real, "rmdir");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf));
 }
 
 int unlink(const char *path) {
     typedef int (*fn_t)(const char *);
-    static fn_t real; REAL(real, "unlink");
+    static _Thread_local fn_t real; REAL(real, "unlink");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf));
 }
 
 int unlinkat(int dirfd, const char *path, int flags) {
     typedef int (*fn_t)(int, const char *, int);
-    static fn_t real; REAL(real, "unlinkat");
+    static _Thread_local fn_t real; REAL(real, "unlinkat");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     return real(dirfd, t, flags);
@@ -1094,7 +1215,7 @@ int unlinkat(int dirfd, const char *path, int flags) {
 
 int rename(const char *from, const char *to) {
     typedef int (*fn_t)(const char *, const char *);
-    static fn_t real; REAL(real, "rename");
+    static _Thread_local fn_t real; REAL(real, "rename");
     char b1[PATH_MAX], b2[PATH_MAX];
     const char *f = bn_resolve(AT_FDCWD, from, b1, sizeof b1);
     const char *t = bn_resolve(AT_FDCWD, to, b2, sizeof b2);
@@ -1103,7 +1224,7 @@ int rename(const char *from, const char *to) {
 
 int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
     typedef int (*fn_t)(int, const char *, int, const char *);
-    static fn_t real; REAL(real, "renameat");
+    static _Thread_local fn_t real; REAL(real, "renameat");
     char b1[PATH_MAX], b2[PATH_MAX];
     const char *f = bn_resolve(olddirfd, oldpath, b1, sizeof b1);
     const char *t = bn_resolve(newdirfd, newpath, b2, sizeof b2);
@@ -1113,7 +1234,7 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
 int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
               unsigned int flags) {
     typedef int (*fn_t)(int, const char *, int, const char *, unsigned int);
-    static fn_t real; REAL(real, "renameat2");
+    static _Thread_local fn_t real; REAL(real, "renameat2");
     if (!real) { errno = ENOSYS; return -1; }
     char b1[PATH_MAX], b2[PATH_MAX];
     const char *f = bn_resolve(olddirfd, oldpath, b1, sizeof b1);
@@ -1131,73 +1252,75 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpa
 // old contents survive) and only loses the inode identity. It is attempted only
 // for a regular file, where hard-link and copy semantics agree, and never
 // silently: the substitution is reported under BIONILUX_DEBUG.
-static int bn_copy_file(const char *from, const char *to, mode_t mode) {
-    typedef int (*open_fn)(const char *, int, ...);
-    typedef ssize_t (*read_fn)(int, void *, size_t);
-    typedef ssize_t (*write_fn)(int, const void *, size_t);
-    typedef int (*close_fn)(int);
-    static open_fn ro; static read_fn rr; static write_fn rw; static close_fn rc_;
-    REAL(ro, "open"); REAL(rr, "read"); REAL(rw, "write"); REAL(rc_, "close");
-    if (!ro || !rr || !rw || !rc_) { errno = ENOSYS; return -1; }
-
-    int in = ro(from, O_RDONLY);
+static int bn_copy_file(int fromfd, const char *from, int tofd, const char *to,
+                         const struct stat *st) {
+    typedef int (*open_fn)(int, const char *, int, ...);
+    typedef int (*unlink_fn)(int, const char *, int);
+    static _Thread_local open_fn ro;
+    static _Thread_local unlink_fn ru;
+    REAL(ro, "openat"); REAL(ru, "unlinkat");
+    if (!ro || !ru) { errno = ENOSYS; return -1; }
+    int in = ro(fromfd, from, O_RDONLY | O_CLOEXEC);
     if (in < 0) return -1;
-    int out = ro(to, O_WRONLY | O_CREAT | O_EXCL, mode & 07777);
-    if (out < 0) { int e = errno; rc_(in); errno = e; return -1; }
-
+    int out = ro(tofd, to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (out < 0) { int saved = errno; close(in); errno = saved; return -1; }
     char buf[65536];
     int rc = 0;
     for (;;) {
-        ssize_t got = rr(in, buf, sizeof buf);
+        ssize_t got = read(in, buf, sizeof buf);
+        if (got < 0 && errno == EINTR) continue;
         if (got < 0) { rc = -1; break; }
-        if (got == 0) break;
+        if (!got) break;
         ssize_t done = 0;
         while (done < got) {
-            ssize_t put = rw(out, buf + done, (size_t)(got - done));
-            if (put <= 0) { rc = -1; break; }
+            ssize_t put = write(out, buf + done, (size_t)(got - done));
+            if (put < 0 && errno == EINTR) continue;
+            if (put <= 0) { if (!put) errno = EIO; rc = -1; break; }
             done += put;
         }
-        if (rc < 0) break;
+        if (rc) break;
     }
-    int e = errno;
-    rc_(in);
-    rc_(out);
-    errno = e;
+    if (!rc) rc = fchmod(out, st->st_mode & 07777);
+    struct timespec times[] = {st->st_atim, st->st_mtim};
+    if (!rc) rc = futimens(out, times);
+    int saved = errno;
+    close(in);
+    if (close(out) < 0 && !rc) { saved = errno; rc = -1; }
+    if (rc) ru(tofd, to, 0);
+    errno = saved;
     return rc;
 }
 
-// The hard link the platform refused, expressed as a copy. `rc` and `e` are the
-// original failure so it can still be reported when no copy is possible.
-static int bn_link_or_copy(const char *from, const char *to, int rc, int e) {
+static int bn_link_or_copy(int fromfd, const char *from, int tofd, const char *to,
+                            int flags, int rc, int error) {
     if (rc == 0) return 0;
-    if (e != EPERM && e != EACCES && e != EOPNOTSUPP && e != EXDEV) {
-        errno = e;
-        return rc;
+    if (error != EPERM && error != EACCES && error != EOPNOTSUPP && error != EXDEV) {
+        errno = error; return rc;
     }
-
-    typedef int (*stat_fn)(const char *, struct stat *);
-    static stat_fn rs;
-    REAL(rs, "stat");
+    typedef int (*stat_fn)(int, const char *, struct stat *, int);
+    static _Thread_local stat_fn real;
+    REAL(real, "fstatat");
     struct stat st;
-    if (rs && rs(from, &st) == 0 && S_ISREG(st.st_mode)) {
-        if (bn_copy_file(from, to, st.st_mode) == 0) {
-            DBG("link: kernel refused (%s), copied instead: %s -> %s\n", strerror(e), from, to);
-            return 0;
-        }
+    int stat_flags = flags & AT_SYMLINK_FOLLOW ? 0 : AT_SYMLINK_NOFOLLOW;
+    // Do not silently turn a hard link to a symlink into a copy of its target.
+    if (real && real(fromfd, from, &st, stat_flags) == 0 && S_ISREG(st.st_mode)) {
+        int copied = bn_copy_file(fromfd, from, tofd, to, &st);
+        if (!copied) DBG("link: copied after kernel refusal: %s -> %s\n", from, to);
+        return copied;
     }
-    errno = e;
+    errno = error;
     return rc;
 }
 
 int link(const char *from, const char *to) {
     typedef int (*fn_t)(const char *, const char *);
-    static fn_t real; REAL(real, "link");
+    static _Thread_local fn_t real; REAL(real, "link");
     char b1[PATH_MAX], b2[PATH_MAX];
     const char *f = bn_resolve(AT_FDCWD, from, b1, sizeof b1);
     const char *t = bn_resolve(AT_FDCWD, to, b2, sizeof b2);
     int rc = real(f, t);
     if (rc == 0 || !bn_rootfs()) return rc;
-    return bn_link_or_copy(f, t, rc, errno);
+    return bn_link_or_copy(AT_FDCWD, f, AT_FDCWD, t, 0, rc, errno);
 }
 
 // An absolute symlink target is stored as its physical path, and readlink()
@@ -1213,7 +1336,7 @@ static const char *bn_map_symlink_target(const char *target, char *buf, size_t s
 
 int symlink(const char *target, const char *linkpath) {
     typedef int (*fn_t)(const char *, const char *);
-    static fn_t real; REAL(real, "symlink");
+    static _Thread_local fn_t real; REAL(real, "symlink");
     char tbuf[PATH_MAX], lbuf[PATH_MAX];
     const char *tg = bn_map_symlink_target(target, tbuf, sizeof tbuf);
     const char *lp = bn_resolve(AT_FDCWD, linkpath, lbuf, sizeof lbuf);
@@ -1222,7 +1345,7 @@ int symlink(const char *target, const char *linkpath) {
 
 int symlinkat(const char *target, int dirfd, const char *linkpath) {
     typedef int (*fn_t)(const char *, int, const char *);
-    static fn_t real; REAL(real, "symlinkat");
+    static _Thread_local fn_t real; REAL(real, "symlinkat");
     char tbuf[PATH_MAX], lbuf[PATH_MAX];
     const char *tg = bn_map_symlink_target(target, tbuf, sizeof tbuf);
     const char *lp = bn_resolve(dirfd, linkpath, lbuf, sizeof lbuf);
@@ -1231,18 +1354,18 @@ int symlinkat(const char *target, int dirfd, const char *linkpath) {
 
 int linkat(int ofd, const char *from, int nfd, const char *to, int flags) {
     typedef int (*fn_t)(int, const char *, int, const char *, int);
-    static fn_t real; REAL(real, "linkat");
+    static _Thread_local fn_t real; REAL(real, "linkat");
     char b1[PATH_MAX], b2[PATH_MAX];
     const char *f = bn_resolve(ofd, from, b1, sizeof b1);
     const char *t = bn_resolve(nfd, to, b2, sizeof b2);
     int rc = real(ofd, f, nfd, t, flags);
     if (rc == 0 || !bn_rootfs()) return rc;
-    return bn_link_or_copy(f, t, rc, errno);
+    return bn_link_or_copy(ofd, f, nfd, t, flags, rc, errno);
 }
 
 int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags) {
     typedef int (*fn_t)(int, const char *, const struct timespec[2], int);
-    static fn_t real; REAL(real, "utimensat");
+    static _Thread_local fn_t real; REAL(real, "utimensat");
     if (!real) { errno = ENOSYS; return -1; }
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
@@ -1251,14 +1374,14 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2], int f
 
 int utimes(const char *path, const struct timeval times[2]) {
     typedef int (*fn_t)(const char *, const struct timeval[2]);
-    static fn_t real; REAL(real, "utimes");
+    static _Thread_local fn_t real; REAL(real, "utimes");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), times);
 }
 
 int utime(const char *path, const struct utimbuf *times) {
     typedef int (*fn_t)(const char *, const struct utimbuf *);
-    static fn_t real; REAL(real, "utime");
+    static _Thread_local fn_t real; REAL(real, "utime");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), times);
 }
@@ -1267,6 +1390,7 @@ int utime(const char *path, const struct utimbuf *times) {
 static ssize_t fake_exe(char *buf, size_t size) {
     const char *exe = getenv("BIONILUX_TARGET_EXE");
     if (!exe) return -1;
+    if (size == 0) { errno = EINVAL; return -1; }
     size_t len = strlen(exe);
     size_t n = len < size ? len : size;
     memcpy(buf, exe, n);
@@ -1275,27 +1399,22 @@ static ssize_t fake_exe(char *buf, size_t size) {
 
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t size) {
     typedef ssize_t (*fn_t)(int, const char *, char *, size_t);
-    static fn_t real; REAL(real, "readlinkat");
-    if (path && strcmp(path, "/proc/self/exe") == 0) {
+    static _Thread_local fn_t real; REAL(real, "readlinkat");
+    if (strcmp(path, "/proc/self/exe") == 0) {
         ssize_t r = fake_exe(buf, size);
         if (r >= 0) return r;
     }
-    char mapped[PATH_MAX];
+    if (size == 0) { errno = EINVAL; return -1; }
+    char mapped[PATH_MAX], raw[PATH_MAX + 1];
     const char *t = bn_resolve(dirfd, path, mapped, sizeof mapped);
-    ssize_t r = real(dirfd, t, buf, size);
+    ssize_t r = real(dirfd, t, raw, PATH_MAX);
     if (r <= 0) return r;
-
-    // The guest must see its own view of the path, not the physical one.
-    char raw[PATH_MAX];
-    size_t n = (size_t)r < sizeof raw - 1 ? (size_t)r : sizeof raw - 1;
-    memcpy(raw, buf, n);
-    raw[n] = '\0';
+    raw[r] = '\0';
     char logical[PATH_MAX];
     const char *u = bn_unmap(raw, logical, sizeof logical);
-    if (u == raw) return r;
-    size_t len = strlen(logical);
+    size_t len = strlen(u);
     size_t copy = len < size ? len : size;
-    memcpy(buf, logical, copy);
+    memcpy(buf, u, copy);
     return (ssize_t)copy;
 }
 
@@ -1304,18 +1423,18 @@ ssize_t readlink(const char *path, char *buf, size_t size) {
 }
 
 ssize_t __readlink_chk(const char *path, char *buf, size_t size, size_t buflen) {
-    (void)buflen;
+    if (size > buflen) __chk_fail();
     return readlink(path, buf, size);
 }
 
 ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t size, size_t buflen) {
-    (void)buflen;
+    if (size > buflen) __chk_fail();
     return readlinkat(dirfd, path, buf, size);
 }
 
 char *realpath(const char *path, char *resolved) {
     typedef char *(*fn_t)(const char *, char *);
-    static fn_t real; REAL(real, "realpath");
+    static _Thread_local fn_t real; REAL(real, "realpath");
     char buf[PATH_MAX];
     char *r = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), resolved);
     if (!r) return r;
@@ -1339,8 +1458,13 @@ char *realpath(const char *path, char *resolved) {
 // Ubuntu enable fortification by default, so this entry point matters as much
 // as realpath itself.
 char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
-    (void)resolvedlen;
-    return realpath(path, resolved);
+    char *logical = realpath(path, NULL);
+    if (!logical) return NULL;
+    size_t len = strlen(logical) + 1;
+    if (len > resolvedlen) { free(logical); __chk_fail(); }
+    memcpy(resolved, logical, len);
+    free(logical);
+    return resolved;
 }
 
 // ── fake root and virtual identity ─────────────────────────────────
@@ -1357,32 +1481,32 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
 
 uid_t getuid(void) {
     typedef uid_t (*fn_t)(void);
-    static fn_t real; REAL(real, "getuid");
+    static _Thread_local fn_t real; REAL(real, "getuid");
     return bn_fake_root() ? bn_vruid : real();
 }
 
 uid_t geteuid(void) {
     typedef uid_t (*fn_t)(void);
-    static fn_t real; REAL(real, "geteuid");
+    static _Thread_local fn_t real; REAL(real, "geteuid");
     return bn_fake_root() ? bn_veuid : real();
 }
 
 gid_t getgid(void) {
     typedef gid_t (*fn_t)(void);
-    static fn_t real; REAL(real, "getgid");
+    static _Thread_local fn_t real; REAL(real, "getgid");
     return bn_fake_root() ? bn_vrgid : real();
 }
 
 gid_t getegid(void) {
     typedef gid_t (*fn_t)(void);
-    static fn_t real; REAL(real, "getegid");
+    static _Thread_local fn_t real; REAL(real, "getegid");
     return bn_fake_root() ? bn_vegid : real();
 }
 
 int getresuid(uid_t *r, uid_t *e, uid_t *s) {
     if (!bn_fake_root()) {
         typedef int (*fn_t)(uid_t *, uid_t *, uid_t *);
-        static fn_t real; REAL(real, "getresuid");
+        static _Thread_local fn_t real; REAL(real, "getresuid");
         return real(r, e, s);
     }
     if (r) *r = bn_vruid;
@@ -1394,7 +1518,7 @@ int getresuid(uid_t *r, uid_t *e, uid_t *s) {
 int getresgid(gid_t *r, gid_t *e, gid_t *s) {
     if (!bn_fake_root()) {
         typedef int (*fn_t)(gid_t *, gid_t *, gid_t *);
-        static fn_t real; REAL(real, "getresgid");
+        static _Thread_local fn_t real; REAL(real, "getresgid");
         return real(r, e, s);
     }
     if (r) *r = bn_vrgid;
@@ -1483,7 +1607,7 @@ int initgroups(const char *user, gid_t group) {
 
 int chown(const char *path, uid_t uid, gid_t gid) {
     typedef int (*fn_t)(const char *, uid_t, gid_t);
-    static fn_t real; REAL(real, "chown");
+    static _Thread_local fn_t real; REAL(real, "chown");
     char buf[PATH_MAX];
     const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
     if (bn_fake_root()) { (void)uid; (void)gid; return 0; }
@@ -1492,7 +1616,7 @@ int chown(const char *path, uid_t uid, gid_t gid) {
 
 int lchown(const char *path, uid_t uid, gid_t gid) {
     typedef int (*fn_t)(const char *, uid_t, gid_t);
-    static fn_t real; REAL(real, "lchown");
+    static _Thread_local fn_t real; REAL(real, "lchown");
     char buf[PATH_MAX];
     const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
     if (bn_fake_root()) { (void)uid; (void)gid; return 0; }
@@ -1501,14 +1625,14 @@ int lchown(const char *path, uid_t uid, gid_t gid) {
 
 int fchown(int fd, uid_t uid, gid_t gid) {
     typedef int (*fn_t)(int, uid_t, gid_t);
-    static fn_t real; REAL(real, "fchown");
+    static _Thread_local fn_t real; REAL(real, "fchown");
     if (bn_fake_root()) { (void)uid; (void)gid; return 0; }
     return real(fd, uid, gid);
 }
 
 int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
     typedef int (*fn_t)(int, const char *, uid_t, gid_t, int);
-    static fn_t real; REAL(real, "fchownat");
+    static _Thread_local fn_t real; REAL(real, "fchownat");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     if (bn_fake_root()) { (void)uid; (void)gid; return 0; }
@@ -1525,43 +1649,25 @@ int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
 // caller's template keeps its logical spelling, so later rename() and
 // unlink() calls on it map the same way and the guest never sees a physical
 // path.
-static const char BN_TMP_CHARS[] =
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-
-static unsigned bn_rand_state;
-
-static unsigned bn_rand(void) {
-    if (!bn_rand_state) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        bn_rand_state = (unsigned)ts.tv_nsec ^ (unsigned)getpid() ^ (unsigned)ts.tv_sec;
-        if (!bn_rand_state) bn_rand_state = 0x9e3779b9u;
-    }
-    // xorshift32
-    bn_rand_state ^= bn_rand_state << 13;
-    bn_rand_state ^= bn_rand_state >> 17;
-    bn_rand_state ^= bn_rand_state << 5;
-    return bn_rand_state;
-}
-
 static int bn_mkstemp_at(char *tmpl, int extra_flags, int suffixlen) {
+    typedef int (*fn_t)(char *, int, int);
+    static _Thread_local fn_t real; REAL(real, "mkostemps");
+    if (!real) { errno = ENOSYS; return -1; }
     size_t len = strlen(tmpl);
-    if (len < 6 || (int)len < suffixlen + 6) { errno = EINVAL; return -1; }
-    char *xx = tmpl + len - (size_t)suffixlen - 6;
-    if (strncmp(xx, "XXXXXX", 6) != 0) { errno = EINVAL; return -1; }
-
-    for (int attempt = 0; attempt < 128; attempt++) {
-        for (int i = 0; i < 6; i++)
-            xx[i] = BN_TMP_CHARS[bn_rand() % (sizeof BN_TMP_CHARS - 1)];
-
-        char mapped[PATH_MAX];
-        const char *target = bn_resolve(AT_FDCWD, tmpl, mapped, sizeof mapped);
-        int fd = open(target, extra_flags | O_CREAT | O_EXCL | O_RDWR, 0600);
-        if (fd >= 0) return fd;
-        if (errno != EEXIST) return -1;
+    if (suffixlen < 0 || len < 6 || (size_t)suffixlen > len - 6) {
+        errno = EINVAL; return -1;
     }
-    errno = EEXIST;
-    return -1;
+    char mapped[PATH_MAX];
+    const char *target = bn_resolve(AT_FDCWD, tmpl, mapped, sizeof mapped);
+    char *physical = strdup(target);
+    if (!physical) return -1;
+    int fd = real(physical, suffixlen, extra_flags);
+    int saved = errno;
+    if (fd >= 0) memcpy(tmpl + len - suffixlen - 6,
+                        physical + strlen(physical) - suffixlen - 6, 6);
+    free(physical);
+    errno = saved;
+    return fd;
 }
 
 int mkstemp(char *tmpl) { return bn_mkstemp_at(tmpl, 0, 0); }
@@ -1595,21 +1701,21 @@ int mkostemps64(char *tmpl, int suffixlen, int flags) {
 
 int lutimes(const char *path, const struct timeval times[2]) {
     typedef int (*fn_t)(const char *, const struct timeval[2]);
-    static fn_t real; REAL(real, "lutimes");
+    static _Thread_local fn_t real; REAL(real, "lutimes");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), times);
 }
 
 int mkfifo(const char *path, mode_t mode) {
     typedef int (*fn_t)(const char *, mode_t);
-    static fn_t real; REAL(real, "mkfifo");
+    static _Thread_local fn_t real; REAL(real, "mkfifo");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
 }
 
 int mkfifoat(int dirfd, const char *path, mode_t mode) {
     typedef int (*fn_t)(int, const char *, mode_t);
-    static fn_t real; REAL(real, "mkfifoat");
+    static _Thread_local fn_t real; REAL(real, "mkfifoat");
     char buf[PATH_MAX];
     return real(dirfd, bn_resolve(dirfd, path, buf, sizeof buf), mode);
 }
@@ -1619,23 +1725,21 @@ int mkfifoat(int dirfd, const char *path, mode_t mode) {
 // it here instead, through the mapped path, and keep the caller's template
 // logical so later calls on it map the same way.
 char *mkdtemp(char *tmpl) {
+    typedef char *(*fn_t)(char *);
+    static _Thread_local fn_t real; REAL(real, "mkdtemp");
+    if (!real) { errno = ENOSYS; return NULL; }
     size_t len = strlen(tmpl);
-    if (len < 6 || strncmp(tmpl + len - 6, "XXXXXX", 6) != 0) {
-        errno = EINVAL;
-        return NULL;
-    }
-    char *xx = tmpl + len - 6;
-    for (int attempt = 0; attempt < 128; attempt++) {
-        for (int i = 0; i < 6; i++)
-            xx[i] = BN_TMP_CHARS[bn_rand() % (sizeof BN_TMP_CHARS - 1)];
-
-        char mapped[PATH_MAX];
-        const char *target = bn_resolve(AT_FDCWD, tmpl, mapped, sizeof mapped);
-        if (mkdir(target, 0700) == 0) return tmpl;
-        if (errno != EEXIST) return NULL;
-    }
-    errno = EEXIST;
-    return NULL;
+    if (len < 6) { errno = EINVAL; return NULL; }
+    char mapped[PATH_MAX];
+    const char *target = bn_resolve(AT_FDCWD, tmpl, mapped, sizeof mapped);
+    char *physical = strdup(target);
+    if (!physical) return NULL;
+    char *result = real(physical);
+    int saved = errno;
+    if (result) memcpy(tmpl + len - 6, physical + strlen(physical) - 6, 6);
+    free(physical);
+    errno = saved;
+    return result ? tmpl : NULL;
 }
 
 int scandir(const char *path, struct dirent ***namelist,
@@ -1643,35 +1747,35 @@ int scandir(const char *path, struct dirent ***namelist,
             int (*compar)(const struct dirent **, const struct dirent **)) {
     typedef int (*fn_t)(const char *, struct dirent ***, int (*)(const struct dirent *),
                         int (*)(const struct dirent **, const struct dirent **));
-    static fn_t real; REAL(real, "scandir");
+    static _Thread_local fn_t real; REAL(real, "scandir");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), namelist, filter, compar);
 }
 
 int statfs(const char *path, struct statfs *st) {
     typedef int (*fn_t)(const char *, struct statfs *);
-    static fn_t real; REAL(real, "statfs");
+    static _Thread_local fn_t real; REAL(real, "statfs");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
 }
 
 int statfs64(const char *path, struct statfs64 *st) {
     typedef int (*fn_t)(const char *, struct statfs64 *);
-    static fn_t real; REAL(real, "statfs64");
+    static _Thread_local fn_t real; REAL(real, "statfs64");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
 }
 
 int remove(const char *path) {
     typedef int (*fn_t)(const char *);
-    static fn_t real; REAL(real, "remove");
+    static _Thread_local fn_t real; REAL(real, "remove");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf));
 }
 
 int lchmod(const char *path, mode_t mode) {
     typedef int (*fn_t)(const char *, mode_t);
-    static fn_t real; REAL(real, "lchmod");
+    static _Thread_local fn_t real; REAL(real, "lchmod");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), mode);
 }
@@ -1682,7 +1786,7 @@ int scandirat(int dirfd, const char *path, struct dirent ***namelist,
     typedef int (*fn_t)(int, const char *, struct dirent ***,
                         int (*)(const struct dirent *),
                         int (*)(const struct dirent **, const struct dirent **));
-    static fn_t real; REAL(real, "scandirat");
+    static _Thread_local fn_t real; REAL(real, "scandirat");
     char buf[PATH_MAX];
     return real(dirfd, bn_resolve(dirfd, path, buf, sizeof buf), namelist, filter, compar);
 }
@@ -1693,7 +1797,7 @@ int scandir64(const char *path, struct dirent64 ***namelist,
     typedef int (*fn_t)(const char *, struct dirent64 ***,
                         int (*)(const struct dirent64 *),
                         int (*)(const struct dirent64 **, const struct dirent64 **));
-    static fn_t real; REAL(real, "scandir64");
+    static _Thread_local fn_t real; REAL(real, "scandir64");
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), namelist, filter, compar);
 }
@@ -1704,8 +1808,8 @@ int scandir64(const char *path, struct dirent64 ***namelist,
 int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t *fa, int fd,
                                      const char *path, int oflag, mode_t mode) {
     typedef int (*fn_t)(posix_spawn_file_actions_t *, int, const char *, int, mode_t);
-    static fn_t real; REAL(real, "posix_spawn_file_actions_addopen");
-    if (!real) { errno = ENOSYS; return -1; }
+    static _Thread_local fn_t real; REAL(real, "posix_spawn_file_actions_addopen");
+    if (!real) return ENOSYS;
     char buf[PATH_MAX];
     return real(fa, fd, bn_resolve(AT_FDCWD, path, buf, sizeof buf), oflag, mode);
 }
@@ -1713,8 +1817,8 @@ int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t *fa, int fd,
 int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *fa,
                                          const char *path) {
     typedef int (*fn_t)(posix_spawn_file_actions_t *, const char *);
-    static fn_t real; REAL(real, "posix_spawn_file_actions_addchdir_np");
-    if (!real) { errno = ENOSYS; return -1; }
+    static _Thread_local fn_t real; REAL(real, "posix_spawn_file_actions_addchdir_np");
+    if (!real) return ENOSYS;
     char buf[PATH_MAX];
     return real(fa, bn_resolve(AT_FDCWD, path, buf, sizeof buf));
 }
@@ -1785,7 +1889,7 @@ static int fallback_getifaddrs(struct ifaddrs **ifap) {
 
 int getifaddrs(struct ifaddrs **ifap) {
     typedef int (*fn_t)(struct ifaddrs **);
-    static fn_t real;
+    static _Thread_local fn_t real;
     REAL(real, "getifaddrs");
 
     int r = real ? real(ifap) : -1;
@@ -1859,7 +1963,7 @@ typedef struct {
     char search[BN_DNS_MAXSEARCH][256];
 } bn_dns_config;
 
-static bn_dns_config bn_dns;
+static _Thread_local bn_dns_config bn_dns;
 
 // Whether guest resolution applies at all. Without --rootfs the process is a
 // plain Android one and libc's own behaviour must be left untouched.
@@ -1876,7 +1980,7 @@ static int bn_dns_enabled(void) {
 static ssize_t bn_read_guest(const char *guest, char *buf, size_t cap) {
     typedef int (*open_fn)(const char *, int, ...);
     typedef ssize_t (*read_fn)(int, void *, size_t);
-    static open_fn ro; static read_fn rr;
+    static _Thread_local open_fn ro; static _Thread_local read_fn rr;
     REAL(ro, "open"); REAL(rr, "read");
     if (!ro || !rr || cap == 0) return -1;
 
@@ -1886,7 +1990,7 @@ static ssize_t bn_read_guest(const char *guest, char *buf, size_t cap) {
     ssize_t got = rr(fd, buf, cap - 1);
     int e = errno;
     typedef int (*close_fn)(int);
-    static close_fn rc; REAL(rc, "close");
+    static _Thread_local close_fn rc; REAL(rc, "close");
     if (rc) rc(fd);
     errno = e;
     if (got < 0) return -1;
@@ -1897,7 +2001,7 @@ static ssize_t bn_read_guest(const char *guest, char *buf, size_t cap) {
 // st_mtim is glibc's; keep one spelling so the loader does not depend on macros.
 static void bn_mtime_of(const char *guest, unsigned long *sec, unsigned long *nsec) {
     typedef int (*stat_fn)(const char *, struct stat *);
-    static stat_fn rs; REAL(rs, "stat");
+    static _Thread_local stat_fn rs; REAL(rs, "stat");
     char path[PATH_MAX];
     struct stat st;
     *sec = 0; *nsec = 0;
@@ -1942,14 +2046,14 @@ static void bn_dns_parse_config(bn_dns_config *c, char *text) {
             char *s2 = NULL;
             for (char *o = strtok_r(arg, " \t", &s2); o; o = strtok_r(NULL, " \t", &s2)) {
                 if (!strncmp(o, "timeout:", 8)) {
-                    int v = atoi(o + 8);
-                    if (v > 0) c->timeout_ms = v * 1000;
+                    long v = strtol(o + 8, NULL, 10);
+                    if (v > 0) c->timeout_ms = (v > 30 ? 30 : (int)v) * 1000;
                 } else if (!strncmp(o, "attempts:", 9)) {
-                    int v = atoi(o + 9);
-                    if (v > 0) c->attempts = v;
+                    long v = strtol(o + 9, NULL, 10);
+                    if (v > 0) c->attempts = v > 5 ? 5 : (int)v;
                 } else if (!strncmp(o, "ndots:", 6)) {
-                    int v = atoi(o + 6);
-                    if (v >= 0) c->ndots = v;
+                    long v = strtol(o + 6, NULL, 10);
+                    if (v >= 0) c->ndots = v > 15 ? 15 : (int)v;
                 }
             }
         } else if ((strcmp(line, "search") == 0 || strcmp(line, "domain") == 0) && more) {
@@ -1965,8 +2069,6 @@ static void bn_dns_parse_config(bn_dns_config *c, char *text) {
 
 static void bn_dns_load(int force) {
     int version = bn_rootfs() ? (int)strlen(bn_rootfs()) : -1;
-    if (bn_dns.loaded && !force && bn_dns.rootfs_version == version) return;
-
     unsigned long sec = 0, nsec = 0;
     bn_mtime_of("/etc/resolv.conf", &sec, &nsec);
     if (bn_dns.loaded && bn_dns.rootfs_version == version && !force &&
@@ -2012,8 +2114,8 @@ static void bn_dns_load(int force) {
     }
 }
 
-// Re-read the configuration at most once a second, so a long-lived guest shell
-// picks up a rewritten resolv.conf without a stat on every single lookup.
+// Check the configuration every 64 lookups, without a stat on every lookup.
+// Each thread owns its resolver snapshot, so refresh cannot race another query.
 static void bn_dns_refresh(void) {
     if (bn_dns.check_countdown-- > 0) return;
     bn_dns.check_countdown = 64;
@@ -2024,7 +2126,7 @@ static void bn_dns_refresh(void) {
 static int bn_dns_build(unsigned char *buf, size_t cap, const char *name, uint16_t id, int qtype) {
     size_t n = 12;
     const char *p = name;
-    if (cap < 12) return -1;
+    if (cap < 17) return -1;
 
     buf[0] = (unsigned char)(id >> 8);
     buf[1] = (unsigned char)(id & 0xff);
@@ -2036,7 +2138,7 @@ static int bn_dns_build(unsigned char *buf, size_t cap, const char *name, uint16
     while (*p) {
         const char *dot = strchr(p, '.');
         size_t len = dot ? (size_t)(dot - p) : strlen(p);
-        if (len == 0 || len > 63 || n + len + 2 > cap) return -1;
+        if (len == 0 || len > 63 || len + 6 > cap - n || n + len + 2 > 267) return -1;
         buf[n++] = (unsigned char)len;
         memcpy(buf + n, p, len);
         n += len;
@@ -2096,7 +2198,9 @@ static int bn_dns_parse(const unsigned char *b, int len, uint16_t id, int qtype,
 }
 
 static uint16_t bn_dns_id(void) {
-    static uint16_t next = 0x1234;
+    uint16_t id;
+    if (getrandom(&id, sizeof id, GRND_NONBLOCK) == sizeof id) return id;
+    static _Thread_local uint16_t next = 0x1234;
     return (uint16_t)(next++ ^ (uint16_t)getpid());
 }
 
@@ -2109,8 +2213,8 @@ static int bn_dns_udp(const struct sockaddr_in *srv, const unsigned char *q, int
     typedef ssize_t (*recv_fn)(int, void *, size_t, int);
     typedef int (*poll_fn)(struct pollfd *, nfds_t, int);
     typedef int (*close_fn)(int);
-    static sock_fn rs; static conn_fn rc_; static send_fn rsnd; static recv_fn rrc;
-    static poll_fn rpoll; static close_fn rcl; static int warned;
+    static _Thread_local sock_fn rs; static _Thread_local conn_fn rc_; static _Thread_local send_fn rsnd; static _Thread_local recv_fn rrc;
+    static _Thread_local poll_fn rpoll; static _Thread_local close_fn rcl; static int warned;
     REAL(rs, "socket"); REAL(rc_, "connect"); REAL(rsnd, "send"); REAL(rrc, "recv");
     REAL(rpoll, "poll"); REAL(rcl, "close");
     if (!rs || !rc_ || !rsnd || !rrc || !rpoll) {
@@ -2118,7 +2222,7 @@ static int bn_dns_udp(const struct sockaddr_in *srv, const unsigned char *q, int
         return -1;
     }
 
-    int fd = rs(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int fd = rs(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
     int rc = rc_(fd, (const struct sockaddr *)srv, sizeof *srv);
     if (rc == 0) rc = (int)(rsnd(fd, q, (size_t)qlen, 0) == (ssize_t)qlen ? 0 : -1);
@@ -2137,55 +2241,67 @@ static int bn_dns_udp(const struct sockaddr_in *srv, const unsigned char *q, int
     return got;
 }
 
-// TC answers need TCP; Debian's apt and git do hit that path.
+static int64_t bn_dns_now(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int bn_dns_ready(int fd, short events, int64_t deadline) {
+    for (;;) {
+        int64_t left = deadline - bn_dns_now();
+        if (left <= 0) { errno = ETIMEDOUT; return -1; }
+        struct pollfd pfd = {.fd = fd, .events = events};
+        int rc = poll(&pfd, 1, left > INT_MAX ? INT_MAX : (int)left);
+        if (rc > 0) return 0;
+        if (rc == 0) { errno = ETIMEDOUT; return -1; }
+        if (errno != EINTR) return -1;
+    }
+}
+
+static int bn_dns_transfer(int fd, void *buf, size_t size, int writing, int64_t deadline) {
+    size_t done = 0;
+    while (done < size) {
+        if (bn_dns_ready(fd, writing ? POLLOUT : POLLIN, deadline) < 0) return -1;
+        ssize_t n = writing ? send(fd, (char *)buf + done, size - done, MSG_NOSIGNAL)
+                            : recv(fd, (char *)buf + done, size - done, 0);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (n <= 0) return -1;
+        done += (size_t)n;
+    }
+    return 0;
+}
+
+// One deadline covers connect, partial writes, the length prefix and the body.
+// A connected DNS peer must not hang a long-lived agent indefinitely.
 static int bn_dns_tcp(const struct sockaddr_in *srv, const unsigned char *q, int qlen,
                       unsigned char *r, int rcap, int timeout_ms) {
-    typedef int (*sock_fn)(int, int, int);
-    typedef int (*conn_fn)(int, const struct sockaddr *, socklen_t);
-    typedef int (*poll_fn)(struct pollfd *, nfds_t, int);
-    typedef ssize_t (*rw_fn)(int, void *, size_t);
-    typedef int (*close_fn)(int);
-    static sock_fn rs; static conn_fn rcon; static poll_fn rpoll;
-    static rw_fn rread; static rw_fn rwrite; static close_fn rcl; static int warned;
-    REAL(rs, "socket"); REAL(rcon, "connect"); REAL(rpoll, "poll");
-    REAL(rread, "read"); REAL(rwrite, "write"); REAL(rcl, "close");
-    if (!rs || !rcon || !rpoll || !rread || !rwrite) {
-        if (!warned++) DBG("dns: tcp entry points unavailable\n");
-        return -1;
-    }
-
-    int fd = rs(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
-
-    int rc = rcon(fd, (const struct sockaddr *)srv, sizeof *srv);
-    if (rc == 0) {
-        unsigned char head[2];
-        head[0] = (unsigned char)(qlen >> 8);
-        head[1] = (unsigned char)(qlen & 0xff);
-        if (rwrite(fd, head, 2) != 2 || rwrite(fd, (void *)q, (size_t)qlen) != qlen) rc = -1;
-    }
-    if (rc == 0) {
-        unsigned char head[2];
-        struct pollfd pfd;
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        if (rpoll(&pfd, 1, timeout_ms) <= 0 || rread(fd, head, 2) != 2) rc = -1;
-        else {
-            int want = ((int)head[0] << 8) | head[1];
-            int got = 0;
-            if (want > rcap) rc = -1;
-            while (rc == 0 && got < want) {
-                pfd.revents = 0;
-                if (rpoll(&pfd, 1, timeout_ms) <= 0) { rc = -1; break; }
-                ssize_t n = rread(fd, r + got, (size_t)(want - got));
-                if (n <= 0) { rc = -1; break; }
-                got += (int)n;
-            }
-            if (rc == 0) { int g = got; if (rcl) rcl(fd); return g; }
+    int64_t deadline = bn_dns_now() + timeout_ms;
+    int rc = connect(fd, (const struct sockaddr *)srv, sizeof *srv);
+    if (rc < 0 && errno == EINPROGRESS) {
+        rc = bn_dns_ready(fd, POLLOUT, deadline);
+        if (rc == 0) {
+            int error = 0;
+            socklen_t len = sizeof error;
+            rc = getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len);
+            if (rc == 0 && error) { errno = error; rc = -1; }
         }
     }
-    if (rcl) rcl(fd);
-    return -1;
+    unsigned char head[2] = {(unsigned char)(qlen >> 8), (unsigned char)qlen};
+    int got = -1;
+    if (rc == 0 && bn_dns_transfer(fd, head, 2, 1, deadline) == 0 &&
+        bn_dns_transfer(fd, (void *)q, (size_t)qlen, 1, deadline) == 0 &&
+        bn_dns_transfer(fd, head, 2, 0, deadline) == 0) {
+        int want = ((int)head[0] << 8) | head[1];
+        if (want >= 12 && want <= rcap && bn_dns_transfer(fd, r, (size_t)want, 0, deadline) == 0)
+            got = want;
+    }
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return got;
 }
 
 static int bn_dns_query_one(const char *name, int qtype, bn_answer *out) {
@@ -2202,11 +2318,14 @@ static int bn_dns_query_one(const char *name, int qtype, bn_answer *out) {
             int got = bn_dns_udp(&bn_dns.server[i], q, qlen, r, sizeof r, bn_dns.timeout_ms);
             if (got < 0) continue;
             // Truncation means the answer is incomplete: retry over TCP.
+            if (got < 12) continue;
             if (r[2] & 0x02) {
                 got = bn_dns_tcp(&bn_dns.server[i], q, qlen, r, sizeof r, bn_dns.timeout_ms);
                 if (got < 0) continue;
             }
-            if (bn_dns_parse(r, got, id, qtype, out) != 0) continue;
+            bn_answer parsed = {0};
+            if (bn_dns_parse(r, got, id, qtype, &parsed) != 0) continue;
+            *out = parsed;
             if (out->rcode != 0) {
                 // A definite answer that the name does not exist: stop looking.
                 if (out->rcode == 3) return 0;
@@ -2227,31 +2346,28 @@ static int bn_dns_query(const char *name, int af, bn_answer *out) {
         if (*p == '.') dots++;
 
     char buf[512];
-    if (bn_dns.ndots > 0 && dots < bn_dns.ndots && bn_dns.search_count > 0) {
-        for (int i = 0; i < bn_dns.search_count; i++) {
-            snprintf(buf, sizeof buf, "%s.%s", name, bn_dns.search[i]);
-            if (bn_dns_query_one(buf, af == AF_INET6 ? 28 : 1, out) == 0 &&
-                (out->v4_count || out->v6_count || out->rcode == 3))
-                return 0;
+    size_t len = strlen(name);
+    int absolute = len && name[len - 1] == '.';
+    int as_is_first = absolute || dots >= bn_dns.ndots;
+    int answered = 0;
+    if (as_is_first) {
+        if (bn_dns_query_one(name, af == AF_INET6 ? 28 : 1, out) == 0) {
+            answered = 1;
+            if (out->v4_count || out->v6_count || absolute) return 0;
         }
-    }
-    if (bn_dns_query_one(name, af == AF_INET6 ? 28 : 1, out) == 0) {
-        if (out->v4_count || out->v6_count || out->rcode == 3) return 0;
-        for (int i = 0; i < bn_dns.search_count; i++) {
-            snprintf(buf, sizeof buf, "%s.%s", name, bn_dns.search[i]);
-            if (bn_dns_query_one(buf, af == AF_INET6 ? 28 : 1, out) == 0 &&
-                (out->v4_count || out->v6_count))
-                return 0;
-        }
-        return 0;
+        if (absolute) return -1;
     }
     for (int i = 0; i < bn_dns.search_count; i++) {
-        snprintf(buf, sizeof buf, "%s.%s", name, bn_dns.search[i]);
-        if (bn_dns_query_one(buf, af == AF_INET6 ? 28 : 1, out) == 0 &&
-            (out->v4_count || out->v6_count))
-            return 0;
+        int n = snprintf(buf, sizeof buf, "%s.%s", name, bn_dns.search[i]);
+        if (n < 0 || (size_t)n >= sizeof buf) continue;
+        if (bn_dns_query_one(buf, af == AF_INET6 ? 28 : 1, out) == 0) {
+            answered = 1;
+            if (out->v4_count || out->v6_count) return 0;
+        }
     }
-    return -1;
+    if (!as_is_first && bn_dns_query_one(name, af == AF_INET6 ? 28 : 1, out) == 0)
+        return 0;
+    return answered ? 0 : -1;
 }
 
 // ── the guest's own databases ──────────────────────────────────────
@@ -2314,7 +2430,7 @@ static int bn_numeric(const char *node, int af, char *out, size_t cap) {
 typedef int (*gai_fn)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
 
 static gai_fn bn_real_getaddrinfo(void) {
-    static gai_fn real;
+    static _Thread_local gai_fn real;
     REAL(real, "getaddrinfo");
     return real;
 }
@@ -2331,10 +2447,17 @@ static int bn_resolve_to_numeric(const char *node, int af, char nums[][INET6_ADD
 
     if (!have_hosts) {
         if (bn_dns.server_count == 0) {
-            DBG("dns: no nameserver configured for the guest, leaving lookup to libc\n");
-            return -1;
+            return -2;
         }
-        if (bn_dns_query(node, af, &ans) != 0) return 0;   // transport failure
+        if (af == AF_UNSPEC) {
+            bn_answer v4 = {0}, v6 = {0};
+            int r4 = bn_dns_query(node, AF_INET, &v4);
+            int r6 = bn_dns_query(node, AF_INET6, &v6);
+            if (r4 < 0 && r6 < 0) return -2;
+            ans = v4;
+            ans.v6_count = v6.v6_count;
+            memcpy(ans.v6, v6.v6, sizeof ans.v6);
+        } else if (bn_dns_query(node, af, &ans) != 0) return -2;
     }
 
     int n = 0;
@@ -2357,12 +2480,17 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
     char num[INET6_ADDRSTRLEN];
     if (bn_numeric(node, af, num, sizeof num)) return real(node, service, hints, res);
 
+    struct addrinfo numeric_hints = {0};
+    if (hints) numeric_hints = *hints;
+    numeric_hints.ai_flags |= AI_NUMERICHOST;
+    int numeric_rc = real(node, service, &numeric_hints, res);
+    if (numeric_rc != EAI_NONAME) return numeric_rc;
+    if (af != AF_UNSPEC && af != AF_INET && af != AF_INET6) return EAI_FAMILY;
     char nums[BN_DNS_MAXV4 + BN_DNS_MAXV6][INET6_ADDRSTRLEN];
     int n = bn_resolve_to_numeric(node, af, nums, BN_DNS_MAXV4 + BN_DNS_MAXV6);
-    if (n <= 0) {
-        DBG("dns: %s unresolved in guest (n=%d), libc decides\n", node, n);
-        return real(node, service, hints, res);
-    }
+    if (n == -1) return real(node, service, hints, res);
+    if (n == -2) return EAI_AGAIN;
+    if (n == 0) return EAI_NONAME;
 
     // Hand each address to libc as a numeric node so service names, socket
     // types, protocols and ordering keep their normal meaning.
@@ -2397,51 +2525,78 @@ static struct hostent *bn_gethost_by_name(const char *name, int af, ghbn_fn real
     if (bn_numeric(name, af, num, sizeof num)) return real(name);
 
     char nums[BN_DNS_MAXV4 + BN_DNS_MAXV6][INET6_ADDRSTRLEN];
-    if (bn_resolve_to_numeric(name, af, nums, BN_DNS_MAXV4 + BN_DNS_MAXV6) <= 0)
-        return real(name);
+    int n = bn_resolve_to_numeric(name, af, nums, BN_DNS_MAXV4 + BN_DNS_MAXV6);
+    if (n == -1) return real(name);
+    if (n <= 0) { h_errno = n == -2 ? TRY_AGAIN : HOST_NOT_FOUND; return NULL; }
     return real(nums[0]);
 }
 
 struct hostent *gethostbyname(const char *name) {
-    static ghbn_fn real;
+    static _Thread_local ghbn_fn real;
     REAL(real, "gethostbyname");
     return bn_gethost_by_name(name, AF_INET, real);
 }
 
 struct hostent *gethostbyname2(const char *name, int af) {
-    static ghbn_fn real;
+    typedef struct hostent *(*fn_t)(const char *, int);
+    static _Thread_local fn_t real;
     REAL(real, "gethostbyname2");
-    return bn_gethost_by_name(name, af, real);
+    if (!real) { h_errno = NO_RECOVERY; return NULL; }
+    char nums[BN_DNS_MAXV4 + BN_DNS_MAXV6][INET6_ADDRSTRLEN];
+    char num[INET6_ADDRSTRLEN];
+    if (!name || !*name || !bn_dns_enabled() || bn_numeric(name, af, num, sizeof num))
+        return real(name, af);
+    int n = bn_resolve_to_numeric(name, af, nums, BN_DNS_MAXV4 + BN_DNS_MAXV6);
+    if (n == -1) return real(name, af);
+    if (n <= 0) { h_errno = n == -2 ? TRY_AGAIN : HOST_NOT_FOUND; return NULL; }
+    return real(nums[0], af);
 }
 
 typedef int (*ghbn_r_fn)(const char *, struct hostent *, char *, size_t, struct hostent **, int *);
 
 static int bn_gethost_by_name_r(ghbn_r_fn real, const char *name, struct hostent *ret, char *buf,
                                 size_t buflen, struct hostent **result, int *h_errnop, int af) {
-    if (!real) return EAI_SYSTEM;
+    if (!real) return ENOSYS;
     if (!name || !*name || !bn_dns_enabled()) return real(name, ret, buf, buflen, result, h_errnop);
 
     char num[INET6_ADDRSTRLEN];
     if (bn_numeric(name, af, num, sizeof num)) return real(name, ret, buf, buflen, result, h_errnop);
 
     char nums[BN_DNS_MAXV4 + BN_DNS_MAXV6][INET6_ADDRSTRLEN];
-    if (bn_resolve_to_numeric(name, af, nums, BN_DNS_MAXV4 + BN_DNS_MAXV6) <= 0)
-        return real(name, ret, buf, buflen, result, h_errnop);
+    int n = bn_resolve_to_numeric(name, af, nums, BN_DNS_MAXV4 + BN_DNS_MAXV6);
+    if (n == -1) return real(name, ret, buf, buflen, result, h_errnop);
+    if (n <= 0) {
+        *result = NULL; *h_errnop = n == -2 ? TRY_AGAIN : HOST_NOT_FOUND;
+        return n == -2 ? EAGAIN : 0;
+    }
     return real(nums[0], ret, buf, buflen, result, h_errnop);
 }
 
 int gethostbyname_r(const char *name, struct hostent *ret, char *buf, size_t buflen,
                     struct hostent **result, int *h_errnop) {
-    static ghbn_r_fn real;
+    static _Thread_local ghbn_r_fn real;
     REAL(real, "gethostbyname_r");
     return bn_gethost_by_name_r(real, name, ret, buf, buflen, result, h_errnop, AF_INET);
 }
 
 int gethostbyname2_r(const char *name, int af, struct hostent *ret, char *buf, size_t buflen,
                      struct hostent **result, int *h_errnop) {
-    static ghbn_r_fn real;
+    typedef int (*fn_t)(const char *, int, struct hostent *, char *, size_t,
+                        struct hostent **, int *);
+    static _Thread_local fn_t real;
     REAL(real, "gethostbyname2_r");
-    return bn_gethost_by_name_r(real, name, ret, buf, buflen, result, h_errnop, af);
+    if (!real) { *result = NULL; *h_errnop = NO_RECOVERY; return ENOSYS; }
+    char nums[BN_DNS_MAXV4 + BN_DNS_MAXV6][INET6_ADDRSTRLEN];
+    char num[INET6_ADDRSTRLEN];
+    if (!name || !*name || !bn_dns_enabled() || bn_numeric(name, af, num, sizeof num))
+        return real(name, af, ret, buf, buflen, result, h_errnop);
+    int n = bn_resolve_to_numeric(name, af, nums, BN_DNS_MAXV4 + BN_DNS_MAXV6);
+    if (n == -1) return real(name, af, ret, buf, buflen, result, h_errnop);
+    if (n <= 0) {
+        *result = NULL; *h_errnop = n == -2 ? TRY_AGAIN : HOST_NOT_FOUND;
+        return n == -2 ? EAGAIN : 0;
+    }
+    return real(nums[0], af, ret, buf, buflen, result, h_errnop);
 }
 
 // ── guest process + identity databases ─────────────────────────────
@@ -2461,153 +2616,192 @@ int gethostbyname2_r(const char *name, int af, struct hostent *ret, char *buf, s
 #include <signal.h>
 #include <sys/wait.h>
 
-// Build the launcher command line for a guest shell. The child must not inherit
-// LD_PRELOAD: a bionic process cannot load a glibc object.
-static void bn_guest_shell_argv(const char *cmd, const char *launcher, const char *rootfs,
-                                const char **argv) {
-    argv[0] = launcher;
-    argv[1] = "--rootfs";
-    argv[2] = rootfs;
-    argv[3] = "/bin/sh";
-    argv[4] = "-c";
-    argv[5] = cmd;
-    argv[6] = NULL;
-}
-
-// Run `cmd` in the guest shell. Returns the raw wait status, or -1.
-static int bn_run_shell(const char *cmd, int *pipe_end, int for_read) {
-    typedef pid_t (*fork_fn)(void);
-    typedef int (*execve_fn)(const char *, char *const[], char *const[]);
-    typedef pid_t (*waitpid_fn)(pid_t, int *, int);
-    typedef int (*pipe_fn)(int[2]);
-    typedef int (*dup2_fn)(int, int);
-    typedef int (*close_fn)(int);
-    static fork_fn rfork; static execve_fn rexec; static waitpid_fn rwait;
-    static pipe_fn rpipe; static dup2_fn rdup2; static close_fn rclose;
-    REAL(rfork, "fork"); REAL(rexec, "execve"); REAL(rwait, "waitpid");
-    REAL(rpipe, "pipe"); REAL(rdup2, "dup2"); REAL(rclose, "close");
-    if (!rfork || !rexec || !rwait) return -1;
-
+// Spawn directly, without allocating or resolving symbols in a post-fork child.
+static int bn_spawn_shell(const char *cmd, const posix_spawn_file_actions_t *actions,
+                           const posix_spawnattr_t *attr, pid_t *pid) {
     const char *launcher = bn_env("BIONILUX_BINARY_PATH");
     const char *rootfs = bn_rootfs();
-    if (!launcher || !rootfs) return -1;
+    spawn_fn spawn = spawn_plain();
+    if (!launcher || !rootfs || !spawn) return ENOSYS;
+    const char *argv[] = {launcher, "--rootfs", rootfs, "/bin/sh", "-c", cmd, NULL};
+    char **env = strip_ld_preload(environ);
+    if (!env) return ENOMEM;
+    int rc = spawn(pid, launcher, actions, attr, (char *const *)argv, env);
+    free(env);
+    return rc;
+}
 
-    int fds[2] = {-1, -1};
-    if (pipe_end && (!rpipe || rpipe(fds) != 0)) return -1;
+static int bn_wait_shell(pid_t pid, int *status) {
+    int rc;
+    do { rc = waitpid(pid, status, 0); } while (rc < 0 && errno == EINTR);
+    return rc;
+}
 
-    pid_t pid = rfork();
-    if (pid < 0) {
-        if (pipe_end) { rclose(fds[0]); rclose(fds[1]); }
-        return -1;
-    }
-    if (pid == 0) {
-        if (pipe_end) {
-            if (rdup2 && rdup2(for_read ? fds[1] : fds[0],
-                               for_read ? STDOUT_FILENO : STDIN_FILENO) < 0)
-                _exit(127);
-            rclose(fds[0]);
-            rclose(fds[1]);
-        }
-        const char *argv[7];
-        bn_guest_shell_argv(cmd, launcher, rootfs, argv);
-        char **env = strip_ld_preload(environ);
-        rexec(launcher, (char *const *)argv, env ? env : environ);
-        _exit(127);
-    }
+static pthread_mutex_t bn_system_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned bn_system_users;
+static struct sigaction bn_old_int, bn_old_quit;
 
-    if (pipe_end) {
-        rclose(fds[for_read ? 1 : 0]);
-        *pipe_end = fds[for_read ? 0 : 1];
+struct bn_system_cleanup {
+    pid_t pid;
+    sigset_t oldmask;
+};
+
+static void bn_system_restore(void *arg) {
+    struct bn_system_cleanup *state = arg;
+    int saved = errno, cancel_state;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    if (state->pid > 0) {
+        kill(state->pid, SIGKILL);
+        int status;
+        (void)bn_wait_shell(state->pid, &status);
     }
-    int status = 0;
-    if (rwait(pid, &status, 0) < 0) return -1;
-    return status;
+    pthread_sigmask(SIG_SETMASK, &state->oldmask, NULL);
+    pthread_mutex_lock(&bn_system_lock);
+    if (--bn_system_users == 0) {
+        sigaction(SIGINT, &bn_old_int, NULL);
+        sigaction(SIGQUIT, &bn_old_quit, NULL);
+    }
+    pthread_mutex_unlock(&bn_system_lock);
+    errno = saved;
+    pthread_setcancelstate(cancel_state, NULL);
 }
 
 int system(const char *cmd) {
-    static int (*real)(const char *);
+    static _Thread_local int (*real)(const char *);
     REAL(real, "system");
-    if (!cmd) return bn_dns_enabled() ? 1 : (real ? real(NULL) : 0);
-    if (!bn_dns_enabled() || !bn_env("BIONILUX_BINARY_PATH"))
+    if (!bn_rootfs() || !bn_env("BIONILUX_BINARY_PATH"))
         return real ? real(cmd) : -1;
+    if (!cmd) return access("/bin/sh", X_OK) == 0;
 
-    DBG("system() -> guest shell: %s\n", cmd);
-    return bn_run_shell(cmd, NULL, 0);
+    struct sigaction ignore = {.sa_handler = SIG_IGN};
+    sigemptyset(&ignore.sa_mask);
+    pthread_mutex_lock(&bn_system_lock);
+    if (bn_system_users++ == 0) {
+        sigaction(SIGINT, &ignore, &bn_old_int);
+        sigaction(SIGQUIT, &ignore, &bn_old_quit);
+    }
+    sigset_t defaults;
+    sigemptyset(&defaults);
+    if (bn_old_int.sa_handler != SIG_IGN) sigaddset(&defaults, SIGINT);
+    if (bn_old_quit.sa_handler != SIG_IGN) sigaddset(&defaults, SIGQUIT);
+    pthread_mutex_unlock(&bn_system_lock);
+
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    struct bn_system_cleanup state = {.pid = -1};
+    pthread_sigmask(SIG_BLOCK, &blocked, &state.oldmask);
+    int status = -1, saved;
+    pthread_cleanup_push(bn_system_restore, &state);
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setsigmask(&attr, &state.oldmask);
+    posix_spawnattr_setsigdefault(&attr, &defaults);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    pid_t pid;
+    int rc = bn_spawn_shell(cmd, NULL, &attr, &pid);
+    posix_spawnattr_destroy(&attr);
+    if (rc == 0) {
+        state.pid = pid;
+        if (bn_wait_shell(pid, &status) < 0) status = -1;
+        state.pid = -1;
+    } else if (rc == EAGAIN || rc == ENOMEM) {
+        errno = rc;
+    } else {
+        status = 127 << 8;
+    }
+    saved = errno;
+    pthread_cleanup_pop(1);
+    errno = saved;
+    return status;
 }
 
-// popen() needs the child's pid at pclose() time; a small table is enough
-// because popen streams are few and short-lived in practice.
-#define BN_POPEN_MAX 32
-static struct { FILE *fp; pid_t pid; } bn_popens[BN_POPEN_MAX];
+struct bn_popen {
+    FILE *fp;
+    pid_t pid;
+    int writing;
+    struct bn_popen *next;
+};
+static struct bn_popen *bn_popens;
+static pthread_mutex_t bn_popen_lock = PTHREAD_MUTEX_INITIALIZER;
 
 FILE *popen(const char *cmd, const char *mode) {
-    static FILE *(*real)(const char *, const char *);
+    static _Thread_local FILE *(*real)(const char *, const char *);
     REAL(real, "popen");
-    if (!cmd || !mode || !bn_dns_enabled() || !bn_env("BIONILUX_BINARY_PATH"))
+    if (!bn_rootfs() || !bn_env("BIONILUX_BINARY_PATH"))
         return real ? real(cmd, mode) : NULL;
-
-    int for_read = (mode[0] == 'r');
-    int fd = -1;
-    // Fork once so the pipe end can be handed to fdopen only after the child
-    // exists; bn_run_shell waits, so use a two-step: spawn, then read.
-    typedef pid_t (*fork_fn)(void);
-    typedef int (*execve_fn)(const char *, char *const[], char *const[]);
-    typedef int (*pipe_fn)(int[2]);
-    typedef int (*dup2_fn)(int, int);
-    typedef int (*close_fn)(int);
-    static fork_fn rfork; static execve_fn rexec; static pipe_fn rpipe;
-    static dup2_fn rdup2; static close_fn rclose;
-    REAL(rfork, "fork"); REAL(rexec, "execve"); REAL(rpipe, "pipe");
-    REAL(rdup2, "dup2"); REAL(rclose, "close");
-    if (!rfork || !rexec || !rpipe) return real ? real(cmd, mode) : NULL;
-
-    const char *launcher = bn_env("BIONILUX_BINARY_PATH");
-    const char *rootfs = bn_rootfs();
-    if (!launcher || !rootfs) return real ? real(cmd, mode) : NULL;
-
-    int fds[2] = {-1, -1};
-    if (rpipe(fds) != 0) return NULL;
-
-    pid_t pid = rfork();
-    if (pid < 0) { rclose(fds[0]); rclose(fds[1]); return NULL; }
-    if (pid == 0) {
-        rdup2(fds[for_read ? 1 : 0], for_read ? STDOUT_FILENO : STDIN_FILENO);
-        rclose(fds[0]);
-        rclose(fds[1]);
-        const char *argv[7];
-        bn_guest_shell_argv(cmd, launcher, rootfs, argv);
-        char **env = strip_ld_preload(environ);
-        rexec(launcher, (char *const *)argv, env ? env : environ);
-        _exit(127);
+    if (!mode || (mode[0] != 'r' && mode[0] != 'w') ||
+        (mode[1] && (mode[1] != 'e' || mode[2]))) {
+        errno = EINVAL; return NULL;
     }
-    rclose(fds[for_read ? 1 : 0]);
-    fd = fds[for_read ? 0 : 1];
-
-    FILE *fp = fdopen(fd, mode);
-    if (!fp) { rclose(fd); return NULL; }
-    for (int i = 0; i < BN_POPEN_MAX; i++) {
-        if (!bn_popens[i].fp) { bn_popens[i].fp = fp; bn_popens[i].pid = pid; break; }
+    int for_read = mode[0] == 'r';
+    struct bn_popen *entry = malloc(sizeof *entry);
+    if (!entry) return NULL;
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) { free(entry); return NULL; }
+    int parent = fds[for_read ? 0 : 1];
+    int child = fds[for_read ? 1 : 0];
+    int dest = for_read ? STDOUT_FILENO : STDIN_FILENO;
+    FILE *fp = fdopen(parent, for_read ? "r" : "w");
+    if (!fp) {
+        int saved = errno;
+        close(fds[0]); close(fds[1]); free(entry);
+        errno = saved; return NULL;
     }
-    DBG("popen(%s) -> guest shell\n", cmd);
+    pthread_mutex_lock(&bn_popen_lock);
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc == 0) {
+        rc = posix_spawn_file_actions_adddup2(&actions, child, dest);
+        for (int i = 0; i < 2 && !rc; i++)
+            if (fds[i] != dest) rc = posix_spawn_file_actions_addclose(&actions, fds[i]);
+        // POSIX requires closing streams from earlier popen calls in this child.
+        for (struct bn_popen *p = bn_popens; p && !rc; p = p->next)
+            if (fileno(p->fp) != dest)
+                rc = posix_spawn_file_actions_addclose(&actions, fileno(p->fp));
+        if (!rc) rc = bn_spawn_shell(cmd, &actions, NULL, &entry->pid);
+        posix_spawn_file_actions_destroy(&actions);
+    }
+    close(child);
+    if (rc == 0) {
+        if (mode[1] != 'e') fcntl(parent, F_SETFD, 0);
+        entry->fp = fp;
+        entry->writing = !for_read;
+        entry->next = bn_popens;
+        bn_popens = entry;
+    }
+    pthread_mutex_unlock(&bn_popen_lock);
+    if (rc) { fclose(fp); free(entry); errno = rc; return NULL; }
     return fp;
 }
 
 int pclose(FILE *fp) {
-    static int (*real)(FILE *);
+    static _Thread_local int (*real)(FILE *);
     REAL(real, "pclose");
-    typedef pid_t (*waitpid_fn)(pid_t, int *, int);
-    static waitpid_fn rwait; REAL(rwait, "waitpid");
+    pthread_mutex_lock(&bn_popen_lock);
+    struct bn_popen *entry = bn_popens;
+    while (entry && entry->fp != fp) entry = entry->next;
+    pthread_mutex_unlock(&bn_popen_lock);
+    if (!entry) return real ? real(fp) : -1;
 
-    for (int i = 0; i < BN_POPEN_MAX; i++) {
-        if (bn_popens[i].fp != fp) continue;
-        pid_t pid = bn_popens[i].pid;
-        bn_popens[i].fp = NULL;
-        fclose(fp);
-        int status = 0;
-        if (rwait && rwait(pid, &status, 0) < 0) return -1;
-        return status;
-    }
-    return real ? real(fp) : -1;
+    // A write-stream flush may block. Keep it registered so concurrent popen
+    // children close this writer, but do not hold the global lock while flushing.
+    int flushed = entry->writing ? fflush(fp) : 0;
+    int saved = errno;
+    pthread_mutex_lock(&bn_popen_lock);
+    struct bn_popen **link = &bn_popens;
+    while (*link && *link != entry) link = &(*link)->next;
+    int closed = fclose(fp);
+    if (closed != 0) saved = errno;
+    if (*link) *link = entry->next;
+    pthread_mutex_unlock(&bn_popen_lock);
+
+    int status;
+    int rc = bn_wait_shell(entry->pid, &status);
+    free(entry);
+    if (rc < 0) return -1;
+    if (flushed != 0 || closed != 0) { errno = saved; return -1; }
+    return status;
 }
 
 // Parse the guest's password and group databases. The file formats are the
@@ -2703,16 +2897,25 @@ static int bn_group_lookup(const char *name, gid_t gid, int by_gid, struct group
                            : (strcmp(fields[0], name) == 0);
         if (!match) continue;
 
-        size_t need = strlen(fields[0]) + strlen(fields[1]) + strlen(fields[3]) + 4;
-        if (need > buflen) return -2;
-        char *w = buf;
+        size_t members = *fields[3] ? 1 : 0;
+        for (const char *p = fields[3]; *p; p++)
+            if (*p == ',') members++;
+        size_t strings = strlen(fields[0]) + strlen(fields[1]) + strlen(fields[3]) + 3;
+        size_t padding = (_Alignof(char *) - (uintptr_t)buf % _Alignof(char *)) % _Alignof(char *);
+        size_t pointers = (members + 1) * sizeof(char *);
+        if (padding > buflen || pointers > buflen - padding ||
+            strings > buflen - padding - pointers) return -2;
+        gr->gr_mem = (char **)(buf + padding);
+        char *w = buf + padding + pointers;
         gr->gr_name = w; w = stpcpy(w, fields[0]) + 1;
         gr->gr_passwd = w; w = stpcpy(w, fields[1]) + 1;
         gr->gr_gid = (gid_t)strtoul(fields[2], NULL, 10);
-        // The member list is handed back empty: nothing in the package
-        // machinery depends on it, and the caller's buffer stays simple.
-        gr->gr_mem = (char **)w;
-        ((char **)w)[0] = NULL;
+        strcpy(w, fields[3]);
+        size_t count = 0;
+        char *save_member = NULL;
+        for (char *p = strtok_r(w, ",", &save_member); p;
+             p = strtok_r(NULL, ",", &save_member)) gr->gr_mem[count++] = p;
+        gr->gr_mem[count] = NULL;
         *result = gr;
         return 0;
     }
@@ -2721,23 +2924,23 @@ static int bn_group_lookup(const char *name, gid_t gid, int by_gid, struct group
 
 static int (*bn_real_getpwnam_r(void))(const char *, struct passwd *, char *, size_t,
                                        struct passwd **) {
-    static pw_get_fn r;
+    static _Thread_local pw_get_fn r;
     REAL(r, "getpwnam_r");
     return r;
 }
 static int (*bn_real_getpwuid_r(void))(uid_t, struct passwd *, char *, size_t, struct passwd **) {
-    static pw_uid_fn r;
+    static _Thread_local pw_uid_fn r;
     REAL(r, "getpwuid_r");
     return r;
 }
 static int (*bn_real_getgrnam_r(void))(const char *, struct group *, char *, size_t,
                                        struct group **) {
-    static gr_get_fn r;
+    static _Thread_local gr_get_fn r;
     REAL(r, "getgrnam_r");
     return r;
 }
 static int (*bn_real_getgrgid_r(void))(gid_t, struct group *, char *, size_t, struct group **) {
-    static gr_gid_fn r;
+    static _Thread_local gr_gid_fn r;
     REAL(r, "getgrgid_r");
     return r;
 }
@@ -2750,7 +2953,7 @@ static int (*bn_real_getgrgid_r(void))(gid_t, struct group *, char *, size_t, st
 int getpwnam_r(const char *name, struct passwd *pw, char *buf, size_t buflen,
                struct passwd **result) {
     if (result) *result = NULL;
-    if (!name || !bn_dns_enabled()) {
+    if (!name || !(bn_rootfs() != NULL)) {
         pw_get_fn real = bn_real_getpwnam_r();
         return real ? real(name, pw, buf, buflen, result) : -1;
     }
@@ -2763,7 +2966,7 @@ int getpwnam_r(const char *name, struct passwd *pw, char *buf, size_t buflen,
 
 int getpwuid_r(uid_t uid, struct passwd *pw, char *buf, size_t buflen, struct passwd **result) {
     if (result) *result = NULL;
-    if (!bn_dns_enabled()) {
+    if (!(bn_rootfs() != NULL)) {
         pw_uid_fn real = bn_real_getpwuid_r();
         return real ? real(uid, pw, buf, buflen, result) : -1;
     }
@@ -2777,7 +2980,7 @@ int getpwuid_r(uid_t uid, struct passwd *pw, char *buf, size_t buflen, struct pa
 int getgrnam_r(const char *name, struct group *gr, char *buf, size_t buflen,
                struct group **result) {
     if (result) *result = NULL;
-    if (!name || !bn_dns_enabled()) {
+    if (!name || !(bn_rootfs() != NULL)) {
         gr_get_fn real = bn_real_getgrnam_r();
         return real ? real(name, gr, buf, buflen, result) : -1;
     }
@@ -2790,7 +2993,7 @@ int getgrnam_r(const char *name, struct group *gr, char *buf, size_t buflen,
 
 int getgrgid_r(gid_t gid, struct group *gr, char *buf, size_t buflen, struct group **result) {
     if (result) *result = NULL;
-    if (!bn_dns_enabled()) {
+    if (!(bn_rootfs() != NULL)) {
         gr_gid_fn real = bn_real_getgrgid_r();
         return real ? real(gid, gr, buf, buflen, result) : -1;
     }
@@ -2808,36 +3011,36 @@ static struct group bn_gr_static;
 static char bn_gr_buf[4096];
 
 struct passwd *getpwnam(const char *name) {
-    static struct passwd *(*real)(const char *);
+    static _Thread_local struct passwd *(*real)(const char *);
     REAL(real, "getpwnam");
-    if (!bn_dns_enabled()) return real ? real(name) : NULL;
+    if (!(bn_rootfs() != NULL)) return real ? real(name) : NULL;
     struct passwd *out = NULL;
     return getpwnam_r(name, &bn_pw_static, bn_pw_buf, sizeof bn_pw_buf, &out) == 0 ? out
                                                                                   : (real ? real(name) : NULL);
 }
 
 struct passwd *getpwuid(uid_t uid) {
-    static struct passwd *(*real)(uid_t);
+    static _Thread_local struct passwd *(*real)(uid_t);
     REAL(real, "getpwuid");
-    if (!bn_dns_enabled()) return real ? real(uid) : NULL;
+    if (!(bn_rootfs() != NULL)) return real ? real(uid) : NULL;
     struct passwd *out = NULL;
     return getpwuid_r(uid, &bn_pw_static, bn_pw_buf, sizeof bn_pw_buf, &out) == 0 ? out
                                                                                   : (real ? real(uid) : NULL);
 }
 
 struct group *getgrnam(const char *name) {
-    static struct group *(*real)(const char *);
+    static _Thread_local struct group *(*real)(const char *);
     REAL(real, "getgrnam");
-    if (!bn_dns_enabled()) return real ? real(name) : NULL;
+    if (!(bn_rootfs() != NULL)) return real ? real(name) : NULL;
     struct group *out = NULL;
     return getgrnam_r(name, &bn_gr_static, bn_gr_buf, sizeof bn_gr_buf, &out) == 0 ? out
                                                                                    : (real ? real(name) : NULL);
 }
 
 struct group *getgrgid(gid_t gid) {
-    static struct group *(*real)(gid_t);
+    static _Thread_local struct group *(*real)(gid_t);
     REAL(real, "getgrgid");
-    if (!bn_dns_enabled()) return real ? real(gid) : NULL;
+    if (!(bn_rootfs() != NULL)) return real ? real(gid) : NULL;
     struct group *out = NULL;
     return getgrgid_r(gid, &bn_gr_static, bn_gr_buf, sizeof bn_gr_buf, &out) == 0 ? out
                                                                                   : (real ? real(gid) : NULL);
@@ -2846,6 +3049,22 @@ struct group *getgrgid(gid_t gid) {
 #pragma GCC diagnostic pop
 
 __attribute__((constructor)) static void on_init(void) {
+    for (size_t i = 0; i < sizeof bn_context / sizeof bn_context[0]; i++) {
+        size_t len = strlen(bn_context[i].key);
+        char name[64];
+        memcpy(name, bn_context[i].key, len - 1); name[len - 1] = '\0';
+        const char *value = getenv(name);
+        if (!value) continue;
+        size_t size = len + strlen(value) + 1;
+        bn_context[i].entry = malloc(size);
+        if (bn_context[i].entry) snprintf(bn_context[i].entry, size, "%s%s", bn_context[i].key, value);
+    }
+    (void)bionilux_debug();
+    (void)bn_rootfs();
+    (void)bn_fake_root();
+    (void)bn_lenient();
+    (void)bn_dns_enabled();
+    (void)bn_under_host_paths("/");
     DBG("Injection successful! rootfs=%s\n",
         bn_rootfs() ? bn_rootfs() : "(none)");
 }
