@@ -90,3 +90,61 @@
 2. aarch64 真机验证（本仓库只验证过 x86_64 设备）。
 3. 「父进程内 reroute」优化（见 PERF.md §5），先把 spawn 成本压下来。
 4. 与上游同步：见 [UPSTREAM.md](UPSTREAM.md)。
+
+
+## 7. LD_PRELOAD 的可达性边界（arm64 真机，2026-10）
+
+**结论**：LD_PRELOAD 只能拦截**公开的、跨 PLT 的**函数。glibc 自己内部的调用
+（`__open`、`__stat`、`__opendir`、`__execve`、`__mkstemp`……）不经过 PLT，任何预载都
+拦不到；`GLIBC_PRIVATE` 符号更是被 glibc 主动拒绝外部满足（已用 `tests/helpers/privprobe.c`
+证伪，见 D-010）。
+
+**后果**：凡是 libc「自己」去读某个路径的地方，都会落到**宿主机**上。实测确认的每一类，
+都在程序真正调用的公开 API 上补回来：
+
+| libc 内部绕过 | 通过哪个公开 API 补回 |
+|---|---|
+| `/etc/resolv.conf`、`/etc/hosts` | `getaddrinfo`、`gethostbyname*`（用 guest 的配置自己发 DNS） |
+| `/etc/passwd`、`/etc/group` | `getpwnam*`、`getpwuid*`、`getgrnam*`、`getgrgid*` |
+| `system`/`popen` 用的 `/bin/sh` | `system`、`popen`、`pclose` |
+| `mkstemp` 内部的 `open` | `mkstemp`/`mkostemp`/`mkstemps`/`mkostemps` 及其 `64` 拼写 |
+| `dlopen` 绝对路径 | `dlopen`（语言运行时的扩展模块、PAM、NSS 插件） |
+| `readlink("/proc/self/fd/N")` | 内部用物理路径，对外呈现 guest 路径 |
+
+**最隐蔽的一个**：`readlinkat` 把 `/proc/self/fd/N` 的结果改写成 guest 路径后，
+`bn_dir_base()` 会拿它当**物理**路径用，`bn_unmap()` 匹配不上就回落成 `/`，于是每一次
+`..` 都被钳到 guest 根目录。症状是 `find` 在 966 个条目里只走 46 个就报
+`fts_read failed: No such file or directory`，`rm -rf` 深目录直接失败。
+strace 看不出来——它只显示 syscall 的返回值，而改写发生在用户态。
+排查工具：`tests/helpers/ftsprobe.c`。
+
+## 8. Android 平台限制（运行时内不可修复）
+
+| 现象 | 根因 | 规避 |
+|---|---|---|
+| 创建硬链接一律 `EPERM` | 设备策略（连 App 自己的私有目录也一样） | `link`/`linkat` 回退为复制；dpkg 依赖此 |
+| `mkfifo()` 返回 `EACCES` | SELinux | `make` 的 jobserver 用命名管道，并行构建只能 `-j1` |
+| `ldconfig` 写入只读的 `/etc` | 它是**静态链接**的，预载无法介入 | `prepare-rootfs.sh` 装 shim |
+| 静态链接的程序完全不生效 | 无 `PT_INTERP`/无 `NEEDED` | 无法规避 |
+
+## 9. 本轮 arm64 真机验证（vivo V2425A，Android 16 / SDK 36，SELinux enforcing）
+
+| 项目 | 结果 |
+|---|---|
+| Debian rootfs | Debian 13 trixie，glibc 2.41，`HOST_ARCH=Aarch64` |
+| DNS | `getent hosts deb.debian.org` → `146.75.114.132` |
+| TLS 信任链 | `curl https://github.com` → `200`，不需要 `GIT_SSL_NO_VERIFY` |
+| 包管理 | `apt-get update` 拉取 9.7 MB；`build-essential`、`git`、`ca-certificates`、`strace` 安装成功 |
+| 工具链 | gcc 14.2.0、git 2.47.3、make 4.4.1 |
+| 版本控制 | `git clone` / `status` / `log` 全新克隆通过（依赖 `mkstemp64` 与身份一致性两处修复） |
+| 遍历 | `find` 走完 guest 的 `/etc`(557)、`/usr`(1655)、`/var`(916) 与克隆仓库(966) |
+| Android 公有目录 | guest 写 `/sdcard/bn-visible.txt`，宿主可读 |
+| Android 私有目录 | 以 App uid 运行、runtime 装在 `files/` 下时，guest 用**原生路径**读写该目录 |
+| `cargo test` | 34 passed（WSL Linux） |
+| `cargo fmt --check` / `cargo clippy` | 通过 |
+
+**仍未完成**：kernel（如 KernelSU 模块）级别的 `make` 递归构建。当配方或 `$(shell ...)`
+里没有 shell 元字符时，GNU make 会**自己** exec 而不经过 `/bin/sh`；实测这条路径绕过了预载
+（`BIONILUX_DEBUG=1` 下看不到对应的 `map:` 行），因此子 make 报
+`make: /usr/bin/make: No such file or directory`。简单 Makefile 与所有走 shell 的命令不受影响。
+这是下一步的头号问题。

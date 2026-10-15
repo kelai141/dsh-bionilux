@@ -49,6 +49,9 @@ impl Rootfs {
         let mut host_dirs = Vec::new();
         host_dirs.extend(cfg.prefix.clone());
         host_dirs.extend(cfg.runtime_dir.clone());
+        // Android paths the guest reaches natively (public storage, the app's
+        // own private directory): no rootfs prefix, no guest-side mapping.
+        host_dirs.extend(cfg.host_paths.iter().cloned());
         Rootfs {
             root: cfg.rootfs.clone(),
             host_dirs,
@@ -238,6 +241,7 @@ mod tests {
             guest_cwd: "/".into(),
             fake_root: true,
             lenient: false,
+            host_paths: Vec::new(),
         };
         let rf = Rootfs::from_config(&cfg);
         (tmp, rf)
@@ -356,6 +360,7 @@ mod tests {
             guest_cwd: "/".into(),
             fake_root: false,
             lenient: false,
+            host_paths: Vec::new(),
         };
         let rf = Rootfs::from_config(&cfg);
         assert!(!rf.enabled());
@@ -382,8 +387,46 @@ mod tests {
             guest_cwd: "/".into(),
             fake_root: false,
             lenient: true,
+            host_paths: Vec::new(),
         };
         let rf = Rootfs::from_config(&cfg);
         assert_eq!(rf.physical("/etc/hosts").to_string_lossy(), "/etc/hosts");
+    }
+
+    #[test]
+    fn android_host_paths_keep_their_native_meaning() {
+        let cfg = Config {
+            prefix: None,
+            runtime_dir: None,
+            rootfs: Some(PathBuf::from("/rootfs")),
+            box64: None,
+            preload: None,
+            loader: None,
+            guest_path: vec![],
+            guest_home: "/root".into(),
+            guest_tmp: "/tmp".into(),
+            guest_cwd: "/".into(),
+            fake_root: false,
+            lenient: false,
+            host_paths: vec![PathBuf::from("/sdcard")],
+        };
+        let rf = Rootfs::from_config(&cfg);
+
+        // Public storage is reached the way Android reaches it.
+        assert!(rf.passthrough("/sdcard"));
+        assert!(rf.passthrough("/sdcard/DCIM/photo.jpg"));
+        assert_eq!(
+            rf.physical("/sdcard/DCIM/photo.jpg").to_string_lossy(),
+            "/sdcard/DCIM/photo.jpg"
+        );
+
+        // A sibling with a shared prefix is not part of it, and everything
+        // else still belongs to the guest.
+        assert!(!rf.passthrough("/sdcardx"));
+        assert!(!rf.passthrough("/etc/hosts"));
+        assert_eq!(
+            rf.physical("/etc/hosts").to_string_lossy(),
+            "/rootfs/etc/hosts"
+        );
     }
 }

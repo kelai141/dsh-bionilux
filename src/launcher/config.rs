@@ -14,7 +14,7 @@
 //! See docs/HARDCODING.md for the full list.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Debian's standard `PATH`. Also the correct default for any glibc rootfs.
@@ -122,6 +122,11 @@ pub struct Config {
     /// When a path is missing inside the rootfs, fall back to the host path
     /// instead of failing. Off by default: the guest must not see host paths.
     pub lenient: bool,
+    /// Host directories the guest reaches through their own absolute path
+    /// instead of inside the rootfs: Android's public storage and the host
+    /// application's private data directory. This is what lets a guest use the
+    /// same paths as Android itself to index and edit files.
+    pub host_paths: Vec<PathBuf>,
 }
 
 impl Config {
@@ -149,6 +154,13 @@ impl Config {
         // refuse to work as a non-root user.
         let fake_root = env_bool("BIONILUX_FAKE_ROOT").unwrap_or(rootfs.is_some());
 
+        let mut host_paths = default_host_paths(prefix.as_deref());
+        if let Some(extra) = env_str(env_keys::HOST_PATHS) {
+            for p in extra.split(':').filter(|s| !s.is_empty()) {
+                host_paths.push(PathBuf::from(p));
+            }
+        }
+
         Config {
             prefix,
             runtime_dir,
@@ -164,8 +176,46 @@ impl Config {
             guest_cwd: env_str("BIONILUX_GUEST_CWD").unwrap_or_else(|| GUEST_CWD_DEFAULT.into()),
             fake_root,
             lenient: env_bool("BIONILUX_LENIENT").unwrap_or(false),
+            host_paths,
         }
     }
+}
+
+/// The host application's own private directory.
+///
+/// An Android app keeps its data in `<root>/files/`, and the guest runtime is
+/// installed below that (`<root>/files/usr`, `<root>/files/linux/...`), so the
+/// app directory is the ancestor of the install prefix whose child is `files`.
+fn app_private_dir(prefix: Option<&Path>) -> Option<PathBuf> {
+    let prefix = prefix?;
+    for ancestor in prefix.ancestors() {
+        if ancestor.file_name().is_some_and(|name| name == "files") {
+            return ancestor.parent().map(Path::to_path_buf);
+        }
+    }
+    None
+}
+
+/// Android paths the guest may reach at their native absolute path.
+///
+/// The app's private directory always qualifies: it is our own data, and the
+/// guest installs its rootfs there. Public storage is added because that is the
+/// shared area an Android app can already read; a caller that wants a
+/// locked-down guest sets `BIONILUX_ANDROID_PATHS=0`.
+fn default_host_paths(prefix: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(app_dir) = app_private_dir(prefix) {
+        out.push(app_dir);
+    }
+    if env_bool(env_keys::ANDROID_PATHS).unwrap_or(true) {
+        for path in ["/sdcard", "/storage/emulated/0"] {
+            let candidate = PathBuf::from(path);
+            if candidate.is_dir() {
+                out.push(candidate);
+            }
+        }
+    }
+    out
 }
 
 /// Process-wide configuration. Read once so the environment cannot shift
@@ -228,6 +278,8 @@ pub mod env_keys {
     pub const ROOTFS: &str = "BIONILUX_ROOTFS";
     pub const PREFIX: &str = "BIONILUX_PREFIX";
     pub const RUNTIME_DIR: &str = "BIONILUX_RUNTIME_DIR";
+    pub const HOST_PATHS: &str = "BIONILUX_HOST_PATHS";
+    pub const ANDROID_PATHS: &str = "BIONILUX_ANDROID_PATHS";
     pub const BOX64: &str = "BIONILUX_BOX64";
     pub const PRELOAD: &str = "BIONILUX_PRELOAD";
     pub const LOADER: &str = "BIONILUX_LOADER";
@@ -315,5 +367,21 @@ mod tests {
                 "missing {dir}"
             );
         }
+    }
+
+    #[test]
+    fn app_private_dir_is_derived_from_the_install_prefix() {
+        // The shape both Termux and the host application use.
+        assert_eq!(
+            app_private_dir(Some(Path::new("/data/data/com.example.app/files/usr"))),
+            Some(PathBuf::from("/data/data/com.example.app"))
+        );
+        assert_eq!(
+            app_private_dir(Some(Path::new("/data/data/com.termux/files/usr"))),
+            Some(PathBuf::from("/data/data/com.termux"))
+        );
+        // A prefix with no `files` component has no app directory to expose.
+        assert_eq!(app_private_dir(Some(Path::new("/opt/bionilux"))), None);
+        assert_eq!(app_private_dir(None), None);
     }
 }

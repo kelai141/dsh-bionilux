@@ -45,6 +45,15 @@ struct Cli {
     #[arg(long, value_name = "LIST")]
     guest_path: Option<String>,
 
+    /// Expose a host directory to the guest at the same absolute path
+    /// (Android public storage, an app's private directory). Repeatable.
+    #[arg(long = "host-path", value_name = "DIR")]
+    host_path: Vec<String>,
+
+    /// Do not expose Android's public storage (/sdcard, /storage/emulated/0)
+    #[arg(long = "no-android-paths")]
+    no_android_paths: bool,
+
     /// Print the resolved runtime identity and exit
     #[arg(long = "print-config")]
     print_config: bool,
@@ -83,6 +92,23 @@ fn apply_overrides(cli: &Cli) {
             // configuration cache is initialized.
             unsafe { env::set_var(key, value) };
         }
+    }
+    if !cli.host_path.is_empty() {
+        // Append to whatever the caller already exported rather than replacing
+        // it: the environment is the plugin's configuration channel.
+        let mut list = env::var(launcher::config::env_keys::HOST_PATHS).unwrap_or_default();
+        for path in &cli.host_path {
+            if !list.is_empty() {
+                list.push(':');
+            }
+            list.push_str(path);
+        }
+        // SAFETY: as above.
+        unsafe { env::set_var(launcher::config::env_keys::HOST_PATHS, list) };
+    }
+    if cli.no_android_paths {
+        // SAFETY: as above.
+        unsafe { env::set_var(launcher::config::env_keys::ANDROID_PATHS, "0") };
     }
 }
 

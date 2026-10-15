@@ -130,6 +130,16 @@ pub fn build(cfg: &Config, spec: &GuestEnv<'_>) -> Vec<String> {
         env_keys::LENIENT.into(),
         if cfg.lenient { "1" } else { "0" }.into(),
     );
+    // The preload hook needs the same host-path list to decide what to leave
+    // alone; it has no access to the launcher's configuration object.
+    vars.insert(
+        env_keys::HOST_PATHS.into(),
+        cfg.host_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(":"),
+    );
 
     if spec.arch != Arch::host() {
         vars.insert("BOX64_UNAME".into(), "x86_64".into());
@@ -178,6 +188,14 @@ pub fn describe(cfg: &Config, rootfs: &Rootfs) -> Vec<String> {
     push("GUEST_CWD", cfg.guest_cwd.clone());
     push("FAKE_ROOT", if cfg.fake_root { "1" } else { "0" }.into());
     push("LENIENT", if cfg.lenient { "1" } else { "0" }.into());
+    push(
+        "HOST_PATHS",
+        cfg.host_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(":"),
+    );
     push(
         "PREFIX",
         cfg.prefix

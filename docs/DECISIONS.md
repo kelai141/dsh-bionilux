@@ -116,3 +116,34 @@ apt 的 http 方法会因为"切换组后 `getgid()` 不是期望值"而报 `Cou
 
 **理由**：实测踩过坑——`apt-get update` 在 DNS 完全失败时仍返回 **0**（把索引下载失败当 warning），
 导致真机上曾出现"阶段 C 全过"的**假通过**。假通过比失败更危险，它会让集成方以为可以发布。
+
+---
+
+## D-010 不要指望拦截 libc 的内部调用
+
+**决策**：凡是 libc 自己会去读某个路径的地方，一律在**程序真正调用的公开 API** 上补回来；
+不再尝试拦截 glibc 内部别名或 `GLIBC_PRIVATE` 符号。
+
+**理由**：`LD_PRELOAD` 只能覆盖跨 PLT 的公开符号。libc 内部调用自己的函数是 DSO 内直接调用，
+不经过 PLT；而 `GLIBC_PRIVATE` 版本符号被 glibc 主动拒绝外部满足——`tests/helpers/privprobe.c`
+里同时挂了一个公开的 `getaddrinfo` 作对照：对照打印、两个 `GLIBC_PRIVATE` 钩子都没打印，
+说明此路不通。所以 DNS、NSS、`/bin/sh`、`mkstemp`、`dlopen` 这些都是一条条在公开 API 上补的。
+
+## D-011 guest 的身份必须自洽，否则工具会拒绝自己的目录
+
+**决策**：`getuid()` 报虚拟 root 时，`stat()` 系列必须把文件属主也报成同一个虚拟 uid/gid。
+
+**理由**：宿主把文件都算在 App 自己的 uid 上，而 guest 被告知自己是 root。两者不一致时，
+任何「把文件属主和自己比一比」的程序都会拒绝工作——`git clone` 直接中止于
+`detected dubious ownership`。`chown()` 本来就是「成功但什么都不做」，所以把属主统一报成
+虚拟身份才是唯一自洽的语义。
+
+## D-012 Android 目录以原生名字暴露，而不是映射进 rootfs
+
+**决策**：`/sdcard`、`/storage/emulated/0` 以及宿主 App 的私有目录，按**它们自己的绝对路径**
+直通；用 `--host-path` / `BIONILUX_HOST_PATHS` 配置，`--no-android-paths` 关掉默认项。
+
+**理由**：集成方（插件）和 App 共享的是同一份数据。若把 `/sdcard` 映射成 rootfs 内的另一个
+路径，App 与 guest 就会各持一份副本，且 Android 的路径在 guest 里失去意义。反过来，
+`/data/local/tmp` 这类目录在 SELinux 下**可读但不可执行**（`shell_data_file`），所以运行时本体
+必须放在 App 自己的 `files/`（`app_data_file`）下——这也是生产布局。

@@ -1,0 +1,5 @@
+GLIBC_PRIVATE {
+  global:
+    __nss_files_fopen;
+    __resolv_context_get;
+};

@@ -143,3 +143,26 @@ scripts/prepare-rootfs.sh --rootfs DIR --verify      # 安装门槛：仍有外�
 
 > LD_PRELOAD 这一层**不可能**达到 PRoot 的完备性。实测结论：路径操作快约 57 倍、
 > 进程创建快约 4.7 倍，但覆盖范围更窄。这也是 D-004 存在的原因。
+
+
+## 宿主目录直通（`--host-path`）
+
+映射规则之前先判断「直通」，命中则路径原样交给内核，不加 rootfs 前缀：
+
+1. `/proc`、`/sys`、`/dev`（`/dev/shm` 例外，POSIX 共享内存需要有地方可写）；
+2. 已经在 rootfs 内的路径（避免二次加前缀）；
+3. launcher 自己安装前缀下的路径；
+4. `BIONILUX_HOST_PATHS` 列出的宿主机目录——默认是 `/sdcard`、`/storage/emulated/0`，
+   以及由 `PREFIX` 推导出的 App 私有目录（`<root>/files/...` → `<root>`）。
+
+第 4 条是给集成方的：App 与 guest 用**同一个绝对路径**访问同一份数据。`--no-android-paths`
+关掉默认项，`--host-path DIR` 追加。默认项由 `PREFIX` 推导而非写死，所以 Termux 的 `$PREFIX`
+和某个 App 的 `files/` 目录都成立。
+
+## 相对路径与 `..`
+
+不含 `..` 的相对路径直接透传——物理工作目录本来就在 rootfs 内。含 `..` 的必须先换算成
+guest 视角：取当前目录的**物理**路径（`/proc/self/fd/N`，且必须用真实的 `readlink`，
+不能走会把结果改写成 guest 路径的那个钩子，否则匹配不上 rootfs 前缀、回落成 `/`，
+每次 `..` 都会跳到 guest 根目录——`find`/`rm -rf` 的深目录失败就是这么来的），
+反解成 guest 路径，拼上 `..` 后按词法归一化（`..` 在 guest 根处钳住），再映射回物理路径。
