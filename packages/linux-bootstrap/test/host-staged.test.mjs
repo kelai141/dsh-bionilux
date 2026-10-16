@@ -68,13 +68,14 @@ const runtimeManager = {
   status: async () => ({ running: false }),
 }
 
-function harness({ dataDir = path.join(root, `staged-${Math.random().toString(16).slice(2)}`), requireStagedBundle = false } = {}) {
+function harness({ dataDir = path.join(root, `staged-${Math.random().toString(16).slice(2)}`), requireStagedBundle = false, hostStagingRoot } = {}) {
   const calls = { downloads: 0 }
   const service = createMobileBootstrap({
     dataDir,
     releaseUrl: 'https://api.github.com/repos/acme/dsh-bionilux/releases/latest',
     appVersionProvider: () => '0.14.0',
     requireStagedBundle,
+    ...(hostStagingRoot !== undefined ? { hostStagingRoot } : {}),
     pluginHost: {
       install: async () => ({ manager: runtimeManager, rollback: async () => {} }),
       uninstall: async () => {},
@@ -156,4 +157,12 @@ test('an optional staged bundle that is missing falls back to the download path'
   const result = await install(value.service)
   assert.equal(value.calls.downloads, 1, 'the documented download contract must keep working')
   assert.equal(result.plugins.runtime.directory, path.join(value.dataDir, 'staging', 'runtime-plugin', sha256))
+})
+
+test('an explicit null disables the host-staged path, leaving the host IO in charge', async () => {
+  const value = harness({ hostStagingRoot: null })
+  await stageBundle(value.dataDir)
+  await value.service.ready
+  await install(value.service)
+  assert.equal(value.calls.downloads, 1, 'null must disable the path rather than silently selecting the default')
 })
