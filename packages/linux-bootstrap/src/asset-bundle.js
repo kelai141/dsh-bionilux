@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { mkdir, lstat, readFile, readdir, rename, rm, stat, writeFile, copyFile } from 'node:fs/promises'
+import { cp, mkdir, lstat, readFile, readdir, rename, rm, stat, writeFile, copyFile } from 'node:fs/promises'
 import path from 'node:path'
 import { parseGithubUrl } from './manifest.js'
 
@@ -16,6 +16,8 @@ async function digestFile(filePath) {
   return { sha256: hash.digest('hex'), size }
 }
 
+const INTEGRITY_MARKER = '.dsh-asset-integrity.json'
+
 async function unpackedBytes(directory) {
   let total = 0
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -23,8 +25,10 @@ async function unpackedBytes(directory) {
     const info = await lstat(child)
     if (info.isSymbolicLink()) throw new Error('Extracted plugin bundles may not contain symlinks')
     if (info.isDirectory()) total += await unpackedBytes(child)
-    else if (info.isFile()) total += info.size
-    else throw new Error('Unsupported filesystem entry in extracted plugin bundle')
+    // Our own bookkeeping is not payload: the manifest's unpackedSize is measured
+    // over the archive's contents, before this marker is written.
+    else if (info.isFile() && entry.name !== INTEGRITY_MARKER) total += info.size
+    else if (!info.isFile()) throw new Error('Unsupported filesystem entry in extracted plugin bundle')
   }
   return total
 }
@@ -43,6 +47,8 @@ function assertAsset(asset) {
 export async function installVerifiedPluginBundle({
   asset,
   destinationRoot,
+  hostStagingRoot,
+  requireStagedBundle = false,
   downloadAsset,
   extractArchive,
   fetchImpl = globalThis.fetch,
@@ -61,10 +67,33 @@ export async function installVerifiedPluginBundle({
     const marker = JSON.parse(await readFile(markerPath, 'utf8'))
     const rootInfo = await lstat(finalDirectory)
     if (rootInfo.isDirectory() && !rootInfo.isSymbolicLink() && marker.sha256 === asset.sha256 && marker.size === asset.size && marker.unpackedSize === asset.unpackedSize) {
-      if (packageName) await validatePackage(finalDirectory, packageName, entry)
-      return { path: finalDirectory, sha256: asset.sha256, size: asset.size, unpackedSize: asset.unpackedSize, reused: true }
+      // Our own marker is bookkeeping, not evidence. Re-measure the tree (which
+      // also refuses symbolic links) and re-validate the package before calling
+      // this reusable, so an altered or truncated slot is rebuilt rather than
+      // activated. `reused: true` is a verification outcome, never an assumption.
+      const measured = await unpackedBytes(finalDirectory)
+      if (measured === asset.unpackedSize) {
+        if (packageName) await validatePackage(finalDirectory, packageName, entry)
+        return { path: finalDirectory, sha256: asset.sha256, size: asset.size, unpackedSize: asset.unpackedSize, reused: true }
+      }
     }
   } catch { /* Rebuild missing or untrusted cached staging content. */ }
+
+  // The host may already have fetched and safely unpacked the bundle (see
+  // docs/DECISIONS.md D-015). Its staging is never trusted as such: the archive
+  // is re-hashed against this manifest and the unpacked tree is re-measured
+  // here, and only then is it published into our own content-addressed root.
+  // A staged bundle that is present but wrong is an error, not a cache miss —
+  // silently falling back to a download would hide tampering or corruption.
+  if (hostStagingRoot) {
+    const staged = await publishHostStagedBundle({
+      hostStagingRoot, asset, root, finalDirectory, packageName, entry,
+    })
+    if (staged) return staged
+    if (requireStagedBundle) {
+      throw new Error('No host-staged bundle is available: the host must prepare this asset before it can be installed')
+    }
+  }
 
   const token = randomUUID()
   const archivePath = path.join(root, `.asset-${token}`)
@@ -83,30 +112,11 @@ export async function installVerifiedPluginBundle({
     if (digest.size !== asset.size || digest.sha256 !== asset.sha256) throw new Error('Plugin asset SHA-256 or size verification failed')
     await mkdir(resultDirectory, { recursive: true })
     await extractArchive(archivePath, resultDirectory, { kind, safe: true, stripComponents: 0 })
-    const nestedPackage = path.join(resultDirectory, 'package')
-    let packageDirectory = resultDirectory
-    try {
-      if ((await stat(path.join(nestedPackage, 'package.json'))).isFile()) packageDirectory = nestedPackage
-    } catch { /* Archive is already rooted at the package directory. */ }
+    const packageDirectory = await pickPackageDirectory(resultDirectory)
     const unpackedSize = await unpackedBytes(packageDirectory)
     if (unpackedSize !== asset.unpackedSize) throw new Error(`Unpacked size mismatch: expected ${asset.unpackedSize}, got ${unpackedSize}`)
     if (packageName) await validatePackage(packageDirectory, packageName, entry)
-    await writeFile(path.join(packageDirectory, '.dsh-asset-integrity.json'), `${JSON.stringify({ sha256: asset.sha256, size: asset.size, unpackedSize })}\n`)
-    const backupDirectory = path.join(root, `.backup-${token}`)
-    let hadPrevious = false
-    try {
-      await rename(finalDirectory, backupDirectory)
-      hadPrevious = true
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error
-    }
-    try {
-      await rename(packageDirectory, finalDirectory)
-      if (hadPrevious) await rm(backupDirectory, { recursive: true, force: true })
-    } catch (error) {
-      if (hadPrevious) await rename(backupDirectory, finalDirectory).catch(() => {})
-      throw error
-    }
+    await publishBundle({ root, finalDirectory, packageDirectory, asset, unpackedSize, token })
     return { path: finalDirectory, sha256: asset.sha256, size: asset.size, unpackedSize, reused: false }
   } catch (error) {
     throw error
@@ -114,6 +124,92 @@ export async function installVerifiedPluginBundle({
     await rm(archivePath, { force: true }).catch(() => {})
     await rm(staging, { recursive: true, force: true }).catch(() => {})
   }
+}
+
+/**
+ * Locate the package directory inside an unpacked bundle: some archives root the
+ * package at `package/`, others are already rooted at it.
+ */
+async function pickPackageDirectory(rootDirectory) {
+  const nested = path.join(rootDirectory, 'package')
+  try {
+    if ((await stat(path.join(nested, 'package.json'))).isFile()) return nested
+  } catch { /* Archive is already rooted at the package directory. */ }
+  return rootDirectory
+}
+
+/**
+ * Publish a verified package directory as `<root>/<sha256>`, replacing any
+ * previous copy atomically and rolling back if the swap fails.
+ */
+async function publishBundle({ root, finalDirectory, packageDirectory, asset, unpackedSize, token }) {
+  await writeFile(path.join(packageDirectory, '.dsh-asset-integrity.json'), `${JSON.stringify({ sha256: asset.sha256, size: asset.size, unpackedSize })}\n`)
+  const backupDirectory = path.join(root, `.backup-${token}`)
+  let hadPrevious = false
+  try {
+    await rename(finalDirectory, backupDirectory)
+    hadPrevious = true
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+  try {
+    await rename(packageDirectory, finalDirectory)
+    if (hadPrevious) await rm(backupDirectory, { recursive: true, force: true })
+  } catch (error) {
+    if (hadPrevious) await rename(backupDirectory, finalDirectory).catch(() => {})
+    throw error
+  }
+}
+
+/**
+ * Re-verify a bundle the host staged at `<hostStagingRoot>/<sha256>/` and
+ * publish it locally.
+ *
+ * Returns `null` when nothing is staged at all, so the caller can decide whether
+ * that is a fallback or a failure. Anything staged but wrong throws: the host's
+ * own marker is never a usability credential, and a mismatch is a corruption or
+ * tampering signal that must not be papered over by a silent re-download.
+ */
+async function publishHostStagedBundle({ hostStagingRoot, asset, root, finalDirectory, packageName, entry }) {
+  const stagedRoot = path.join(path.resolve(hostStagingRoot), asset.sha256)
+  const archivePath = path.join(stagedRoot, 'asset.tar.xz')
+  let archiveInfo
+  try {
+    archiveInfo = await lstat(archivePath)
+  } catch {
+    return null
+  }
+  if (!archiveInfo.isFile() || archiveInfo.isSymbolicLink()) {
+    throw new Error('Host-staged archive must be a regular file')
+  }
+  const digest = await digestFile(archivePath)
+  if (digest.size !== asset.size || digest.sha256 !== asset.sha256) {
+    throw new Error('Host-staged archive does not match the release manifest (SHA-256 or size)')
+  }
+  const unpackedRoot = path.join(stagedRoot, 'unpacked')
+  const unpackedInfo = await lstat(unpackedRoot)
+  if (!unpackedInfo.isDirectory() || unpackedInfo.isSymbolicLink()) {
+    throw new Error('Host-staged bundle is missing its unpacked tree')
+  }
+  const packageDirectory = await pickPackageDirectory(unpackedRoot)
+  const unpackedSize = await unpackedBytes(packageDirectory)
+  if (unpackedSize !== asset.unpackedSize) {
+    throw new Error(`Host-staged bundle unpacked size mismatch: expected ${asset.unpackedSize}, got ${unpackedSize}`)
+  }
+  if (packageName) await validatePackage(packageDirectory, packageName, entry)
+  const token = randomUUID()
+  const staging = path.join(root, `.stage-${token}`)
+  const copied = path.join(staging, 'package')
+  await mkdir(staging, { recursive: true })
+  try {
+    // Copy rather than move: the host's staging area stays intact and
+    // re-verifiable, and our own copy is what gets published and re-used.
+    await cp(packageDirectory, copied, { recursive: true })
+    await publishBundle({ root, finalDirectory, packageDirectory: copied, asset, unpackedSize, token })
+  } finally {
+    await rm(staging, { recursive: true, force: true }).catch(() => {})
+  }
+  return { path: finalDirectory, sha256: asset.sha256, size: asset.size, unpackedSize, reused: false, hostStaged: true }
 }
 
 async function validatePackage(directory, packageName, entry) {
