@@ -32,6 +32,20 @@ flowchart TD
 * `linux-release.json`、rootfs、Node、Bionilux 全部是 **Release 附件**，不进 Git、不进 LFS。
 * 壳只提供 `linuxPluginHost` 适配器（加载/卸载插件目录、`isInjected`），不复制下载与解包事务。
 
+### 1.1 引导插件的客户端注册契约（跨包接口）
+
+引导插件的 client 半边由 DSH Mobile 的 UI 宿主装载，宿主提供 `react` 与 `slots` 两个面，
+并从 `settings.section` 槽位读回设置页条目。这是一条**跨仓接口**，因此钉进本仓测试
+（`packages/linux-bootstrap/test/client.test.mjs`）：
+
+* `inject` 必须同时声明 `slots` 与 `linuxBootstrap`——壳按声明的注入集决定槽位服务是否可见，
+  其自带客户端插件（`dsh-client-ui-responsive`、`dsh-android-vdisplay`）也是这样声明的。
+* 注册形态与壳现有先例一致：`ctx.slots.inject('settings.section', () => ctx.slots.register(
+  { name: 'settings.section', id: 'linux-environment', order, label: () => 'Linux环境' }, Section))`。
+  注意 `sidebar.right.pane.tab` 用的是 `{ key, inject }`，**不是**本槽位的形态，不可照抄。
+* 槽位注册返回 disposer，必须经 `ctx.effect(...)` 交给上下文，避免重载/卸载后残留入口。
+* 设置入口的**唯一权威注册方**是引导插件的 client 半边；壳侧不再重复注册，避免双入口。
+
 ## 2. 安装与启用（默认不启用）
 
 ```mermaid
