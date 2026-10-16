@@ -73,6 +73,10 @@ sequenceDiagram
 
 * “挂载”分两层：**插件装配**（由壳的注入目录决定）与 **guest 路径映射**（`--host-path` 原路径直通，
   不做内核 bind mount）。
+* 工作目录规则：rootfs 内的路径映射为 guest 路径；**guest 命名空间之外**且宿主上确实存在的目录
+  按原名直通可见；位于 guest 命名空间内（`/etc`、`/usr`、`/tmp` …）或宿主上不存在的路径一律按
+  guest 语义处理——因为 launcher 会先按名解析已配置的宿主目录，把这些目录提升为直通会遮蔽
+  guest 自己的同名子树。
 * 共享 glibc Node 位于各 rootfs 之外，经 `BIONILUX_HOST_PATHS` 与 guest `PATH` 暴露，
   从而“一份 Node 多环境复用”。
 * guest 路径缺失按 guest 语义失败，**绝不**回落到宿主同名路径；Linux 失败也**绝不**回退 Termux。

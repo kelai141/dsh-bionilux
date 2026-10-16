@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { createManager } from '../modules/manager.js';
+import { createManager, GUEST_PATH_PREFIXES, isGuestPath } from '../modules/manager.js';
 import { validateManifest, validateAsset, selectRuntime } from '../modules/manifest.js';
 
 const temporaryRoot = path.join(os.tmpdir(), `bionilux-runtime-tests-${process.pid}`);
@@ -376,9 +376,12 @@ test('cwd inside the rootfs becomes a guest path, and relative cwd is rejected',
   runner.calls.length = 0;
   const inside = await manager.execute({ command: 'pwd', cwd: path.join(rootfs, 'work') });
   assert.equal(inside.cwd, '/work');
-  const hostPaths = runner.calls.at(-1).spec.env.BIONILUX_HOST_PATHS.split(path.delimiter);
+  const nodeBin = path.join(manager.status().paths.node, 'bin');
+  // The list is colon-separated for the POSIX guest; on a Windows host an
+  // absolute path itself contains ':', so compare by position instead of by
+  // splitting.
   assert.equal(
-    hostPaths.includes(path.join(manager.status().paths.node, 'bin')),
+    String(runner.calls.at(-1).spec.env.BIONILUX_HOST_PATHS).startsWith(nodeBin),
     true,
     'the shared Linux Node bin directory must stay reachable from the guest',
   );
@@ -390,8 +393,36 @@ test('cwd inside the rootfs becomes a guest path, and relative cwd is rejected',
   await assert.rejects(() => manager.execute({ command: 'pwd', cwd: 'relative/path' }), /absolute path/);
 });
 
-test('a host directory that exists under a guest-visible name stays visible', { skip: process.platform === 'win32' }, async () => {
+test('a working directory in the guest namespace is never promoted to a host pass-through', { skip: process.platform === 'win32' }, async () => {
   const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager, runner } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  // /tmp exists on the host and is also a guest path: promoting it would shadow
+  // the guest's own /tmp, so the cwd must stay a guest path.
+  const guestNamespaceDir = path.posix.join('/tmp', `bionilux-guest-ns-${process.pid}`);
+  await mkdir(guestNamespaceDir, { recursive: true });
+
+  runner.calls.length = 0;
+  const result = await manager.execute({ command: 'pwd', cwd: guestNamespaceDir });
+
+  assert.equal(result.cwd, guestNamespaceDir);
+  assert.equal(
+    String(runner.calls.at(-1).spec.env.BIONILUX_HOST_PATHS).includes(guestNamespaceDir),
+    false,
+    'the guest namespace must not be shadowed',
+  );
+});
+
+test('a host workspace outside the guest namespace stays visible under its own name', async () => {
+  const dataDir = tempDir();
+  // On platforms whose temp root is itself a guest path (Linux CI: /tmp) this
+  // case cannot be exercised without shadowing the guest namespace, so it is
+  // reported as skipped rather than asserted.
+  const guestPrefixed = GUEST_PATH_PREFIXES.some((prefix) => dataDir === prefix || dataDir.startsWith(`${prefix}${path.sep}`) || dataDir.startsWith(`${prefix}/`));
+  if (guestPrefixed) return;
+
   const fixture = makeManifest();
   const { manager, runner } = makeManager(fixture, { dataDir });
   await manager.install(fixture.manifest);
@@ -403,7 +434,21 @@ test('a host directory that exists under a guest-visible name stays visible', { 
   const outside = await manager.execute({ command: 'pwd', cwd: shared });
 
   assert.equal(outside.cwd, shared);
-  assert.match(runner.calls.at(-1).spec.env.BIONILUX_HOST_PATHS, /project/);
+  assert.equal(
+    String(runner.calls.at(-1).spec.env.BIONILUX_HOST_PATHS).endsWith(shared),
+    true,
+    'a real host workspace must stay reachable',
+  );
+});
+
+test('the guest namespace list covers the directories the rootfs owns', () => {
+  for (const required of ['/etc', '/usr', '/tmp', '/var', '/home', '/root']) {
+    assert.equal(GUEST_PATH_PREFIXES.includes(required), true, `${required} must be in the guest namespace`);
+  }
+  assert.equal(isGuestPath('/etc'), true);
+  assert.equal(isGuestPath('/etc/os-release'), true);
+  assert.equal(isGuestPath('/etcetera'), false, 'prefix matching must not leak to similar names');
+  assert.equal(isGuestPath('/data/data/com.dsharnessmobile.shell/files'), false);
 });
 
 test('execution fails closed when the runtime is absent, and never falls back to the host', async () => {

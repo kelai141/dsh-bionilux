@@ -120,18 +120,26 @@ test('mobile-version delta triggers automatic check/install once; enabling toggl
   await value.service.install({ confirmed: true, activate: true })
   await value.service.setAutoUpdateEnabled(false)
   value.currentVersion.value = '0.14.1'
-  const fresh = harness({ dataDir: value.dataDir, currentVersion: value.currentVersion, latestVersion: '1.2.0' })
-  await fresh.service.ready
-  assert.equal(fresh.calls.manifestFetches, 0)
-  await fresh.service.setAutoUpdateEnabled(true)
-  assert.equal(fresh.calls.manifestFetches, 0)
-  const resumed = harness({ dataDir: value.dataDir, currentVersion: value.currentVersion, latestVersion: '1.2.0' })
-  const stored = JSON.parse(await readFile(path.join(value.dataDir, 'linux-bootstrap-state.json'), 'utf8'))
+
+  // Reopen the same store with the new app version: the preference is off, so
+  // nothing is fetched and enabling the toggle must not check either.
+  const reopened = harness({ dataDir: value.dataDir, currentVersion: value.currentVersion, latestVersion: '1.2.0' })
+  await reopened.service.ready
+  assert.equal(reopened.calls.manifestFetches, 0, 'auto-update off must stay network silent')
+  await reopened.service.setAutoUpdateEnabled(true)
+  assert.equal(reopened.calls.manifestFetches, 0, 'the toggle itself must not trigger a check')
+
+  // Persist the preference, then reopen: the recorded app version differs from
+  // the current one, so exactly one automatic check (and install) happens.
+  const statePath = path.join(value.dataDir, 'linux-bootstrap-state.json')
+  const stored = JSON.parse(await readFile(statePath, 'utf8'))
   stored.autoUpdateEnabled = true
-  await writeFile(path.join(value.dataDir, 'linux-bootstrap-state.json'), JSON.stringify(stored))
-  await resumed.service.ready
-  assert.equal(resumed.calls.manifestFetches, 2)
-  assert.equal(resumed.calls.managerInstalls.length, 1)
+  await writeFile(statePath, JSON.stringify(stored))
+
+  const afterVersionChange = harness({ dataDir: value.dataDir, currentVersion: value.currentVersion, latestVersion: '1.2.0' })
+  await afterVersionChange.service.ready
+  assert.equal(afterVersionChange.calls.manifestFetches, 2)
+  assert.equal(afterVersionChange.calls.managerInstalls.length, 1)
 })
 
 test('a plugin the user removed from the injection directory is never resurrected', async () => {
@@ -163,22 +171,16 @@ test('an automatic update fails closed when the injected plugin disappears mid-f
   await installed.service.ready
   await installed.service.install({ confirmed: true, activate: true })
 
-  const gone = harness({
-    dataDir: installed.dataDir,
-    currentVersion: { value: '0.15.0' },
-    latestVersion: '1.2.0',
-    isInjected: { injected: true, active: true },
-  })
-  await gone.service.ready
-
-  // Simulate the user removing the directory between the check and the install.
-  gone.service.setAutoUpdateEnabled(false)
+  // Record the pre-removal state deterministically: settle every write before
+  // reopening the store, so the reopened service cannot race a stale write.
   const statePath = path.join(installed.dataDir, 'linux-bootstrap-state.json')
-  const stored = JSON.parse(await readFile(statePath, 'utf8'))
-  stored.injectionActivated = true
-  stored.enabled = true
-  await writeFile(statePath, JSON.stringify(stored))
+  const active = JSON.parse(await readFile(statePath, 'utf8'))
+  active.enabled = true
+  active.injectionActivated = true
+  active.autoUpdateEnabled = true
+  await writeFile(statePath, JSON.stringify(active))
 
+  // The user removes the runtime plugin: the host reports it as not injected.
   const hostile = harness({
     dataDir: installed.dataDir,
     currentVersion: { value: '0.15.0' },
@@ -190,6 +192,7 @@ test('an automatic update fails closed when the injected plugin disappears mid-f
 
   const after = JSON.parse(await readFile(statePath, 'utf8'))
   assert.equal(after.injectionActivated, false, 'the removal must be persisted')
+  assert.equal(after.enabled, false)
   assert.equal(hostile.calls.hostInstalls.length, 0, 'an automatic update must never re-add the plugin')
 })
 

@@ -56,9 +56,13 @@ child of the Bionilux launcher and returns
   `BIONILUX_FAKE_ROOT=1` presents the guest's own root identity and
   `BIONILUX_LENIENT=0` keeps missing guest paths failing rather than reaching the
   host.
-* **Working directory.** A path inside the rootfs maps to its guest path; any
-  other existing absolute directory stays visible to the guest under its own
-  name; a relative path is rejected.
+* **Working directory.** A path inside the rootfs maps to its guest path. A path
+  outside the guest namespace (not under `/bin`, `/etc`, `/usr`, `/tmp`, …) that
+  exists on the host stays visible under its own name. A path inside the guest
+  namespace, or one that does not exist on the host, is treated as a guest path —
+  promoting it to a host path would shadow the guest's own subtree, because the
+  launcher resolves a configured host directory before consulting the rootfs. A
+  relative path is rejected.
 
 ## Install/cutover safety
 

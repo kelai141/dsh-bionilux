@@ -40,7 +40,7 @@ const HOST_ENV_ALLOWLIST = new Set([
   'all_proxy',
   'no_proxy',
 ]);
-const GUEST_PATH_PREFIXES = [
+const GUEST_PATH_PREFIXES_LIST = [
   '/bin',
   '/dev',
   '/etc',
@@ -57,6 +57,22 @@ const GUEST_PATH_PREFIXES = [
   '/var',
   '/work',
 ];
+
+/**
+ * The guest namespace, deliberately exported.
+ *
+ * A working directory under one of these prefixes is *never* promoted to a host
+ * pass-through: the launcher resolves a configured host directory by its own
+ * name before consulting the rootfs, so promoting e.g. `/tmp` or `/etc` would
+ * shadow the whole guest subtree of that name. Promoting a directory outside
+ * the guest namespace is what makes a real host workspace visible instead.
+ */
+export const GUEST_PATH_PREFIXES = Object.freeze(GUEST_PATH_PREFIXES_LIST);
+
+/** `true` when `value` names a path inside the guest's own namespace. */
+export function isGuestPath(value) {
+  return GUEST_PATH_PREFIXES.some((prefix) => value === prefix || value.startsWith(`${prefix}/`));
+}
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -324,10 +340,6 @@ function cleanHostEnvironment() {
     if (HOST_ENV_ALLOWLIST.has(key)) environment[key] = value;
   }
   return environment;
-}
-
-function isGuestPath(value) {
-  return GUEST_PATH_PREFIXES.some((prefix) => value === prefix || value.startsWith(`${prefix}/`));
 }
 
 function executableFileExists(file) {
@@ -847,7 +859,13 @@ export class LinuxRuntimeManager {
       const relative = path.relative(rootfs, resolved).split(path.sep).filter(Boolean).join('/');
       return { guestCwd: relative ? `/${relative}` : '/', hostPaths: [] };
     }
-    if (isGuestPath(cwd) || !existsSync(cwd)) return { guestCwd: cwd, hostPaths: [] };
+    if (isGuestPath(cwd) || !existsSync(cwd)) {
+      // A guest-namespace directory is never promoted to a host pass-through:
+      // the launcher resolves a configured host directory before the rootfs, so
+      // promoting /tmp or /etc would shadow the guest's own subtree. A path that
+      // does not exist on the host is likewise only meaningful inside the guest.
+      return { guestCwd: cwd, hostPaths: [] };
+    }
     return { guestCwd: cwd, hostPaths: [cwd] };
   }
 
