@@ -103,7 +103,15 @@ sh scripts/prepare-rootfs.sh --rootfs "$STAGE" --relative-links --verify    # �
 `--dns` 的取值必须来自**设备当前网络**（Android 无 `/etc/resolv.conf`），
 详见 [STATUS.md](STATUS.md) §9 的设备验证记录；网络可达性仍需按设备检查。
 
-## 6. 卸载
+## 6. 发行版与共享 Node.js
+
+Linux Environment System 独立于 DSH Mobile APK 版本发布；安装器从版本化 GitHub Release manifest 获取两种插件及运行时资源的直接下载地址、大小和 SHA-256。所有大体积 rootfs、Node.js 和运行二进制只作为 Release 附件分发，不提交到 Git 或 Git LFS。
+
+默认运行时为 Debian minimal。Bionilux launcher/preload 和 Debian rootfs 按运行时实例装配；glibc Node.js 作为应用级、按 ABI/版本划分的共享工具包安装一次，各 Linux rootfs 引用它，不在各 rootfs 内重复安装。宿主 DSH Core 的 Bionic Node 与此 Node 不同，不得互相冒充。
+
+设置提供自动更新开关和手动检查更新。自动检查仅在记录的 DSH Mobile 安装版本发生变化后触发；开关启用、网络恢复、后台重启本身均不触发自动更新。手动检查不受此前版本是否变化限制，安装前仍由用户确认。
+
+## 7. 卸载
 
 ```bash
 rm -rf "$ROOTFS"          # 整个 Linux runtime 目录

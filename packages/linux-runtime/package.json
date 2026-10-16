@@ -1,0 +1,26 @@
+{
+  "name": "@dsh-android/linux-runtime",
+  "version": "0.5.0",
+  "private": false,
+  "type": "module",
+  "description": "DSH Mobile Linux runtime plugin: Bionilux + Debian minimal rootfs install/execute lifecycle and the linux_bash tool",
+  "exports": {
+    ".": "./lib/index.js",
+    "./modules/*": "./modules/*"
+  },
+  "files": [
+    "lib/",
+    "modules/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

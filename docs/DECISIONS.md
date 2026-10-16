@@ -147,3 +147,30 @@ apt 的 http 方法会因为"切换组后 `getgid()` 不是期望值"而报 `Cou
 路径，App 与 guest 就会各持一份副本，且 Android 的路径在 guest 里失去意义。反过来，
 `/data/local/tmp` 这类目录在 SELinux 下**可读但不可执行**（`shell_data_file`），所以运行时本体
 必须放在 App 自己的 `files/`（`app_data_file`）下——这也是生产布局。
+---
+
+## D-013 两个实验性内部插件、Release 分发、共享 glibc Node，默认不启用
+
+**决策**：Linux 环境以**两个外部 Cordis 插件**分发——极小的引导插件（设置入口 + 清单发现 +
+安装事务 + 更新策略）与运行时插件（安装/健康检查/卸载 + `linux_bash`）。Bionilux、Debian
+minimal rootfs 与 glibc Node.js 作为**版本化 GitHub Release 附件**发布，附 SHA-256/大小，
+不进入 Git，也不使用 Git LFS。glibc Node 作为**应用级共享包**安装一次
+（`<dataDir>/shared/node/sha256-<摘要>/<arch>`），由各 rootfs 引用；宿主 Bionic Node 与 Termux
+保持不变。
+
+**理由**：
+1. 用户需求：系统独立于 DSH Mobile 本体更新；必须有“自动更新/手动检查更新”，且自动更新
+   只在**已安装系统的 DSH Mobile 版本变化**时触发。
+2. release 附件（而非 LFS）避免仓库膨胀与 LFS 配额爆炸——用户明确要求“不要让 LFS 炸了”。
+3. 每个 rootfs 各装一份 Node 会重复数百 MB；以内容摘要为键的共享安装既去重又能在系统
+   升级时复用同一份 Node。
+
+**边界（不可默示违反）**：两个插件都是**我们自己的内部插件**，写进内置（hard）插件目录，
+但默认不启用（存在 ≠ 启用）。应用更新或 Linux 新版本发布都不会启用它们；宿主
+`linuxPluginHost.isInjected()` 是唯一权威，用户手工移除后自动更新失败关闭，只有显式安装才能恢复。
+
+**否掉**：把插件打进默认 profile/快照（会与“默认不启用”冲突）；用 LFS 存 rootfs
+（配额与克隆成本不可接受）；每个 rootfs 内 `apt install nodejs`（重复且与宿主 Node 混淆）。
+
+**代价**：宿主需要提供真实的插件加载适配器（`linuxPluginHost`）与安全解包/下载 IO；真机端到端
+安装、`isInjected` 行为与 guest DNS 仍需设备验收，本文档不将其记为已验证。

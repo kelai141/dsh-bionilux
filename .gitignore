@@ -9,6 +9,9 @@ preload_data.h
 # Vendored test fixtures
 tests/helpers/*.bin
 
+# Plugin package test scratch data
+packages/*/.test-data/
+
 # Editor
 .vscode/
 .idea/

@@ -39,6 +39,87 @@ jobs:
             exit 1
           fi
 
+  linux-environment-plugins:
+    # The two experimental plugin packages and the release manifest validator are
+    # pure Node.js; they are gated on every PR so the install/update contract
+    # (checksums, opt-in activation, shared Node reuse) cannot regress.
+    name: linux environment plugins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+      - name: plugin package tests
+        run: node --test packages/linux-bootstrap/test/*.test.mjs packages/linux-runtime/test/*.test.mjs
+      - name: the bootstrap and runtime manifest validators agree
+        run: |
+          node --input-type=module -e '
+            import { validateManifest } from "./packages/linux-runtime/modules/manifest.js";
+            import { validateManifestShape } from "./packages/linux-bootstrap/src/manifest.js";
+            const tag = "v0.5.0";
+            const asset = (name) => ({
+              url: `https://github.com/kelai141/dsh-bionilux/releases/download/${tag}/${name}`,
+              sha256: "a".repeat(64),
+              size: 1,
+              unpackedSize: 1,
+              pluginReleaseUrl: `https://github.com/kelai141/dsh-bionilux/releases/tag/${tag}`,
+            });
+            const manifest = {
+              schemaVersion: 1,
+              version: "0.5.0",
+              minMobileVersion: "0.14.0",
+              plugins: { bootstrap: asset("linux-bootstrap-plugin.tar.xz"), runtime: asset("linux-runtime-plugin.tar.xz") },
+              runtimes: [{
+                id: "debian-minimal",
+                label: "Debian minimal",
+                architecture: "arm64",
+                backend: "bionilux",
+                backendAsset: asset("bionilux-backend-aarch64.tar.xz"),
+                rootfsAsset: asset("debian-minimal-aarch64.tar.xz"),
+                nodeAsset: asset("node-glibc-v24.22.0-linux-arm64.tar.xz"),
+              }],
+            };
+            validateManifest(manifest);
+            validateManifestShape(manifest, tag);
+            console.log("Both manifest validators accept the canonical release manifest.");
+          '
+      - name: no tracked release binaries or Git LFS pointers
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          forbidden_suffixes = (
+              ".so", ".dylib", ".dll", ".exe", ".apk", ".deb", ".tar",
+              ".tar.gz", ".tar.xz", ".tgz", ".xz", ".a", ".o", ".node",
+          )
+          lfs_pointer = b"version https://git-lfs.github.com/spec/v1\n"
+          errors = []
+          for raw_path in subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0"):
+              if not raw_path:
+                  continue
+              path = os.fsdecode(raw_path)
+              if path.lower().endswith(forbidden_suffixes):
+                  errors.append(f"tracked release/binary asset: {path}")
+              try:
+                  with open(path, "rb") as tracked_file:
+                      prefix = tracked_file.read(1024)
+              except (OSError, IsADirectoryError):
+                  continue
+              if prefix.startswith(lfs_pointer):
+                  errors.append(f"tracked Git LFS pointer: {path}")
+              if os.path.basename(path) == ".gitattributes" and re.search(r"(?im)^\s*[^#\n]*\bfilter\s*=\s*lfs\b", prefix.decode("utf-8", errors="replace")):
+                  errors.append(f"Git LFS tracking rule in {path}")
+          if errors:
+              print("::error::Release binaries and generated archives belong in GitHub Releases, not Git/LFS.")
+              print("\n".join(errors))
+              sys.exit(1)
+          print("No tracked release binaries, generated archives, or Git LFS pointers.")
+          PY
+
   preload-paths:
     name: preload path semantics
     runs-on: ubuntu-latest

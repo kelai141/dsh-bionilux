@@ -64,6 +64,29 @@ bionilux --rootfs "$R" --print-config | grep HOST_PATHS
 bionilux --rootfs "$R" /bin/sh -c 'cat /data/data/<pkg>/files/app-state.json'
 ```
 
+## Experimental DSH Mobile plugins and updates
+
+The Linux environment is an **experimental, opt-in system built from our own
+internal plugins**. The plugins ship in the built-in (hard) plugin directory but
+are not enabled by default — presence is not activation. Neither installing an
+APK update nor publishing a new Linux Release enables them, and neither
+re-enables one the user turned off. The lightweight bootstrap and runtime plugins
+are separately published as version-pinned GitHub Release assets described by
+`linux-release.json`; the user enables the system and explicitly confirms runtime
+installation before `linux_bash` is registered.
+
+The Linux system has its own version lifecycle. Manual update checks are
+available; automatic checking is only eligible for an already activated Linux
+system after the installed DSH Mobile app version changes, and only when its
+user-controlled auto-update option is enabled. A manual check never installs an
+update without explicit confirmation.
+
+Bionilux, rootfs, and a shared glibc Node.js package are published as checksummed
+Release assets, not committed source or Git LFS objects. One app-level Linux
+Node installation is shared across rootfs instances; the host's Bionic Node and
+Termux Bash remain unchanged. The rootfs provides Debian/glibc runtime support,
+not a security sandbox.
+
 ## Guest path semantics
 
 * Only absolute paths are rewritten; a path already inside the rootfs is left
