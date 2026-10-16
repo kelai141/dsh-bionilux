@@ -27,6 +27,7 @@ export function LinuxEnvironmentSection({ linuxBootstrap }) {
   const [status, setStatus] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [runtimeId, setRuntimeId] = useState('debian-minimal')
 
   useEffect(() => {
     if (!linuxBootstrap) {
@@ -70,6 +71,8 @@ export function LinuxEnvironmentSection({ linuxBootstrap }) {
   const installed = Boolean(status?.installed)
   const autoUpdateEnabled = status?.autoUpdate ?? false
   const urls = status?.pluginReleaseUrls ?? {}
+  const runtimes = Array.isArray(status?.runtimes) ? status.runtimes : []
+  const selectedRuntime = status?.installed && status?.runtime?.id ? status.runtime.id : runtimeId
   const confirmInstall = () =>
     window.confirm(
       '安装 Linux 环境会下载 Bionilux、Debian minimal rootfs 与共享 glibc Node.js（数百 MB），' +
@@ -83,6 +86,24 @@ export function LinuxEnvironmentSection({ linuxBootstrap }) {
     h('h2', null, 'Linux环境'),
     h('p', { className: 'linux-environment-notice' }, EXTERNAL_NOTICE),
     h('p', { role: 'status', 'aria-live': 'polite' }, describeVersionStatus(status)),
+    runtimes.length > 1
+      ? h(
+          'label',
+          { className: 'linux-environment-runtime' },
+          'Linux 运行时：',
+          h(
+            'select',
+            {
+              value: selectedRuntime,
+              disabled: busy || installed,
+              onChange: (event) => setRuntimeId(event.currentTarget.value),
+            },
+            runtimes.map((runtime) =>
+              h('option', { key: runtime.id, value: runtime.id }, `${runtime.label}（${runtime.architecture}）`),
+            ),
+          ),
+        )
+      : null,
     h(
       'label',
       null,
@@ -113,7 +134,7 @@ export function LinuxEnvironmentSection({ linuxBootstrap }) {
           disabled: busy || !linuxBootstrap,
           onClick: () => {
             if (!confirmInstall()) return undefined
-            return run(() => linuxBootstrap.install({ runtimeId: 'debian-minimal', confirmed: true, activate: true }))
+            return run(() => linuxBootstrap.install({ runtimeId: selectedRuntime, confirmed: true, activate: true }))
           },
         },
         installed ? '安装 Linux 更新' : '安装 Linux 环境',

@@ -225,6 +225,27 @@ test('install and reinstall require an explicit confirmed activation', async () 
   assert.equal(status.autoUpdate, false, 'auto-update is off until the user opts in')
 })
 
+test('the service offers the manifest runtimes and defaults to Debian minimal', async () => {
+  const value = harness()
+  await value.service.ready
+  await value.service.checkForUpdates({ source: 'manual' })
+  const status = await value.service.status()
+
+  assert.equal(status.defaultRuntimeId, 'debian-minimal')
+  assert.equal(Array.isArray(status.runtimes), true)
+  assert.equal(status.runtimes.length, 1)
+  assert.deepEqual(
+    { id: status.runtimes[0].id, architecture: status.runtimes[0].architecture, installed: status.runtimes[0].installed },
+    { id: 'debian-minimal', architecture: 'arm64', installed: false },
+  )
+
+  await assert.rejects(
+    () => value.service.install({ runtimeId: 'not-a-runtime', confirmed: true, activate: true }),
+    /Unknown runtime id/,
+  )
+  assert.equal(value.calls.hostInstalls.length, 0, 'an unknown runtime must not reach the host adapter')
+});
+
 test('rejects bad package asset digest before host activation', async () => {
   const value = harness()
   const originalFetch = value.service

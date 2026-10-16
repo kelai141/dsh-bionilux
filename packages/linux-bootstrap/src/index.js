@@ -51,6 +51,27 @@ function initialState(autoUpdate) {
   }
 }
 
+/**
+ * Runtime choices offered by the newest manifest this service has seen.
+ *
+ * Debian minimal is the default and the only one published today; the list is
+ * data-driven so additional runtimes appear in the settings selector as soon as
+ * the release manifest carries them.
+ *
+ * @param {object} state - Persisted bootstrap state.
+ * @returns {Array<{id: string, label: string, architecture: string, installed: boolean}>} Choices.
+ */
+function availableRuntimes(state) {
+  const manifest = state.availableManifest ?? state.pinnedManifest
+  if (!Array.isArray(manifest?.runtimes)) return []
+  return manifest.runtimes.map((runtime) => ({
+    id: runtime.id,
+    label: runtime.label,
+    architecture: runtime.architecture,
+    installed: state.runtimeId === runtime.id && Boolean(state.installedLinuxVersion),
+  }))
+}
+
 function statusShape(state, mobileVersion, operation, packageVersion) {
   return Object.freeze({
     experimental: true,
@@ -72,6 +93,8 @@ function statusShape(state, mobileVersion, operation, packageVersion) {
     busy: operation !== 'idle',
     operation,
     runtime: state.runtime ?? (state.runtimeId ? { id: state.runtimeId } : null),
+    runtimes: availableRuntimes(state),
+    defaultRuntimeId: DEFAULT_RUNTIME_ID,
     plugins: {
       bootstrap: { version: packageVersion, builtIn: true },
       runtime: state.installedLinuxVersion ? { version: state.installedLinuxVersion, package: RUNTIME_PACKAGE_NAME, directory: state.pluginDirectory } : null,

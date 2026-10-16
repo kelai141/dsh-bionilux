@@ -21,6 +21,7 @@
 | [UPSTREAM.md](UPSTREAM.md) | fork 基点、patch 清单、上游同步流程 | 中期 |
 | [adr/0001-independent-mobile-linux-runtime.md](adr/0001-independent-mobile-linux-runtime.md) | 独立发布、共享 glibc Node 与默认禁用边界 | 长期 |
 | [RELEASES.md](RELEASES.md) | 发布物清单、清单格式、完整性校验与更新策略 | 长期 |
+| [PLUGINS.md](PLUGINS.md) | 两个外部插件的挂载、安装、执行与更新流程图设计 | 长期 |
 
 ## 本 fork 与上游的边界
 

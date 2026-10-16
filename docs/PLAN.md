@@ -73,3 +73,5 @@
 | DP-1 | 是否继续独立维护 fork | 阶段 A/C 需要大量 syscall 特例 | **未触发**：A/B 与 C 的包管理机制已通过（D-004） |
 | DP-2 | 是否采用 `openat2(RESOLVE_IN_ROOT)` | 内核支持且行为正确 | **暂缓**（D-003） |
 | DP-3 | 默认后端是 PRoot 还是 bionilux | 阶段 A–D 通过且性能收益可重复 | **待定**：A–C 已通过，D 未做；性能收益已实测（PERF.md） |
+
+- [x] 设计记录 [PLUGINS.md](PLUGINS.md)：挂载/安装/执行/更新流程图，与实现一一对应
