@@ -160,8 +160,12 @@ export function createMobileBootstrap(options = {}) {
     // Where the host stages a bundle it fetched itself (D-015): `<root>/<sha256>/`.
     // A directory that exists but does not match the manifest is an error, never a
     // cache miss; `requireStagedBundle` additionally forbids falling back to a
-    // download when a host owns byte fetching.
-    hostStagingRoot = options.hostStagingRoot ?? (dataDir ? path.join(dataDir, 'staging') : undefined),
+    // download when a host owns byte fetching. Only `undefined` selects the
+    // default: an explicit `null` (or `false`) disables the path, so a host can
+    // make its own IO the single owner of "what is staged".
+    hostStagingRoot = options.hostStagingRoot === undefined
+      ? (dataDir ? path.join(dataDir, 'staging') : undefined)
+      : options.hostStagingRoot,
     requireStagedBundle = options.requireStagedBundle === true,
     runtimePluginConfig = {},
     autoUpdateEnabled,
