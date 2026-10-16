@@ -47,6 +47,12 @@ and returns it.
   reject absolute paths, `..` traversal and symlinks escaping `destination`.
   The runtime package is rejected if it does not contain
   `package.json` named `@dsh-android/linux-runtime` with a safe `lib/index.js`.
+* When the host has already fetched and extracted the bundle itself — the shipped
+  arrangement, where the settings client triggers the host and `.tar.xz` is
+  decoded host-side (see `docs/DECISIONS.md` D-015) — both hooks may be
+  pass-through. Nothing is trusted on that basis: the bootstrap re-verifies the
+  staged content against the manifest before it activates, so a reuse result is a
+  verification outcome and never an assumption.
 
 ### Host adapter (`linuxPluginHost`)
 

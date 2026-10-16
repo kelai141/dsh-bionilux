@@ -31,9 +31,36 @@ flowchart TD
   但**默认不启用**（存在 ≠ 启用）；**运行时插件**与 Bionilux、rootfs、glibc Node 一样按需取自
   Release，不随应用分发。
 * `linux-release.json`、rootfs、Node、Bionilux 全部是 **Release 附件**，不进 Git、不进 LFS。
-* 壳只提供 `linuxPluginHost` 适配器（加载/卸载插件目录、`isInjected`），不复制下载与解包事务。
+* 壳提供 `linuxPluginHost` 适配器（加载/卸载插件目录、`isInjected`），并**承担字节获取与安全解包**
+  ——`.tar.xz` 的解码在 Node 侧没有实现（Node 的 zlib 不含 xz，本仓也没有 xz/tar 依赖），而宿主
+  已有加固实现（`SnapshotExtractor` 的穿越/符号链接逃逸/炸弹上限、`SnapshotBundledAsset.digest`
+  的流式摘要 + 实读字节数），因此宿主负责下载与解包，**不复制**版本/状态/校验/激活事务。
+* **所有权边界**：bootstrap 仍**拥有**版本解析、状态、完整性验收与激活；宿主产物（暂存区）不是
+  可用性凭据，bootstrap 必须在激活前**自行复验**（重算保留归档的摘要，或校验解包树的
+  `unpackedSize` + 入口 + 包名），`reused:true` 必须是复验结果而非假设。
 
-### 1.1 引导插件的客户端注册契约（跨包接口）
+### 1.1 资产准备的所有权（宿主取字节，bootstrap 复验）
+
+引擎（Node/Cordis）侧**没有反向通道**调用宿主：壳是客户端，长轮询引擎的
+`/api/android/ui/pending`，而那条队列是**设备控制队列**，其策略要求 `danger-full-access`。
+把资产下载挂上去等于「装 Linux 必须先开设备控制档」，与用户要求相反；协议面又属逐字节镜像面。
+因此采用**客户端触发**：
+
+```mermaid
+flowchart LR
+    U[用户点击安装] --> C[客户端调宿主准备原语]
+    C --> H[宿主: 来源白名单 https + 逐跳重定向校验 + SHA-256 与字节数]
+    H --> X[宿主: 安全解包到 staging 内容寻址目录]
+    X --> R[引擎侧 bootstrap: 按清单 sha256 自行定位并复验]
+    R -->|通过| A[激活并注册 linux_bash]
+    R -->|失败或缺失| F[失败关闭 不下载不激活]
+```
+
+* 落点由宿主按摘要推导，**调用方无法指定路径**；摘要与体量在任何文件系统操作前校验。
+* 引擎侧**不接受调用方传入的暂存路径**：bootstrap 用自己清单里的 `sha256` 定位暂存目录。
+* `downloadAsset` / `extractArchive` 在此形态下是**宿主透传/占位**，bootstrap 的该契约不变。
+
+### 1.2 引导插件的客户端注册契约（跨包接口）
 
 引导插件的 client 半边由 DSH Mobile 的 UI 宿主装载，宿主提供 `react` 与 `slots` 两个面，
 并从 `settings.section` 槽位读回设置页条目。这是一条**跨仓接口**，因此钉进本仓测试
