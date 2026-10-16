@@ -14,7 +14,12 @@ import React, { useEffect, useState } from 'react'
 import { EXPERIMENTAL_NOTICE, autoUpdateAvailable, describeVersionStatus } from '../src/status.js'
 
 export const name = 'dsh-linux-bootstrap-client'
-export const inject = ['linuxBootstrap']
+// `slots` is declared next to the service the section renders from. The DSH
+// Mobile host gates slot access on the declared injection set, and its own
+// client plugins declare it too (`dsh-client-ui-responsive`: `slots`, `theme`,
+// ...), so a client that calls `ctx.slots` without declaring it can end up
+// with no slot registry at all.
+export const inject = ['slots', 'linuxBootstrap']
 
 const h = React.createElement
 
@@ -181,12 +186,16 @@ export function apply(ctx, config = {}) {
   if (!linuxBootstrap) throw new Error('The linuxBootstrap service injection is required')
   const order = Number.isFinite(config.order) ? config.order : 80
   const Section = (props) => h(LinuxEnvironmentSection, { ...props, linuxBootstrap })
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
+  const register = () => ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
     id: 'linux-environment',
     order,
     label: () => 'Linux环境',
   }, Section))
+  // The slot registry hands back a disposer; routing it through the context
+  // removes the section on reload or uninstall instead of leaking it.
+  if (typeof ctx.effect === 'function') ctx.effect(register)
+  else register()
 }
 
 export default { name, inject, apply, LinuxEnvironmentSection }
