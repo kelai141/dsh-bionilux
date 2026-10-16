@@ -151,7 +151,7 @@ apt 的 http 方法会因为"切换组后 `getgid()` 不是期望值"而报 `Cou
 
 ## D-013 两个实验性内部插件、Release 分发、共享 glibc Node，默认不启用
 
-**决策**：Linux 环境以**两个外部 Cordis 插件**分发——极小的引导插件（设置入口 + 清单发现 +
+**决策**：Linux 环境以**两个实验性内部 Cordis 插件**分发——极小的引导插件（设置入口 + 清单发现 +
 安装事务 + 更新策略）与运行时插件（安装/健康检查/卸载 + `linux_bash`）。Bionilux、Debian
 minimal rootfs 与 glibc Node.js 作为**版本化 GitHub Release 附件**发布，附 SHA-256/大小，
 不进入 Git，也不使用 Git LFS。glibc Node 作为**应用级共享包**安装一次
@@ -174,3 +174,25 @@ minimal rootfs 与 glibc Node.js 作为**版本化 GitHub Release 附件**发布
 
 **代价**：宿主需要提供真实的插件加载适配器（`linuxPluginHost`）与安全解包/下载 IO；真机端到端
 安装、`isInjected` 行为与 guest DNS 仍需设备验收，本文档不将其记为已验证。
+
+---
+
+## D-014 引导插件由宿主显式装载，不进入 profile 与注入集
+
+**决策**：引导插件以**源码**形式随应用分发（我们自己的实验性内部插件），但**不进入 Cordis
+profile，也不加入注入集**；它只在用户**显式启用** Linux 环境时由宿主 JS 动态装载。运行时插件、
+Bionilux、Debian rootfs 与共享 glibc Node 仍全部作为 Release 附件按需安装。
+
+**理由**：
+1. 引导插件需要**函数型 config**（`dataDir` / `releaseUrl` / `pluginHost` / `downloadAsset` /
+   `extractArchive` / `fetchImpl` / `appVersionProvider`）。YAML 形态的 profile 在结构上无法表达，
+   所以它根本无法被 profile patch 挂载——「在场但不挂载」不需要新增机制。
+2. 因此不需要为「在场但不启用」新增 presence-only 注入类：它会牵动协调仓的逐字节镜像文件
+   （`inject-all.py`、`build-apk-013.ps1`），却没有任何功能收益。
+3. 「存在 ≠ 启用」由宿主的显式决策与 `isInjected()` 只读权威共同保证，与 D-013 的边界一致。
+
+**边界**：未启用时不得注册 `linux_bash`、不得创建 `files/linux-environment`、设置页不得出现入口；
+新 Release 或新应用版本都不会复活被用户移除的注入。
+
+**否掉**：新增 presence-only 注入类（无功能收益 + 跨仓镜像改动）；把函数型配置序列化进 YAML
+（脆弱，且容易与 JS 语义漂移）。
