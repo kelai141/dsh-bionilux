@@ -1,0 +1,171 @@
+/**
+ * DSH Mobile settings client for the external Linux environment.
+ *
+ * This section is only reachable when the user has explicitly added the
+ * bootstrap plugin to the plugin injection directory: it injects the
+ * `linuxBootstrap` service, and a host that never injected the plugin simply has
+ * no such service, so no section is registered.
+ *
+ * Everything here is opt-in. Nothing in this UI enables the Linux runtime on its
+ * own: installing, reinstalling and uninstalling all go through explicit,
+ * confirmed actions on the engine service.
+ */
+import React, { useEffect, useState } from 'react'
+import { EXTERNAL_NOTICE, autoUpdateAvailable, describeVersionStatus } from '../src/status.js'
+
+export const name = 'dsh-linux-bootstrap-client'
+export const inject = ['linuxBootstrap']
+
+const h = React.createElement
+
+function ReleaseLink({ label, url }) {
+  if (typeof url !== 'string' || !url.startsWith('https://github.com/')) return null
+  return h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, `${label} Release`)
+}
+
+export function LinuxEnvironmentSection({ linuxBootstrap }) {
+  const [status, setStatus] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!linuxBootstrap) {
+      setError('Linux bootstrap 服务不可用：插件未注入')
+      return undefined
+    }
+    let active = true
+    const update = (next) => {
+      if (active) setStatus(next)
+    }
+    let unsubscribe
+    try {
+      unsubscribe = linuxBootstrap.subscribe(update)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    }
+    Promise.resolve(linuxBootstrap.status()).then(update).catch((cause) => {
+      if (active) setError(cause instanceof Error ? cause.message : String(cause))
+    })
+    return () => {
+      active = false
+      if (typeof unsubscribe === 'function') unsubscribe()
+      else unsubscribe?.unsubscribe?.()
+    }
+  }, [linuxBootstrap])
+
+  const run = async (action) => {
+    setBusy(true)
+    setError('')
+    try {
+      const next = await action()
+      if (next && typeof next === 'object' && 'installed' in next) setStatus(next)
+      else setStatus(await linuxBootstrap.status())
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const installed = Boolean(status?.installed)
+  const autoUpdateEnabled = status?.autoUpdate ?? false
+  const urls = status?.pluginReleaseUrls ?? {}
+  const confirmInstall = () =>
+    window.confirm(
+      '安装 Linux 环境会下载 Bionilux、Debian minimal rootfs 与共享 glibc Node.js（数百 MB），' +
+        '并在应用私有目录中启用运行时插件。是否继续？',
+    )
+  const confirmRemove = () => window.confirm('卸载会删除已安装的 Linux 运行时与其中的软件包和文件，是否继续？')
+
+  return h(
+    'section',
+    { className: 'linux-environment-settings', 'aria-label': 'Linux环境', 'data-external': 'true' },
+    h('h2', null, 'Linux环境'),
+    h('p', { className: 'linux-environment-notice' }, EXTERNAL_NOTICE),
+    h('p', { role: 'status', 'aria-live': 'polite' }, describeVersionStatus(status)),
+    h(
+      'label',
+      null,
+      h('input', {
+        type: 'checkbox',
+        checked: Boolean(autoUpdateEnabled),
+        disabled: busy || !linuxBootstrap || !autoUpdateAvailable(status),
+        onChange: (event) => run(() => linuxBootstrap.setAutoUpdateEnabled(event.currentTarget.checked)),
+      }),
+      '自动更新（仅在已启用的 Linux 环境的 DSH Mobile 版本变化后检查并安装较新的 Linux 运行时）',
+    ),
+    h(
+      'div',
+      { className: 'linux-environment-actions' },
+      h(
+        'button',
+        {
+          type: 'button',
+          disabled: busy || !linuxBootstrap,
+          onClick: () => run(() => linuxBootstrap.checkForUpdates({ source: 'manual' })),
+        },
+        '手动检查更新',
+      ),
+      h(
+        'button',
+        {
+          type: 'button',
+          disabled: busy || !linuxBootstrap,
+          onClick: () => {
+            if (!confirmInstall()) return undefined
+            return run(() => linuxBootstrap.install({ runtimeId: 'debian-minimal', confirmed: true, activate: true }))
+          },
+        },
+        installed ? '安装 Linux 更新' : '安装 Linux 环境',
+      ),
+      h(
+        'button',
+        {
+          type: 'button',
+          disabled: busy || !linuxBootstrap || !installed,
+          onClick: () => {
+            if (!confirmInstall()) return undefined
+            return run(() => linuxBootstrap.reinstall({ confirmed: true, activate: true }))
+          },
+        },
+        '重新安装',
+      ),
+      h(
+        'button',
+        {
+          type: 'button',
+          disabled: busy || !linuxBootstrap || !installed,
+          onClick: () => {
+            if (!confirmRemove()) return undefined
+            return run(() => linuxBootstrap.uninstall({ confirmed: true }))
+          },
+        },
+        '卸载 Linux 环境',
+      ),
+    ),
+    h(
+      'p',
+      { className: 'linux-environment-links' },
+      '插件下载页：',
+      ReleaseLink({ label: '引导插件', url: urls.bootstrap }),
+      ' ',
+      ReleaseLink({ label: '运行时插件', url: urls.runtime }),
+    ),
+    error ? h('p', { role: 'alert' }, error) : null,
+  )
+}
+
+export function apply(ctx, config = {}) {
+  const linuxBootstrap = ctx.linuxBootstrap
+  if (!linuxBootstrap) throw new Error('The linuxBootstrap service injection is required')
+  const order = Number.isFinite(config.order) ? config.order : 80
+  const Section = (props) => h(LinuxEnvironmentSection, { ...props, linuxBootstrap })
+  ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section',
+    id: 'linux-environment',
+    order,
+    label: () => 'Linux环境',
+  }, Section))
+}
+
+export default { name, inject, apply, LinuxEnvironmentSection }

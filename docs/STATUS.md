@@ -204,3 +204,43 @@ FIFO 模式才失败。
 
 结论：容器能跑完整的内核构建流程（配置、prepare、并行编译、Kbuild 递归），
 `.ko` 未产出是内核树/上游兼容性所致，与 bionilux 无关。
+---
+
+## 11. 外部 Linux 环境系统（插件、发布、更新）
+
+本节记录本轮新增的**两个外部插件**与独立发布链，只写有测试证据的部分。
+
+### 11.1 交付物
+
+| 组件 | 位置 | 状态 |
+|------|------|------|
+| 引导插件 | `packages/linux-bootstrap` | ✅ 包级测试通过（14 项） |
+| 运行时插件 | `packages/linux-runtime` | ✅ 包级测试通过（16 项） |
+| 发布流水线 | `.github/workflows/release.yml` | ✅ YAML 合法；本地复现清单双校验通过 |
+| 清单双校验 | runtime + bootstrap 两个校验器 | ✅ 同一 canonical 清单两侧均接受 |
+| LFS/二进制守卫 | `ci.yml` 与 `release.yml` | ✅ 本地运行通过（无跟踪二进制、无 LFS 指针） |
+| 文档 | `docs/RELEASES.md`、两包 README、ADR-0001、D-013 | ✅ |
+
+### 11.2 已验证行为（`node --test`）
+
+* 引导插件：手动检查只报告不安装；`install/reinstall` 必须 `confirmed:true` 且 `activate:true`；
+  自动更新默认关闭；仅在“已安装 + 仍被注入 + 开关开启 + 应用版本变化”时检查，且每个应用版本最多一次；
+  用户手工移除插件后**永不复活**（持久化 `injectionActivated:false`，自动更新失败关闭）；
+  摘要不符时在宿主激活前拒绝；路线处理器写操作要求 `confirmed:true`。
+* 运行时管理器：安装先暂存后健康检查再原子切换，失败保留旧的 active 实例；
+  共享 Node 以 `nodeAsset.sha256` 为键，同一 Node 归档在系统升级时**不重复下载**，
+  不同归档各装一份；切换前中止在途命令、切换期间新命令排队；卸载只删自身实例与无引用 Node，
+  保留用户工作区；guest 环境不继承宿主 `PREFIX`/`TERMUX_*`/`LD_*`/Node 变量且无静默回退；
+  cwd 在 rootfs 内映射为 guest 路径、相对路径被拒。
+* 本地修正的真实缺陷（均有失败用例→通过证据）：`rename` 覆盖已存在文件在 Windows 上 EPERM；
+  `require('node:fs')` 在 ESM 中不可用；共享 Node 清理只删 `<key>/<arch>` 残留空壳目录；
+  运行清单误把 `manifest.version` 钉死为插件包版本；`_resolveCwd` 只接受 POSIX 拼写。
+
+### 11.3 未验证 / 已知缺口（不得当作已完成）
+
+* **真机端到端安装未验收**：Android 宿主的 `linuxPluginHost.isInjected` 实现、注入目录布局、
+  安全解包器与 DNS 转发均为集成方职责，本轮只在包级以注入 IO 验证。
+* 只发布 arm64；x86_64 未构建、未验证。
+* `linux_bash` 工具面（`defineTool` 注册）未在有 `@deepseek-ai/dsh-tools` 的宿主中实跑。
+* PTY/长会话未验证。
+* Debian rootfs 由 `debootstrap` 从主镜像构建，未固定镜像快照哈希。

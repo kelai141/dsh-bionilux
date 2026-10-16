@@ -57,6 +57,15 @@
 - [x] 冻结健康检查约定（`--print-config` 的 `ROOTFS_ENABLED` / `ROOTFS_LOADER`）
 - [ ] PTY 下的行为未单独验证
 
+## 阶段 7 — 外部插件与独立发布 🟡
+
+- [x] 引导插件 `packages/linux-bootstrap`：清单发现/校验、安装事务、更新策略（包级测试通过）
+- [x] 运行时插件 `packages/linux-runtime`：安装/健康检查/卸载、`linux_bash`、共享 glibc Node
+- [x] 独立发布流水线 `.github/workflows/release.yml` + 清单双校验（见 [RELEASES.md](RELEASES.md)）
+- [x] LFS/二进制守卫进入 CI 与发布流程
+- [ ] Android 宿主适配器（`linuxPluginHost`）与真机端到端安装验收（集成方）
+- [ ] x86_64 构建与验证
+
 ## 决策点
 
 | # | 决策点 | 触发条件 | 结论 |

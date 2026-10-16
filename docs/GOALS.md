@@ -24,7 +24,7 @@
 - ❌ 把 DSH Core、Cordis 或 Node.js 迁移到 Debian。
 - ❌ 修改原有 Agent 执行架构。
 - ❌ 强制用户安装 Linux。
-- ❌ 预装大规模开发工具链（GCC/Python/Node.js）。
+- ❌ 预装大规模开发工具链（GCC/Python）；Debian rootfs 不携带 Node.js。按需安装的 glibc Node 作为应用级共享工具包单独发布，由多个 rootfs 复用。
 - ❌ 维护独立的 Linux 软件仓库。
 - ❌ 要求 Root。
 - ❌ 混用 Bionic 与 glibc 的编译链。

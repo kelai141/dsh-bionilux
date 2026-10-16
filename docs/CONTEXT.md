@@ -8,24 +8,26 @@
 ```
 dsh-mobile-apk (Android app, Bionic)
 │
-├── DSH Core / Node.js / Cordis         ← 始终跑在 Android Bionic 上
+├── DSH Core / Cordis / Node.js         ← 始终跑在 Android Bionic 上
+│   └── Termux Bash                     ← 既有宿主任务，保持不变
 │
-└── Linux Runtime Plugin (Cordis, 可选)
-    │
-    ├── Runtime Manager                 ← 下载/安装/启用/卸载/快照（dsh 侧）
-    │
-    ├── Linux Tool Provider
-    │   └── linux_bash (PTY/Session)    ← dsh 侧
-    │
-    └── Runtime Backend                 ← 本仓库
-        └── bionilux (Rust launcher, Bionic)
-            ├── launcher                src/main.rs, src/launcher/*
-            ├── rootfs 路径语义层        src/launcher/rootfs.rs
-            └── preload hook (glibc)    src/preload/hooks.c
-                    │
-                    ▼
-              Debian Minimal rootfs
-              (/usr/bin/bash, glibc, apt, dpkg …)
+└── Linux Environment System (可选、独立更新)
+    ├── Bootstrap Plugin (Cordis, tiny)
+    │   └── 设置 → Linux环境 / 安装入口 / 自动与手动更新
+    └── Runtime Plugin (按需安装)
+        ├── Runtime Manager             ← 下载/安装/启用/卸载
+        ├── Linux Tool Provider
+        │   └── linux_bash              ← Agent 选择 Debian/glibc 环境
+        ├── Shared glibc Node           ← 应用级一份，各 rootfs 复用
+        └── Runtime Backend             ← 本仓库
+            └── bionilux (Rust launcher, Bionic)
+                ├── launcher            src/main.rs, src/launcher/*
+                ├── rootfs 路径语义层    src/launcher/rootfs.rs
+                └── preload hook (glibc) src/preload/hooks.c
+                        │
+                        ▼
+                  Debian Minimal rootfs
+                  (/usr/bin/bash, glibc, apt, dpkg …)
 ```
 
 ## 2. 术语
@@ -79,14 +81,18 @@ dsh-mobile-apk (Android app, Bionic)
 | **后端可替换** | 换 backend 不改变 `linux_bash` 的接口与快照格式 |
 | **DSH 数据边界** | 默认直通路径包含推导出的 App 私有目录；集成方须审查 HOST_PATHS，不能把 rootfs 当作 DSH Core 数据的安全隔离边界 |
 | **失败不降级** | 健康检查失败时不注册 `linux_bash`，也不破坏已有 PRoot 环境 |
+| **共享 Linux Node** | glibc Node 作为应用级共享工具包安装一次，由各 rootfs 引用；不把 Node 重复写入每个 rootfs，也不把宿主 Bionic Node 伪装成 glibc Node |
 | **不混用编译链** | Bionic 与 glibc 的工具链不混用；launcher 用 bionic 编译，preload 用 glibc 编译 |
 
-## 5. 权限模型（引用，不在本仓库实现）
+## 5. 权限与安全边界（引用，不在本仓库实现）
 
-| DSH 权限模式 | `linux_bash` |
-|--------------|--------------|
-| read-only | 禁止 |
-| workspace-write | 禁止 |
-| danger-full-access | 允许 |
+`linux_bash` 的可用性由 DSH 工具权限策略和插件健康状态共同决定；**Linux rootfs 不是安全沙箱**，也不提供内核级隔离。它只提供 Debian/glibc 软件包和运行环境支持。
 
-> RootFS 的用途是**软件包环境隔离**，不是内核级安全沙箱。快照用于状态恢复，不是安全边界。
+| 概念 | 语义 |
+|------|------|
+| Termux Bash | Android/Bionic 宿主环境，继续承载 DSH 既有宿主任务 |
+| Linux Bash | Debian/glibc guest 用户空间，供 Agent 选择 Linux 运行环境；失败不得静默切回 Termux |
+| guest root | rootfs 内的用户身份模拟，不等于 Android/手机 Root |
+| host-path | 明确配置的宿主路径直通，不是安全隔离边界 |
+
+> 工具描述必须向 Agent 解释 Termux Bash 与 Linux Bash 的用途差异；不能把 Linux Bash 宣传成沙箱或 Root 权限。

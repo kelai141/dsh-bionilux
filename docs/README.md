@@ -19,6 +19,8 @@
 | [DECISIONS.md](DECISIONS.md) | 决策记录与理由（追加式） | 追加式 |
 | [PERF.md](PERF.md) | 实测性能数据与分解 | 数据更新 |
 | [UPSTREAM.md](UPSTREAM.md) | fork 基点、patch 清单、上游同步流程 | 中期 |
+| [adr/0001-independent-mobile-linux-runtime.md](adr/0001-independent-mobile-linux-runtime.md) | 独立发布、共享 glibc Node 与默认禁用边界 | 长期 |
+| [RELEASES.md](RELEASES.md) | 发布物清单、清单格式、完整性校验与更新策略 | 长期 |
 
 ## 本 fork 与上游的边界
 
@@ -35,6 +37,15 @@
 - Cordis 插件本体、`linux_bash` 工具的注册与 Guard 权限模型。
 - rootfs 下载/校验/安装的 UI。
 - PTY 会话管理器（host 回归与 Android PTY 验收应分别记录，不推断设备兼容性）。
+
+**本 fork 现在额外提供（两个外部插件，独立于应用发布）：**
+
+- `packages/linux-bootstrap`：外部引导插件（设置入口、清单发现与校验、安装事务、更新策略）。
+- `packages/linux-runtime`：外部运行时插件（安装/健康检查/卸载、`linux_bash`、共享 glibc Node）。
+- `.github/workflows/release.yml` + [RELEASES.md](RELEASES.md)：版本化 Release 资产与清单，不使用 Git LFS。
+
+> 两个插件**默认不启用**：任何应用更新或 Linux 发布都不会写入插件注入目录或启用插件；
+> 只有用户显式注入并确认安装后，Linux 环境才存在。
 
 ## 快速开始
 
