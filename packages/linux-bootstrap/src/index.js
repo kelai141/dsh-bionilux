@@ -157,6 +157,12 @@ export function createMobileBootstrap(options = {}) {
     fetchImpl = globalThis.fetch,
     cacheDir = dataDir ? path.join(dataDir, 'cache') : undefined,
     stagingDirectory = options.stagingDirectory ?? options.pluginDirectory ?? (dataDir ? path.join(dataDir, 'staging', 'runtime-plugin') : undefined),
+    // Where the host stages a bundle it fetched itself (D-015): `<root>/<sha256>/`.
+    // A directory that exists but does not match the manifest is an error, never a
+    // cache miss; `requireStagedBundle` additionally forbids falling back to a
+    // download when a host owns byte fetching.
+    hostStagingRoot = options.hostStagingRoot ?? (dataDir ? path.join(dataDir, 'staging') : undefined),
+    requireStagedBundle = options.requireStagedBundle === true,
     runtimePluginConfig = {},
     autoUpdateEnabled,
     onChange,
@@ -314,6 +320,8 @@ export function createMobileBootstrap(options = {}) {
       result = await installVerifiedPluginBundle({
         asset: manifest.plugins.runtime,
         destinationRoot: pluginRoot,
+        hostStagingRoot,
+        requireStagedBundle,
         downloadAsset,
         extractArchive,
         fetchImpl,
