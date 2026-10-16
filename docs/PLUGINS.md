@@ -27,8 +27,9 @@ flowchart TD
 ```
 
 * **host** 是 Android/壳（Bionic、应用私有目录）；**guest** 是 Debian 用户空间。
-* 两个插件都是**我们自己的内部插件**：随应用放入内置（hard）插件目录，但**默认不启用**——
-  存在 ≠ 启用。
+* 两个插件都是**我们自己的实验性内部插件**：**引导插件**随应用放入内置（hard）插件目录、
+  但**默认不启用**（存在 ≠ 启用）；**运行时插件**与 Bionilux、rootfs、glibc Node 一样按需取自
+  Release，不随应用分发。
 * `linux-release.json`、rootfs、Node、Bionilux 全部是 **Release 附件**，不进 Git、不进 LFS。
 * 壳只提供 `linuxPluginHost` 适配器（加载/卸载插件目录、`isInjected`），不复制下载与解包事务。
 
@@ -140,3 +141,7 @@ flowchart TD
 
 真机端到端安装与 `isInjected` 行为属集成方；x86_64 未构建未验证；PTY/长会话未验证；
 Debian rootfs 未固定镜像快照哈希。见 [STATUS.md](STATUS.md) §11。
+
+两个插件**尚未**按注入链登记进 DSH Mobile 的内置（hard）插件目录——本仓是插件源码真源，登记与
+装载仍在进行中；引导插件需要函数型 config，无法被 profile patch 挂载，因此由宿主在用户显式启用时
+动态装载（见 [DECISIONS.md](DECISIONS.md) D-014）。

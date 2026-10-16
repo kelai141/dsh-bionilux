@@ -206,7 +206,7 @@ FIFO 模式才失败。
 `.ko` 未产出是内核树/上游兼容性所致，与 bionilux 无关。
 ---
 
-## 11. 外部 Linux 环境系统（插件、发布、更新）
+## 11. 实验性内部 Linux 环境系统（插件、发布、更新）
 
 本节记录本轮新增的**两个实验性内部插件**与独立发布链，只写有测试证据的部分。
 
@@ -214,8 +214,9 @@ FIFO 模式才失败。
 
 | 组件 | 位置 | 状态 |
 |------|------|------|
-| 引导插件 | `packages/linux-bootstrap` | ✅ 包级测试通过（14 项） |
-| 运行时插件 | `packages/linux-runtime` | ✅ 包级测试通过（16 项） |
+| 引导插件 | `packages/linux-bootstrap` | ✅ 包级测试通过（24 项） |
+| 运行时插件 | `packages/linux-runtime` | ✅ 包级测试通过（15 项；其中 1 项 POSIX 专用，在 Windows 上跳过） |
+| 客户端注册契约 | `packages/linux-bootstrap/test/client.test.mjs` | ✅ 6 项（`inject` 含 `slots`、`{name,id,order,label}` 形态、disposer 归 `ctx.effect`、无 `effect` 回落、缺服务失败） |
 | 发布流水线 | `.github/workflows/release.yml` | ✅ YAML 合法；本地复现清单双校验通过 |
 | 清单双校验 | runtime + bootstrap 两个校验器 | ✅ 同一 canonical 清单两侧均接受 |
 | LFS/二进制守卫 | `ci.yml` 与 `release.yml` | ✅ 本地运行通过（无跟踪二进制、无 LFS 指针） |
@@ -234,10 +235,15 @@ FIFO 模式才失败。
   cwd 在 rootfs 内映射为 guest 路径、相对路径被拒。
 * 本地修正的真实缺陷（均有失败用例→通过证据）：`rename` 覆盖已存在文件在 Windows 上 EPERM；
   `require('node:fs')` 在 ESM 中不可用；共享 Node 清理只删 `<key>/<arch>` 残留空壳目录；
-  运行清单误把 `manifest.version` 钉死为插件包版本；`_resolveCwd` 只接受 POSIX 拼写。
+  运行清单误把 `manifest.version` 钉死为插件包版本；`_resolveCwd` 只接受 POSIX 拼写；
+  客户端半边调用 `ctx.slots` 却未声明 `slots`——在按注入集收敛槽位服务的宿主里，设置入口会**静默
+  不出现**（已声明 `slots` 并把 disposer 交 `ctx.effect`，另有 6 项契约测试钉住）。
 
 ### 11.3 未验证 / 已知缺口（不得当作已完成）
 
+* **两个插件尚未登记进 APK 的内置（hard）插件目录**：本仓是插件源码真源，把包按注入链正式登记进
+  `kelai141/dsh-mobile-apk` 仍在进行中（该步骤不改变「默认不启用」）。引导插件需要函数型 config，
+  结构上无法被 profile patch 挂载，故由宿主在用户显式启用时动态装载（见 D-014）。
 * **真机端到端安装未验收**：Android 宿主的 `linuxPluginHost.isInjected` 实现、注入目录布局、
   安全解包器与 DNS 转发均为集成方职责，本轮只在包级以注入 IO 验证。
 * 只发布 arm64；x86_64 未构建、未验证。

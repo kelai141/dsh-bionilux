@@ -67,8 +67,12 @@ bionilux --rootfs "$R" /bin/sh -c 'cat /data/data/<pkg>/files/app-state.json'
 ## Experimental DSH Mobile plugins and updates
 
 The Linux environment is an **experimental, opt-in system built from our own
-internal plugins**. The plugins ship in the built-in (hard) plugin directory but
-are not enabled by default — presence is not activation. Neither installing an
+internal plugins**. The bootstrap is distributed with the app in the built-in
+(hard) plugin directory; it is not enabled by default — presence is not
+activation — and it is not mounted in the Cordis profile either, so the host
+loads it only when the user explicitly enables the system (`docs/DECISIONS.md`
+D-014). The runtime plugin arrives the same way everything else does, from a
+Release. Neither installing an
 APK update nor publishing a new Linux Release enables them, and neither
 re-enables one the user turned off. The lightweight bootstrap and runtime plugins
 are separately published as version-pinned GitHub Release assets described by

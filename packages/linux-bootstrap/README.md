@@ -7,8 +7,12 @@ is independent of the DSH Mobile app version.
 
 Both plugins in this system are **our own experimental internal plugins**:
 
-* They ship in the built-in (hard) plugin directory, but they are **not enabled
-  by default** — presence is not activation.
+* The bootstrap is distributed with the app in the built-in (hard) plugin
+  directory, but it is **not enabled by default** — presence is not activation.
+  It is not mounted in the Cordis profile either: the host loads it only once the
+  user explicitly enables the Linux environment (see `docs/DECISIONS.md` D-014).
+* The runtime plugin, Bionilux, the rootfs and the shared glibc Node are **not**
+  distributed with the app: they are fetched on demand from a versioned Release.
 * Installing a new DSH Mobile APK or publishing a new Linux release never enables
   a plugin, and never re-enables one the user turned off.
 * The Linux environment only becomes usable after the user explicitly enables the
