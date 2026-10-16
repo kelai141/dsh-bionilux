@@ -64,16 +64,16 @@ bionilux --rootfs "$R" --print-config | grep HOST_PATHS
 bionilux --rootfs "$R" /bin/sh -c 'cat /data/data/<pkg>/files/app-state.json'
 ```
 
-## External DSH Mobile plugins and updates
+## Experimental DSH Mobile plugins and updates
 
-The Linux environment is an **external, opt-in plugin system**, not part of the
-DSH Mobile APK's default plugin injection directory. Neither installing an APK
-update nor publishing a new Linux Release automatically injects or enables
-these plugins. The lightweight bootstrap and runtime plugin are separately
-published as version-pinned GitHub Release assets in `linux-release.json`; the
-user must explicitly operate the plugin injection directory to add/enable the
-bootstrap, and explicitly confirm runtime installation before `linux_bash` is
-registered. Both plugins remain disabled by default.
+The Linux environment is an **experimental, opt-in system built from our own
+internal plugins**. The plugins ship in the built-in (hard) plugin directory but
+are not enabled by default — presence is not activation. Neither installing an
+APK update nor publishing a new Linux Release enables them, and neither
+re-enables one the user turned off. The lightweight bootstrap and runtime plugins
+are separately published as version-pinned GitHub Release assets described by
+`linux-release.json`; the user enables the system and explicitly confirms runtime
+installation before `linux_bash` is registered.
 
 The Linux system has its own version lifecycle. Manual update checks are
 available; automatic checking is only eligible for an already activated Linux

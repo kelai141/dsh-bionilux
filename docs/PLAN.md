@@ -57,7 +57,7 @@
 - [x] 冻结健康检查约定（`--print-config` 的 `ROOTFS_ENABLED` / `ROOTFS_LOADER`）
 - [ ] PTY 下的行为未单独验证
 
-## 阶段 7 — 外部插件与独立发布 🟡
+## 阶段 7 — 实验性内部插件与独立发布 🟡
 
 - [x] 引导插件 `packages/linux-bootstrap`：清单发现/校验、安装事务、更新策略（包级测试通过）
 - [x] 运行时插件 `packages/linux-runtime`：安装/健康检查/卸载、`linux_bash`、共享 glibc Node

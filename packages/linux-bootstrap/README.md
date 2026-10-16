@@ -1,18 +1,18 @@
 # @dsh-android/linux-bootstrap
 
-The **external**, opt-in entry point for the DSH Mobile Linux environment. It is
-deliberately small: it discovers releases, verifies the runtime package before
+The **experimental**, opt-in entry point for the DSH Mobile Linux environment. It
+is deliberately small: it discovers releases, verifies the runtime package before
 staging it, and exposes status/actions to the mobile settings client. Its version
 is independent of the DSH Mobile app version.
 
-Both plugins in this system are external:
+Both plugins in this system are **our own experimental internal plugins**:
 
-* They are **not** injected or enabled by default, and are not part of any
-  default profile or snapshot.
-* Installing a new DSH Mobile APK or publishing a new Linux release never adds
-  anything to the plugin injection directory and never enables a plugin.
-* A Linux environment only exists after the user explicitly adds the bootstrap
-  plugin and then explicitly confirms an install.
+* They ship in the built-in (hard) plugin directory, but they are **not enabled
+  by default** — presence is not activation.
+* Installing a new DSH Mobile APK or publishing a new Linux release never enables
+  a plugin, and never re-enables one the user turned off.
+* The Linux environment only becomes usable after the user explicitly enables the
+  system and confirms an install.
 
 ## Engine plugin
 
@@ -115,7 +115,7 @@ dead surface.
 
 `@dsh-android/linux-bootstrap/client` registers the `settings.section` slot with
 id `linux-environment` and label `Linux环境`. The section states up front that
-the plugin is external and disabled by default, shows the installed/available
+the plugin is experimental and disabled by default, shows the installed/available
 versions and the app-version baseline, offers the persisted 自动更新 toggle and
 手动检查更新, install/reinstall/uninstall (each with an explicit confirmation), and
 links to both plugin Release pages from the manifest.

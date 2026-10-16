@@ -21,7 +21,7 @@
 | [UPSTREAM.md](UPSTREAM.md) | fork 基点、patch 清单、上游同步流程 | 中期 |
 | [adr/0001-independent-mobile-linux-runtime.md](adr/0001-independent-mobile-linux-runtime.md) | 独立发布、共享 glibc Node 与默认禁用边界 | 长期 |
 | [RELEASES.md](RELEASES.md) | 发布物清单、清单格式、完整性校验与更新策略 | 长期 |
-| [PLUGINS.md](PLUGINS.md) | 两个外部插件的挂载、安装、执行与更新流程图设计 | 长期 |
+| [PLUGINS.md](PLUGINS.md) | 两个实验性内部插件的挂载、安装、执行与更新流程图设计 | 长期 |
 
 ## 本 fork 与上游的边界
 
@@ -39,14 +39,15 @@
 - rootfs 下载/校验/安装的 UI。
 - PTY 会话管理器（host 回归与 Android PTY 验收应分别记录，不推断设备兼容性）。
 
-**本 fork 现在额外提供（两个外部插件，独立于应用发布）：**
+**本 fork 现在额外提供（两个实验性内部插件，独立于应用发布）：**
 
-- `packages/linux-bootstrap`：外部引导插件（设置入口、清单发现与校验、安装事务、更新策略）。
-- `packages/linux-runtime`：外部运行时插件（安装/健康检查/卸载、`linux_bash`、共享 glibc Node）。
+- `packages/linux-bootstrap`：实验性引导插件（设置入口、清单发现与校验、安装事务、更新策略）。
+- `packages/linux-runtime`：实验性运行时插件（安装/健康检查/卸载、`linux_bash`、共享 glibc Node）。
 - `.github/workflows/release.yml` + [RELEASES.md](RELEASES.md)：版本化 Release 资产与清单，不使用 Git LFS。
 
-> 两个插件**默认不启用**：任何应用更新或 Linux 发布都不会写入插件注入目录或启用插件；
-> 只有用户显式注入并确认安装后，Linux 环境才存在。
+> 两个插件都是**我们自己的内部插件**：随应用放入内置（hard）插件目录，但**默认不启用**
+> （存在 ≠ 启用）；任何应用更新或 Linux 发布都不会启用它们。只有用户显式启用并确认安装后，
+> Linux 环境才可用。
 
 ## 快速开始
 

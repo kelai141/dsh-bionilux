@@ -1,12 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { EXTERNAL_NOTICE, autoUpdateAvailable, describeVersionStatus } from '../src/status.js'
+import { EXPERIMENTAL_NOTICE, autoUpdateAvailable, describeVersionStatus } from '../src/status.js'
 
-test('the section states that the plugin is external and not enabled by default', () => {
-  assert.match(EXTERNAL_NOTICE, /external/)
-  assert.match(EXTERNAL_NOTICE, /默认不启用/)
-  assert.match(EXTERNAL_NOTICE, /不会自动启用/)
+test('the section states that the plugin is experimental and not enabled by default', () => {
+  assert.match(EXPERIMENTAL_NOTICE, /experimental/)
+  assert.match(EXPERIMENTAL_NOTICE, /内部插件/)
+  assert.match(EXPERIMENTAL_NOTICE, /内置（hard）/)
+  assert.match(EXPERIMENTAL_NOTICE, /默认不启用/)
+  assert.match(EXPERIMENTAL_NOTICE, /不会自动启用/)
 })
 
 test('an uninstalled environment is described as opt-in, not as an error', () => {
@@ -29,7 +31,7 @@ test('the installed state names the Linux version and the app-version baseline',
   assert.equal(text.includes('自动更新已停止'), false)
 })
 
-test('a plugin missing from the injection directory is reported as stopped, not silently healthy', () => {
+test('a plugin removed or disabled by the user is reported as stopped, not silently healthy', () => {
   const text = describeVersionStatus({
     installed: true,
     version: '1.1.0',
@@ -37,7 +39,7 @@ test('a plugin missing from the injection directory is reported as stopped, not 
     installedSystemMobileVersion: '0.15.0',
     injectionActivated: false,
   })
-  assert.match(text, /插件已不在注入目录中，自动更新已停止/)
+  assert.match(text, /插件已被移除或停用，自动更新已停止/)
 })
 
 test('an available update and a blocked downgrade are both surfaced', () => {

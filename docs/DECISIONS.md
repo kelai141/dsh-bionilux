@@ -149,7 +149,7 @@ apt 的 http 方法会因为"切换组后 `getgid()` 不是期望值"而报 `Cou
 必须放在 App 自己的 `files/`（`app_data_file`）下——这也是生产布局。
 ---
 
-## D-013 两个外部插件、Release 分发、共享 glibc Node，默认不启用
+## D-013 两个实验性内部插件、Release 分发、共享 glibc Node，默认不启用
 
 **决策**：Linux 环境以**两个外部 Cordis 插件**分发——极小的引导插件（设置入口 + 清单发现 +
 安装事务 + 更新策略）与运行时插件（安装/健康检查/卸载 + `linux_bash`）。Bionilux、Debian
@@ -165,9 +165,9 @@ minimal rootfs 与 glibc Node.js 作为**版本化 GitHub Release 附件**发布
 3. 每个 rootfs 各装一份 Node 会重复数百 MB；以内容摘要为键的共享安装既去重又能在系统
    升级时复用同一份 Node。
 
-**边界（不可默示违反）**：两个插件都是 external、opt-in、默认禁用。应用更新或 Linux 新版本
-发布**绝不**写入插件注入目录或启用插件；宿主 `linuxPluginHost.isInjected()` 是唯一权威，
-用户手工移除后自动更新失败关闭，只有显式安装才能恢复。
+**边界（不可默示违反）**：两个插件都是**我们自己的内部插件**，写进内置（hard）插件目录，
+但默认不启用（存在 ≠ 启用）。应用更新或 Linux 新版本发布都不会启用它们；宿主
+`linuxPluginHost.isInjected()` 是唯一权威，用户手工移除后自动更新失败关闭，只有显式安装才能恢复。
 
 **否掉**：把插件打进默认 profile/快照（会与“默认不启用”冲突）；用 LFS 存 rootfs
 （配额与克隆成本不可接受）；每个 rootfs 内 `apt install nodejs`（重复且与宿主 Node 混淆）。

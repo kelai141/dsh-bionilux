@@ -1,13 +1,14 @@
 # @dsh-android/linux-runtime
 
-The **external** DSH Mobile Linux capability plugin: it installs, health-checks
-and runs the Debian/glibc environment, and it owns the Agent-facing
-`linux_bash` tool.
+The **experimental** DSH Mobile Linux capability plugin: it installs,
+health-checks and runs the Debian/glibc environment, and it owns the
+Agent-facing `linux_bash` tool.
 
-This plugin is not part of DSH Mobile and is **not enabled by default**. Nothing
-here adds itself to the plugin injection directory, and publishing a new Linux
-release never activates it. Only an explicit, user-confirmed install (through the
-bootstrap plugin's settings section) enables the runtime.
+This is our own internal plugin. It ships in the built-in (hard) plugin
+directory, but it is **not enabled by default**: presence is not activation.
+Nothing here activates itself, and publishing a new Linux release never turns it
+on. Only an explicit, user-confirmed install (through the bootstrap plugin's
+settings section) enables the runtime.
 
 ## What this package owns
 

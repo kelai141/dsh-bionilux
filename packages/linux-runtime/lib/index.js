@@ -1,10 +1,10 @@
 /**
- * @dsh-android/linux-runtime — the external DSH Mobile Linux capability plugin.
+ * @dsh-android/linux-runtime — the experimental DSH Mobile Linux capability plugin.
  *
- * This plugin is **not** injected or enabled by default: DSH Mobile ships no
- * default profile entry for it, and publishing a Linux release never writes the
- * plugin injection directory. Only an explicit user action (adding the plugin
- * and confirming the install) loads it.
+ * This is our own internal plugin: it ships in the built-in (hard) plugin
+ * directory, but it is **not enabled by default** — presence is not activation.
+ * Only an explicit user action (enabling the system and confirming the install)
+ * loads and activates it.
  *
  * It owns the runtime lifecycle (install, reinstall, uninstall, health) and the
  * Agent-facing `linux_bash` tool. Bionilux, the Debian minimal rootfs and the

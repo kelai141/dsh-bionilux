@@ -75,7 +75,7 @@ function availableRuntimes(state) {
 function statusShape(state, mobileVersion, operation, packageVersion) {
   return Object.freeze({
     experimental: true,
-    external: true,
+    experimental: true,
     enabledByDefault: false,
     sandboxed: false,
     installed: Boolean(state.installedLinuxVersion),
@@ -442,7 +442,7 @@ export function createMobileBootstrap(options = {}) {
 
   const service = {
     name,
-    external: true,
+    experimental: true,
     enabledByDefault: false,
     ready,
     status: async () => { await ready; await updateMobileVersion().catch(() => {}); return emit() },

@@ -1,14 +1,14 @@
 /**
- * Presentation strings for the external Linux environment settings section.
+ * Presentation strings for the experimental Linux environment settings section.
  *
  * Kept free of React so the wording and the state derivation can be tested
  * without a DOM (the release gate runs `node --test` with no UI dependencies).
  */
 
-/** The opt-in statement shown at the top of the section. */
-export const EXTERNAL_NOTICE =
-  '外部插件（external）：不属于 DSH Mobile 本体，默认不启用。' +
-  '只有你手动把插件放入注入目录并明确安装后，Linux 环境才会启用；' +
+/** The experimental / not-enabled-yet statement shown at the top of the section. */
+export const EXPERIMENTAL_NOTICE =
+  '实验性插件（experimental）：这是我们自己的内部插件，已放入内置（hard）插件目录，但默认不启用。' +
+  '只有你明确执行安装后，Linux 环境才会启用；' +
   '应用更新或 Linux 新版本发布都不会自动启用它。'
 
 /**
@@ -22,14 +22,14 @@ export function describeVersionStatus(status) {
   if (!status.installed) {
     return status.updateBlocked
       ? '尚未安装 Linux 环境；发现较旧的 Linux 版本，已阻止降级'
-      : '尚未安装 Linux 环境（外部插件，默认不启用）'
+      : '尚未安装 Linux 环境（实验性插件，默认不启用）'
   }
   const installed = `已安装 Linux 运行时 ${status.version}`
   const appVersion = status.mobileVersion ? `；当前 DSH Mobile ${status.mobileVersion}` : ''
   const baseline = status.installedSystemMobileVersion
     ? `（安装时 DSH Mobile ${status.installedSystemMobileVersion}）`
     : ''
-  const activation = status.injectionActivated ? '' : '；插件已不在注入目录中，自动更新已停止'
+  const activation = status.injectionActivated ? '' : '；插件已被移除或停用，自动更新已停止'
   if (status.updateAvailable) {
     return `${installed}${appVersion}${baseline}；可更新至 ${status.availableVersion}${activation}`
   }

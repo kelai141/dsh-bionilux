@@ -40,7 +40,7 @@ jobs:
           fi
 
   linux-environment-plugins:
-    # The two external plugin packages and the release manifest validator are
+    # The two experimental plugin packages and the release manifest validator are
     # pure Node.js; they are gated on every PR so the install/update contract
     # (checksums, opt-in activation, shared Node reuse) cannot regress.
     name: linux environment plugins

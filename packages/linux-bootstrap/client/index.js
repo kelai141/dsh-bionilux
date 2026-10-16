@@ -1,17 +1,17 @@
 /**
- * DSH Mobile settings client for the external Linux environment.
+ * DSH Mobile settings client for the experimental Linux environment.
  *
- * This section is only reachable when the user has explicitly added the
- * bootstrap plugin to the plugin injection directory: it injects the
- * `linuxBootstrap` service, and a host that never injected the plugin simply has
- * no such service, so no section is registered.
+ * This section is only reachable when the Linux bootstrap plugin is present and
+ * enabled. The plugins ship in the built-in (hard) plugin directory but are not
+ * enabled by default: presence is not activation, so the section appears only
+ * after the user turns the system on.
  *
  * Everything here is opt-in. Nothing in this UI enables the Linux runtime on its
  * own: installing, reinstalling and uninstalling all go through explicit,
  * confirmed actions on the engine service.
  */
 import React, { useEffect, useState } from 'react'
-import { EXTERNAL_NOTICE, autoUpdateAvailable, describeVersionStatus } from '../src/status.js'
+import { EXPERIMENTAL_NOTICE, autoUpdateAvailable, describeVersionStatus } from '../src/status.js'
 
 export const name = 'dsh-linux-bootstrap-client'
 export const inject = ['linuxBootstrap']
@@ -82,9 +82,9 @@ export function LinuxEnvironmentSection({ linuxBootstrap }) {
 
   return h(
     'section',
-    { className: 'linux-environment-settings', 'aria-label': 'Linux环境', 'data-external': 'true' },
+    { className: 'linux-environment-settings', 'aria-label': 'Linux环境', 'data-experimental': 'true' },
     h('h2', null, 'Linux环境'),
-    h('p', { className: 'linux-environment-notice' }, EXTERNAL_NOTICE),
+    h('p', { className: 'linux-environment-notice' }, EXPERIMENTAL_NOTICE),
     h('p', { role: 'status', 'aria-live': 'polite' }, describeVersionStatus(status)),
     runtimes.length > 1
       ? h(

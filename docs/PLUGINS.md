@@ -1,6 +1,6 @@
 # PLUGINS — 挂载、安装与运行设计
 
-本文件是本轮实现的**设计记录**：两个外部插件的边界、安装/启用流程、挂载与执行路径、
+本文件是本轮实现的**设计记录**：两个实验性内部插件的边界、安装/启用流程、挂载与执行路径、
 更新策略，以及“默认不启用”不变量。图与代码一一对应；实现细节见
 [RELEASES.md](RELEASES.md) 与两个包的 README。
 
@@ -10,11 +10,11 @@
 flowchart TD
     A[DSH Mobile 壳 Bionic] --> B[DSH Core / Cordis / Bionic Node.js]
     A --> C[Termux Bash 基座 保持不变]
-    A --> D[插件注入目录 用户所有]
+    A --> D[内置 hard 插件目录 随应用分发]
 
-    D -->|用户显式加入| E[外部引导插件 linux-bootstrap]
-    E --> F[设置 → Linux环境]
-    E -->|confirmed + activate| G[外部运行时插件 linux-runtime]
+    D -->|已放入但默认未启用| E[实验性引导插件 linux-bootstrap]
+    E --> F[用户启用后 设置 → Linux环境]
+    E -->|confirmed + activate| G[实验性运行时插件 linux-runtime]
 
     G --> H[Runtime Manager 安装/健康/卸载]
     G --> I[linux_bash 仅在健康时注册]
@@ -27,6 +27,8 @@ flowchart TD
 ```
 
 * **host** 是 Android/壳（Bionic、应用私有目录）；**guest** 是 Debian 用户空间。
+* 两个插件都是**我们自己的内部插件**：随应用放入内置（hard）插件目录，但**默认不启用**——
+  存在 ≠ 启用。
 * `linux-release.json`、rootfs、Node、Bionilux 全部是 **Release 附件**，不进 Git、不进 LFS。
 * 壳只提供 `linuxPluginHost` 适配器（加载/卸载插件目录、`isInjected`），不复制下载与解包事务。
 
@@ -34,8 +36,8 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[应用更新 / Linux 新版本发布] --> B[不写注入目录 不启用插件]
-    C[用户把引导插件放入注入目录] --> D[linuxBootstrap 服务出现]
+    A[应用更新 / Linux 新版本发布] --> B[不自动启用插件]
+    C[用户在设置中启用 Linux 环境] --> D[linuxBootstrap 服务可用]
     D --> E[设置页注册 Linux环境 入口]
     E --> F[手动检查更新 仅报告]
     F --> G{用户确认安装<br/>confirmed + activate}
