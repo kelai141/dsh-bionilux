@@ -99,11 +99,17 @@ The package exports `LINUX_ENVIRONMENT_ROUTES` and `createRouteHandlers(service)
 so the Android shell can expose its existing authenticated route style without
 re-implementing the transaction:
 
-`GET /api/android/linux-environment/status`, `POST …/check`, `POST …/auto-check`,
+`GET /api/android/linux-environment/status`, `POST …/check`,
 `POST …/install`, `POST …/reinstall`, `POST …/uninstall`,
 `POST …/auto-update-on`, `POST …/auto-update-off`.
 
 Mutating actions require `{"confirmed": true}` in the body.
+
+`POST …/auto-check` (source `mobile-version-change`) is provided as an **optional**
+convenience: a host that triggers the automatic check when the `linuxBootstrap`
+service becomes ready calls `checkForUpdates({ source: 'mobile-version-change' })`
+directly and needs no route. Do not expose both paths; the duplicate would be a
+dead surface.
 
 ## Mobile settings client
 
