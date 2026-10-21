@@ -31,11 +31,35 @@ ctx.plugin(linuxBootstrap, {
   extractArchive,          // required: safe extractor (no shell tar)
   appVersionProvider,      // DSH Mobile version (function, getVersion(), or string)
   managerProvider,         // optional: build the manager after the runtime plugin loads
+  arch,                    // optional: 'arm64' or 'x64'; defaults to process.arch
 })
 ```
 
 `apply(ctx, config)` publishes the service as `ctx.provide('linuxBootstrap', service)`
 and returns it.
+
+### Architecture and runtime defaults
+
+The host architecture comes from the explicit arch option, or from process.arch
+when it is omitted. Only arm64 and x64 are accepted; any other host architecture
+raises an explicit error rather than guessing.
+
+The canonical runtime IDs are:
+
+| Host | Default runtime ID |
+|---|---|
+| arm64 | debian-minimal |
+| x64 | debian-minimal-x64 |
+
+status() reports architecture, defaultRuntimeId, runtimeId and only the runtimes
+available for this host. An install, reinstall or automatic update without an
+explicit ID selects that architecture's canonical ID. An explicit ID that
+belongs to another architecture is rejected before host activation, and a
+manifest without a runtime for this architecture fails closed instead of
+falling back to another architecture. A manifest must use unique IDs. Custom IDs
+remain valid when explicitly selected; an omitted ID requires the host's default
+to be present. The historical `DEFAULT_RUNTIME_ID` export remains an ARM64-only
+compatibility constant; new callers should use `defaultRuntimeIdForArch()`.
 
 ### Required IO
 
@@ -86,6 +110,9 @@ re-adding it, and only an explicit install can bring it back.
 `installedSystemMobileVersion`, `autoUpdate`, `availableVersion`,
 `updateAvailable`, `updateBlocked`, `busy`, `operation`, `runtime`,
 `injectionActivated`, `enabled`, `pluginReleaseUrls`, `lastCheckAt` and `error`.
+
+The status object also includes architecture, defaultRuntimeId, runtimeId and
+the host-architecture runtimes list.
 
 ## Update policy
 

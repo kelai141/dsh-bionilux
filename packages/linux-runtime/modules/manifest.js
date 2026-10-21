@@ -2,6 +2,30 @@ export const MANIFEST_SCHEMA_VERSION = 1;
 export const PACKAGE_VERSION = '0.5.0';
 export const MIN_MOBILE_VERSION = '0.14.0';
 export const SUPPORTED_ARCHITECTURES = new Set(['arm64', 'x64']);
+export const DEFAULT_RUNTIME_IDS = Object.freeze({
+  arm64: 'debian-minimal',
+  x64: 'debian-minimal-x64',
+});
+
+/** Resolve the architecture explicitly, or from the Node host when omitted. */
+export function resolveHostArchitecture(value) {
+  if (value !== undefined) {
+    if (!SUPPORTED_ARCHITECTURES.has(value)) {
+      throw new TypeError('arch must be arm64 or x64');
+    }
+    return value;
+  }
+  if (SUPPORTED_ARCHITECTURES.has(process.arch)) return process.arch;
+  throw new Error(
+    `Unsupported host architecture ${process.arch}; pass arch: 'arm64' or 'x64' explicitly`,
+  );
+}
+
+export function defaultRuntimeIdForArch(arch) {
+  const id = DEFAULT_RUNTIME_IDS[arch];
+  if (!id) throw new TypeError('arch must be arm64 or x64');
+  return id;
+}
 /** Manifest versions are semantic versions of the Linux release, not of this package. */
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 
@@ -143,6 +167,12 @@ export function selectRuntime(manifest, runtimeId, architecture) {
     (candidate) => candidate.id === runtimeId && candidate.architecture === architecture,
   );
   if (!runtime) {
+    const otherArchitecture = validated.runtimes.find((candidate) => candidate.id === runtimeId);
+    if (otherArchitecture) {
+      throw new Error(
+        `runtime ${runtimeId} targets ${otherArchitecture.architecture}, but this host is ${architecture}`,
+      );
+    }
     const available = validated.runtimes
       .filter((candidate) => candidate.architecture === architecture)
       .map((candidate) => candidate.id)

@@ -14,7 +14,16 @@
 import { createManager, LinuxRuntimeManager, ExecutionGate } from '../modules/manager.js';
 
 export { createManager, LinuxRuntimeManager, ExecutionGate };
-export { selectRuntime, validateManifest, validateAsset, MANIFEST_SCHEMA_VERSION, PACKAGE_VERSION } from '../modules/manifest.js';
+export {
+  selectRuntime,
+  validateManifest,
+  validateAsset,
+  MANIFEST_SCHEMA_VERSION,
+  PACKAGE_VERSION,
+  DEFAULT_RUNTIME_IDS,
+  defaultRuntimeIdForArch,
+  resolveHostArchitecture,
+} from '../modules/manifest.js';
 export { installPluginAsset, assertOfficialAssetUrl, isAllowedAssetOrigin, verifyDownloadedAsset } from '../modules/asset-installer.js';
 
 export const name = 'dsh-linux-runtime';
@@ -123,6 +132,9 @@ export function registerLinuxBash(ctx, manager, options = {}) {
  * @returns {import('../modules/manager.js').LinuxRuntimeManager} the manager.
  */
 export function apply(ctx, config = {}) {
+  // A manager supplied by the host belongs to the host. One created here must
+  // stop its guest sessions when the plugin is unloaded.
+  const ownsManager = config.manager == null;
   const manager =
     config.manager ??
     createManager({
@@ -158,6 +170,8 @@ export function apply(ctx, config = {}) {
     ctx.effect(() => () => {
       disposeTool();
       manager.off('change', syncTool);
+      if (ownsManager) return manager.dispose();
+      return undefined;
     });
   }
   return manager;

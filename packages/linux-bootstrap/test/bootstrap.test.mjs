@@ -50,6 +50,7 @@ function harness({ dataDir = path.join(root, `state-${Math.random().toString(16)
   }
   const service = createMobileBootstrap({
     dataDir,
+    arch: 'arm64',
     releaseUrl: 'https://api.github.com/repos/acme/dsh-bionilux/releases/latest',
     appVersionProvider: () => currentVersion.value,
     managerProvider,
@@ -228,7 +229,7 @@ test('install and reinstall require an explicit confirmed activation', async () 
   assert.equal(status.autoUpdate, false, 'auto-update is off until the user opts in')
 })
 
-test('the service offers the manifest runtimes and defaults to Debian minimal', async () => {
+test('the arm64 service offers the arm64 runtime and defaults to Debian minimal', async () => {
   const value = harness()
   await value.service.ready
   await value.service.checkForUpdates({ source: 'manual' })
@@ -244,7 +245,7 @@ test('the service offers the manifest runtimes and defaults to Debian minimal', 
 
   await assert.rejects(
     () => value.service.install({ runtimeId: 'not-a-runtime', confirmed: true, activate: true }),
-    /Unknown runtime id/,
+    /not present in the release manifest/,
   )
   assert.equal(value.calls.hostInstalls.length, 0, 'an unknown runtime must not reach the host adapter')
 });
@@ -256,6 +257,7 @@ test('rejects bad package asset digest before host activation', async () => {
   const badArchive = Buffer.from('wrong')
   const badService = createMobileBootstrap({
     dataDir: path.join(root, 'bad-hash'),
+    arch: 'arm64',
     releaseUrl: 'https://api.github.com/repos/acme/dsh-bionilux/releases/latest',
     appVersionProvider: () => '0.14.0',
     pluginHost: { install: async () => assert.fail('must not activate'), uninstall: async () => {} },

@@ -40,8 +40,14 @@
 `BIONILUX_ROOTFS` `BIONILUX_PREFIX` `BIONILUX_RUNTIME_DIR` `BIONILUX_BOX64`
 `BIONILUX_GUEST_PATH/HOME/TMP/CWD` `BIONILUX_FAKE_ROOT` `BIONILUX_LENIENT`
 `BIONILUX_BINARY_PATH` `BIONILUX_TARGET_EXE`
+`BIONILUX_GUEST_SESSION`
 
 子进程靠这些值推导出与父进程一致的映射。
+
+`BIONILUX_GUEST_SESSION=1` 标记已进入运行时；包含静态工具启动的子进程。
+此时继承的 `BIONILUX_GUEST_CWD` 只作无法映射 cwd 时的默认值，嵌套调用 launcher
+保持当前物理工作目录。首次宿主入口仍使用该环境变量指定初始目录；显式
+`--guest-cwd` 在两种情况下都优先。
 
 ### 2.4 会被剥离、不会进入 guest 的宿主变量
 
@@ -50,6 +56,15 @@
 
 `LD_LIBRARY_PATH` **不剥不设**：guest 自己设的必须保留，loader 的搜索路径改为
 用 `--library-path` 按次传递，避免把宿主物理路径灌进 Bionic 子进程。
+
+该参数现在包含经映射的主程序 RPATH/RUNPATH、guest `LD_LIBRARY_PATH` 和默认库目录，
+保留 RPATH → 环境 → RUNPATH 的优先级。仅处理主程序自己的动态标签，不能据此推断
+所有间接依赖的搜索语义已经完整支持。未显式设置 `SSL_CERT_FILE` / `SSL_CERT_DIR` 时，
+仅在 guest 证书文件/目录存在的情况下填入它们的物理路径。
+
+`LOCPATH` 未指定且 guest `/usr/lib/locale` 存在时，导出其物理目录，让 glibc 能加载
+Debian 随附的 `C.utf8` 等目录式 locale。只有 `locale-archive`、没有相应目录数据的
+locale 仍需用 `localedef --no-archive` 生成；这不是强制把用户的 `LC_ALL=C` 改成 UTF-8。
 
 ## 3. 命令行
 

@@ -254,3 +254,15 @@ FIFO 模式才失败。
 * `linux_bash` 工具面（`defineTool` 注册）未在有 `@deepseek-ai/dsh-tools` 的宿主中实跑。
 * PTY/长会话未验证。
 * Debian rootfs 由 `debootstrap` 从主镜像构建，未固定镜像快照哈希。
+
+## 12. 两轮验收后的源码修复（2026-10-21）
+
+本节更新上文历史缺口的当前状态；逐项证据、限制及复现见
+[ACCEPTANCE_FIXES.md](ACCEPTANCE_FIXES.md)。修复使用独立测试构建，没有覆盖原安装或重装 rootfs。
+
+- 补 libc syscall 路径入口、旧 stat ABI、xattr、共享内存/命名信号量、显式 libc 符号查询，以及 rootfs 的 DEEPBIND 兼容策略。
+- 修主 ELF 库搜索、显式 loader、嵌套 cwd、SDK symlink 与 shebang 进程身份；增加 guest CA/locale 物理路径默认值。
+- 设备回归已包含 Python IPC/venv、Node npm、.NET NuGet/MSBuild/PInvoke、Dart args 292 项、Perl Mojolicious 4183 项、Julia JSON3 737 项及 Go CGO 的有条件全量/增量测试。
+- 管理器补实际 ELF 架构校验、默认架构选择、会话排空/退出确认和失败安装清理；发布工作流增加 x86_64 矩阵及回归，但真实 tag 发布、APK 插件集成没有完成。
+- 静态/内联系统调用、完整动态链接器语义、内核级链接隔离、独立 PTY 清理仍有边界；Ruby 15 项残留失败未抹除。
+- 此轮不新增 ARM64 手机、SELinux Enforcing、完整长期压力或真实插件生命周期的通过结论。

@@ -11,6 +11,9 @@ printf 'guest\n' > "$ROOT/usr/share/marker"
 ln -s /usr/share/marker "$ROOT/entry"
 ln -s /usr/share/marker "$ROOT/nested/deep/link"
 ln -s / "$ROOT/root-link"
+ln -s ../../../../usr/share/marker "$ROOT/nested/deep/escape"
+ln -s ../usr/share/marker "$ROOT/root-escape"
+ln -s /../../usr/share/marker "$ROOT/absolute-dotdot"
 chmod 755 "$ROOT/tmp" "$ROOT/var/tmp"
 
 reject() {
@@ -32,6 +35,9 @@ reject sh "$PREP" --rootfs "$ROOT" --verify
 sh "$PREP" --rootfs "$ROOT" --dns '1.1.1.1 2001:db8::1' > /dev/null
 [ "$(readlink "$ROOT/entry")" = "$ROOT/usr/share/marker" ]
 [ "$(cat "$ROOT/entry")" = guest ]
+[ "$(cat "$ROOT/nested/deep/escape")" = guest ]
+[ "$(cat "$ROOT/root-escape")" = guest ]
+[ "$(cat "$ROOT/absolute-dotdot")" = guest ]
 sh "$PREP" --rootfs "$ROOT" --verify --dns '1.1.1.1 2001:db8::1' > /dev/null
 sh "$PREP" --rootfs "$ROOT" > /dev/null
 [ "$(readlink "$ROOT/entry")" = "$ROOT/usr/share/marker" ]
@@ -54,6 +60,8 @@ ROOT="$WORK/moved"
 sh "$PREP" --rootfs "$ROOT" --relative-links --verify > /dev/null
 [ "$(cat "$ROOT/entry")" = guest ]
 [ "$(cat "$ROOT/nested/deep/link")" = guest ]
+[ "$(cat "$ROOT/nested/deep/escape")" = guest ]
+[ "$(cat "$ROOT/root-escape")" = guest ]
 
 mkdir -p "$WORK/fail/bin" "$WORK/fail/root"
 ln -s /missing "$WORK/fail/root/link"

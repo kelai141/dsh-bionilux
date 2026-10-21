@@ -28,6 +28,12 @@ jobs:
           cargo build --locked
           BIONILUX_TEST_LAUNCHER="$PWD/target/debug/bionilux" bash tests/make.sh
           BIONILUX_TEST_LAUNCHER="$PWD/target/debug/bionilux" bash tests/runtime.sh
+          bash tests/identity_compat.sh
+          bash tests/syscall_compat.sh
+          bash tests/python_compat.sh
+          bash tests/host_paths.sh
+          bash tests/sharedlib.sh
+          bash tests/prepare_rootfs.sh
 
       # The whole point of this fork is that no host package path is baked in.
       # A guest prefix is derived from the host application's package name,

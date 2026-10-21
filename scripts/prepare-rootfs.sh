@@ -9,7 +9,8 @@
 #     target against the real root, so inside a guest it silently reaches the
 #     *host's* file of the same name instead of the guest's. Rewriting them to
 #     point inside the rootfs keeps resolution where it belongs. Relative links
-#     need no work: they already resolve inside the guest.
+#     that climb above the guest root must be clamped there as well. This is
+#     preparation of existing links, not a sandbox against later link changes.
 #
 #  2. Name resolution. Android has no standard /etc/resolv.conf, so the guest's
 #     resolver configuration must be supplied from outside. DNS reachability
@@ -60,14 +61,69 @@ ROOTFS="${ROOTFS%/}"
 
 # Capture find's status before entering a pipeline: unreadable trees must fail.
 links=$(find "$ROOTFS" -type l) || exit 1
+# Normalise components without consulting the host filesystem. In particular,
+# /../../etc names the guest's /etc, never a parent of the physical rootfs.
+normalise_guest() {
+    remaining=${1#/}
+    normalised=""
+    while [ -n "$remaining" ]; do
+        component=${remaining%%/*}
+        case "$remaining" in */*) remaining=${remaining#*/} ;; *) remaining="" ;; esac
+        case "$component" in
+            ''|.) ;;
+            ..) normalised=${normalised%/*} ;;
+            *) normalised="$normalised/$component" ;;
+        esac
+    done
+    printf '%s\n' "${normalised:-/}"
+}
+
+desired_link_target() {
+    link_path=$1
+    link_target=$2
+    directory=$(dirname "${link_path#"$ROOTFS"/}")
+    case "$link_target" in
+        "$ROOTFS") guest_target=/ ;;
+        "$ROOTFS"/*) guest_target=${link_target#"$ROOTFS"} ;;
+        /*) guest_target=$link_target ;;
+        *)
+            # Leave ordinary relative links byte-for-byte intact. Only links
+            # whose lexical traversal goes above / need changing here.
+            remaining="$directory/$link_target"
+            depth=0
+            escaped=0
+            while [ -n "$remaining" ]; do
+                component=${remaining%%/*}
+                case "$remaining" in */*) remaining=${remaining#*/} ;; *) remaining="" ;; esac
+                case "$component" in
+                    ''|.) ;;
+                    ..) if [ "$depth" -eq 0 ]; then escaped=1; else depth=$((depth - 1)); fi ;;
+                    *) depth=$((depth + 1)) ;;
+                esac
+            done
+            if [ "$escaped" -eq 0 ]; then printf '%s\n' "$link_target"; return; fi
+            guest_target="/$directory/$link_target" ;;
+    esac
+    guest_target=$(normalise_guest "$guest_target")
+    if [ "$MODE" = relative ]; then
+        prefix=""
+        while [ "$directory" != . ]; do
+            prefix="../$prefix"
+            directory=$(dirname "$directory")
+        done
+        new_target="$prefix${guest_target#/}"
+        printf '%s\n' "${new_target:-.}"
+    else
+        printf '%s\n' "$ROOTFS${guest_target%/}"
+    fi
+}
+
 count_pending_links() {
     printf '%s\n' "$links" | while IFS= read -r link; do
         [ -n "$link" ] || continue
         target=$(readlink "$link") || exit 1
-        case "$target" in
-            "$ROOTFS"|"$ROOTFS"/*) [ "$MODE" != relative ] || echo "$link" ;;
-            /*) echo "$link" ;;
-        esac
+        wanted=$(desired_link_target "$link" "$target") || exit 1
+        [ "$wanted" = "$target" ] || echo "$link"
     done | wc -l
 }
 
@@ -81,24 +137,7 @@ else
     printf '%s\n' "$links" | while IFS= read -r link; do
         [ -n "$link" ] || continue
         target=$(readlink "$link") || exit 1
-        case "$target" in /*) ;; *) continue ;; esac
-        case "$target" in
-            "$ROOTFS") guest_target=/ ;;
-            "$ROOTFS"/*) guest_target="${target#"$ROOTFS"}" ;;
-            *) guest_target="$target" ;;
-        esac
-        if [ "$MODE" = relative ]; then
-            directory=$(dirname "${link#"$ROOTFS"/}")
-            prefix=""
-            while [ "$directory" != . ]; do
-                prefix="../$prefix"
-                directory=$(dirname "$directory")
-            done
-            new_target="$prefix${guest_target#/}"
-            [ -n "$new_target" ] || new_target=.
-        else
-            new_target="$ROOTFS$guest_target"
-        fi
+        new_target=$(desired_link_target "$link" "$target") || exit 1
         [ "$target" != "$new_target" ] || continue
         ln -sfn "$new_target" "$link" || exit 1
     done

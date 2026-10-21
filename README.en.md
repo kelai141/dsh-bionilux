@@ -132,6 +132,10 @@ Configuration, in `--print-config` order:
 
 ## Known limitations
 
+The [acceptance fix ledger](docs/ACCEPTANCE_FIXES.md) records the 2026-10-21
+source changes, device regressions and remaining limitations from both test rounds.
+See also the [updated rootfs contract](docs/ROOTFS.md#2026-10-21-验收修正).
+
 Some are Android platform facts, some are inherent to doing this with
 `LD_PRELOAD` rather than a kernel sandbox. They are documented rather than
 papered over.

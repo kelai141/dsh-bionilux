@@ -32,6 +32,7 @@
 #include <grp.h>
 #include <ifaddrs.h>
 #include <limits.h>
+#include <link.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <spawn.h>
@@ -49,6 +50,7 @@
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
@@ -336,7 +338,27 @@ static int bn_dir_base(int dirfd, char *buf, size_t size) {
 static const char *bn_resolve(int dirfd, const char *path, char *buf, size_t size) {
     if (!path || !*path) return path;
     if (path[0] == '/') return bn_map(path, buf, size);
-    if (!bn_rootfs() || !bn_has_dotdot(path)) return path;
+    if (!bn_rootfs()) return path;
+
+    int dotdot = bn_has_dotdot(path);
+    // A component-wise walk (GNU mkdir -p, for example) starts at guest /
+    // and eventually reaches an authorized host mount. Even a plain relative
+    // component must switch to that host directory at the mount boundary.
+    // Passing it through would instead create a shadow tree below rootfs/data.
+    if (!dotdot) {
+        char physical[PATH_MAX], logical_buf[PATH_MAX], joined[PATH_MAX];
+        if (!bn_dir_base(dirfd, physical, sizeof physical)) return path;
+        const char *logical = bn_unmap(physical, logical_buf, sizeof logical_buf);
+        if (logical == physical) return path;
+        int n = snprintf(joined, sizeof joined, "%s/%s", logical, path);
+        if (n <= 0 || (size_t)n >= sizeof joined) return path;
+        char norm[PATH_MAX];
+        bn_normalize(joined, norm, sizeof norm);
+        if (!bn_under_host_paths(norm)) return path;
+        n = snprintf(buf, size, "%s", norm);
+        if (n <= 0 || (size_t)n >= size) return path;
+        return buf;
+    }
 
     char base[PATH_MAX];
     if (!bn_dir_base(dirfd, base, sizeof base)) return path;
@@ -862,6 +884,12 @@ void *dlopen(const char *filename, int flags) {
     static _Thread_local fn_t real; REAL(real, "dlopen");
     if (!real) { errno = ENOSYS; return NULL; }
     if (!filename || !*filename || !bn_rootfs()) return real(filename, flags);
+    DBG("dlopen: %s flags=0x%x\n", filename, flags);
+    // DEEPBIND puts libc ahead of the preload in a plugin's symbol scope,
+    // disabling guest paths and DNS for that plugin (Julia's bundled libcurl
+    // is one real example). A rootfs depends on interposition, so keep the
+    // ordinary loader scope while it is enabled. No-rootfs use is unchanged.
+    flags &= ~RTLD_DEEPBIND;
     char buf[PATH_MAX];
     return real(bn_resolve(AT_FDCWD, filename, buf, sizeof buf), flags);
 }
@@ -940,6 +968,128 @@ DIR *opendir(const char *path) {
 }
 
 // ── stat / access ──────────────────────────────────────────────────
+// Managed runtimes may explicitly resolve e.g. chmod from a libc handle.
+// That bypasses ELF interposition even though the program is dynamically
+// linked. Redirect only our path/identity wrappers, and only libc handles;
+// RTLD_NEXT must remain untouched because every REAL() lookup relies on it.
+typedef void *(*bn_dlsym_fn)(void *, const char *);
+__attribute__((visibility("hidden"))) bn_dlsym_fn bn_real_dlsym;
+
+__attribute__((used, visibility("hidden")))
+bn_dlsym_fn bn_dlsym_init(void) {
+    bn_dlsym_fn real = __atomic_load_n(&bn_real_dlsym, __ATOMIC_ACQUIRE);
+    if (!real) {
+#if defined(__x86_64__)
+        real = (bn_dlsym_fn)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+#elif defined(__aarch64__)
+        real = (bn_dlsym_fn)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.17");
+#endif
+        __atomic_store_n(&bn_real_dlsym, real, __ATOMIC_RELEASE);
+    }
+    return real;
+}
+
+// Special handles depend on the caller's return address. Tail forwarding
+// them from assembly preserves RTLD_NEXT's actual caller, rather than making
+// it incorrectly search after this preload for every DSO in the process.
+#if defined(__x86_64__)
+__asm__(
+    ".text\n.p2align 4\n.globl dlsym\n.type dlsym,@function\ndlsym:\n"
+    "test %rdi,%rdi\nje 1f\ncmp $-1,%rdi\nje 1f\njmp bn_dlsym_dispatch\n"
+    "1: mov bn_real_dlsym(%rip),%rax\ntest %rax,%rax\nje 2f\njmp *%rax\n"
+    "2: push %rdi\npush %rsi\nsub $8,%rsp\ncall bn_dlsym_init\nadd $8,%rsp\npop %rsi\npop %rdi\njmp *%rax\n"
+    ".size dlsym,.-dlsym\n"
+);
+#elif defined(__aarch64__)
+__asm__(
+    ".text\n.p2align 4\n.globl dlsym\n.type dlsym,%function\ndlsym:\n"
+    "cbz x0,1f\ncmn x0,#1\nb.eq 1f\nb bn_dlsym_dispatch\n"
+    "1: adrp x9,bn_real_dlsym\nldr x9,[x9,:lo12:bn_real_dlsym]\ncbz x9,2f\nbr x9\n"
+    "2: stp x0,x1,[sp,#-32]!\nstp x29,x30,[sp,#16]\nbl bn_dlsym_init\nmov x9,x0\nldp x29,x30,[sp,#16]\nldp x0,x1,[sp],#32\nbr x9\n"
+    ".size dlsym,.-dlsym\n"
+);
+#endif
+
+__attribute__((used, visibility("hidden")))
+void *bn_dlsym_dispatch(void *handle, const char *name) {
+    bn_dlsym_fn real = bn_dlsym_init();
+    static _Thread_local int active;
+    if (!real) return NULL;
+    void *result = real(handle, name);
+    if (!result || active || handle == RTLD_NEXT || handle == RTLD_DEFAULT || !bn_rootfs()) return result;
+    int saved = errno;
+    active = 1;
+    Dl_info implementation;
+    if (dladdr(result, &implementation) && implementation.dli_fname) {
+        // A lookup on another DSO can still resolve a dependency's libc
+        // implementation, as Julia's symbol resolver does for mkstemp.
+        // Judge the resolved definition, not merely the requested handle.
+        const char *leaf = strrchr(implementation.dli_fname, '/');
+        leaf = leaf ? leaf + 1 : implementation.dli_fname;
+        if (!strcmp(leaf, "libc.so.6")) {
+            // Only substitute symbols actually defined by this preload. This
+            // also covers temporary-file and spawn APIs without maintaining a
+            // second, inevitably incomplete list of the interposed functions.
+            void *hook = real(RTLD_DEFAULT, name);
+            Dl_info own, selected;
+            if (hook && dladdr((void *)&bn_resolve, &own) && dladdr(hook, &selected) && own.dli_fbase == selected.dli_fbase) {
+                DBG("libc lookup redirected: %s\n", name);
+                result = hook;
+            }
+        }
+    }
+    active = 0;
+    errno = saved;
+    return result;
+}
+
+// Older glibc binaries (including .NET's System.Native) call the versioned
+// __xstat ABI rather than stat. Its hidden libc implementation does not pass
+// through our public stat hook. Forward the version unchanged so unsupported
+// ABI versions still fail instead of interpreting the wrong struct layout.
+#define BN_XSTAT(name, type) \
+int name(int version, const char *path, type *st) { \
+    typedef int (*fn_t)(int, const char *, type *); \
+    static _Thread_local fn_t real; REAL(real, #name); \
+    if (!real) { errno = ENOSYS; return -1; } \
+    char buf[PATH_MAX]; \
+    int rc = real(version, bn_resolve(AT_FDCWD, path, buf, sizeof buf), st); \
+    if (rc == 0) BN_VIRT_STAT(*st); \
+    return rc; \
+}
+BN_XSTAT(__xstat, struct stat)
+BN_XSTAT(__lxstat, struct stat)
+BN_XSTAT(__xstat64, struct stat64)
+BN_XSTAT(__lxstat64, struct stat64)
+#undef BN_XSTAT
+
+#define BN_FXSTAT(name, type) \
+int name(int version, int fd, type *st) { \
+    typedef int (*fn_t)(int, int, type *); \
+    static _Thread_local fn_t real; REAL(real, #name); \
+    if (!real) { errno = ENOSYS; return -1; } \
+    int rc = real(version, fd, st); \
+    if (rc == 0) BN_VIRT_STAT(*st); \
+    return rc; \
+}
+BN_FXSTAT(__fxstat, struct stat)
+BN_FXSTAT(__fxstat64, struct stat64)
+#undef BN_FXSTAT
+
+#define BN_FXSTATAT(name, type) \
+int name(int version, int fd, const char *path, type *st, int flags) { \
+    typedef int (*fn_t)(int, int, const char *, type *, int); \
+    static _Thread_local fn_t real; REAL(real, #name); \
+    if (!real) { errno = ENOSYS; return -1; } \
+    char buf[PATH_MAX]; \
+    int rc = real(version, fd, bn_resolve(fd, path, buf, sizeof buf), st, flags); \
+    if (rc == 0) BN_VIRT_STAT(*st); \
+    return rc; \
+}
+BN_FXSTATAT(__fxstatat, struct stat)
+BN_FXSTATAT(__fxstatat64, struct stat64)
+#undef BN_FXSTATAT
+
 int stat(const char *path, struct stat *st) {
     typedef int (*fn_t)(const char *, struct stat *);
     static _Thread_local fn_t real; REAL(real, "stat");
@@ -1327,19 +1477,51 @@ int link(const char *from, const char *to) {
 // maps it back, so the guest always sees the logical target it asked for.
 // Storing it verbatim would let a link such as /usr/lib/os-release ->
 // /etc/os-release escape the guest at open() time.
-static const char *bn_map_symlink_target(const char *target, char *buf, size_t size) {
-    if (!target || target[0] != '/') return target;
+static const char *bn_map_symlink_target(const char *target, int dirfd,
+                                         const char *linkpath, char *buf, size_t size) {
+    if (!target) return target;
     if (!bn_rootfs()) return target;
-    if (bn_under(target, bn_rootfs())) return target;
-    return bn_map(target, buf, size);
+    if (target[0] == '/') {
+        if (bn_under(target, bn_rootfs())) return target;
+        return bn_map(target, buf, size);
+    }
+    if (!bn_has_dotdot(target) || !linkpath || !*linkpath) return target;
+    char physical[PATH_MAX];
+    if (linkpath[0] == '/') {
+        if (strlen(linkpath) >= sizeof physical) return target;
+        memcpy(physical, linkpath, strlen(linkpath) + 1);
+    } else {
+        char base[PATH_MAX];
+        if (!bn_dir_base(dirfd, base, sizeof base)) return target;
+        int n = snprintf(physical, sizeof physical, "%s/%s", base, linkpath);
+        if (n <= 0 || (size_t)n >= sizeof physical) return target;
+    }
+    char *slash = strrchr(physical, '/');
+    if (!slash) return target;
+    *slash = '\0';
+    if (!bn_under(physical, bn_rootfs())) return target; // authorized host cwd
+    char joined[PATH_MAX], norm[PATH_MAX];
+    int n = snprintf(joined, sizeof joined, "%s/%s", physical, target);
+    if (n <= 0 || (size_t)n >= sizeof joined) return target;
+    bn_normalize(joined, norm, sizeof norm);
+    if (bn_under(norm, bn_rootfs())) return target; // ordinary relative link
+
+    // The kernel cannot clamp a relative target at the guest root. Store a
+    // mapped absolute target only when its lexical .. traversal crosses it.
+    char logical[PATH_MAX];
+    const char *parent = bn_unmap(physical, logical, sizeof logical);
+    n = snprintf(joined, sizeof joined, "%s/%s", parent, target);
+    if (n <= 0 || (size_t)n >= sizeof joined) return target;
+    bn_normalize(joined, norm, sizeof norm);
+    return bn_map(norm, buf, size);
 }
 
 int symlink(const char *target, const char *linkpath) {
     typedef int (*fn_t)(const char *, const char *);
     static _Thread_local fn_t real; REAL(real, "symlink");
     char tbuf[PATH_MAX], lbuf[PATH_MAX];
-    const char *tg = bn_map_symlink_target(target, tbuf, sizeof tbuf);
     const char *lp = bn_resolve(AT_FDCWD, linkpath, lbuf, sizeof lbuf);
+    const char *tg = bn_map_symlink_target(target, AT_FDCWD, lp, tbuf, sizeof tbuf);
     return real(tg, lp);
 }
 
@@ -1347,8 +1529,8 @@ int symlinkat(const char *target, int dirfd, const char *linkpath) {
     typedef int (*fn_t)(const char *, int, const char *);
     static _Thread_local fn_t real; REAL(real, "symlinkat");
     char tbuf[PATH_MAX], lbuf[PATH_MAX];
-    const char *tg = bn_map_symlink_target(target, tbuf, sizeof tbuf);
     const char *lp = bn_resolve(dirfd, linkpath, lbuf, sizeof lbuf);
+    const char *tg = bn_map_symlink_target(target, dirfd, lp, tbuf, sizeof tbuf);
     return real(tg, dirfd, lp);
 }
 
@@ -1387,6 +1569,17 @@ int utime(const char *path, const struct utimbuf *times) {
 }
 
 // ── readlink / realpath ────────────────────────────────────────────
+// The kernel sees the explicitly invoked loader as the executable. Both
+// readlink and realpath must expose the original program, including the
+// aliases used by libuv and managed language hosts.
+static int bn_self_exe(const char *path) {
+    if (!path) return 0;
+    if (!strcmp(path, "/proc/self/exe") || !strcmp(path, "/proc/thread-self/exe")) return 1;
+    char own[64];
+    snprintf(own, sizeof own, "/proc/%ld/exe", (long)getpid());
+    return !strcmp(path, own);
+}
+
 static ssize_t fake_exe(char *buf, size_t size) {
     const char *exe = getenv("BIONILUX_TARGET_EXE");
     if (!exe) return -1;
@@ -1400,7 +1593,7 @@ static ssize_t fake_exe(char *buf, size_t size) {
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t size) {
     typedef ssize_t (*fn_t)(int, const char *, char *, size_t);
     static _Thread_local fn_t real; REAL(real, "readlinkat");
-    if (strcmp(path, "/proc/self/exe") == 0) {
+    if (bn_self_exe(path)) {
         ssize_t r = fake_exe(buf, size);
         if (r >= 0) return r;
     }
@@ -1435,6 +1628,10 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t size, si
 char *realpath(const char *path, char *resolved) {
     typedef char *(*fn_t)(const char *, char *);
     static _Thread_local fn_t real; REAL(real, "realpath");
+    if (bn_self_exe(path)) {
+        const char *exe = getenv("BIONILUX_TARGET_EXE");
+        if (exe && *exe) path = exe;
+    }
     char buf[PATH_MAX];
     char *r = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), resolved);
     if (!r) return r;
@@ -1452,6 +1649,22 @@ char *realpath(const char *path, char *resolved) {
     memcpy(copy, logical, len + 1);
     free(r);
     return copy;
+}
+
+// uname's machine field describes the guest ABI, rather than an Android
+// native bridge's underlying kernel. Keep all other kernel fields intact.
+int uname(struct utsname *name) {
+    typedef int (*fn_t)(struct utsname *);
+    static _Thread_local fn_t real; REAL(real, "uname");
+    int rc = real(name);
+    if (rc == 0 && bn_rootfs()) {
+#if defined(__x86_64__)
+        snprintf(name->machine, sizeof name->machine, "x86_64");
+#elif defined(__aarch64__)
+        snprintf(name->machine, sizeof name->machine, "aarch64");
+#endif
+    }
+    return rc;
 }
 
 // _FORTIFY_SOURCE rewrites realpath(path, buf) into __realpath_chk. Debian and
@@ -3047,6 +3260,9 @@ struct group *getgrgid(gid_t gid) {
 }
 
 #pragma GCC diagnostic pop
+
+#include "compat_syscall.inc.c"
+#include "compat_python.inc.c"
 
 __attribute__((constructor)) static void on_init(void) {
     for (size_t i = 0; i < sizeof bn_context / sizeof bn_context[0]; i++) {
