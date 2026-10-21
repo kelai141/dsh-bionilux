@@ -181,6 +181,53 @@ static int bn_py_unlink_raw(const char *path) {
     return real(path);
 }
 
+static int bn_py_openat_raw(int dirfd, const char *path, int flags,
+                            mode_t mode) {
+    typedef int (*openat_fn)(int, const char *, int, ...);
+    static _Thread_local openat_fn real;
+    REAL(real, "openat64");
+    if (!real) REAL(real, "openat");
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(dirfd, path, flags, mode);
+}
+
+static int bn_py_fstat_raw(int fd, struct stat *st) {
+    typedef int (*fstat_fn)(int, struct stat *);
+    static _Thread_local fstat_fn real;
+    REAL(real, "fstat");
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(fd, st);
+}
+
+static int bn_py_fstatat_raw(int dirfd, const char *path, struct stat *st,
+                             int flags) {
+    typedef int (*fstatat_fn)(int, const char *, struct stat *, int);
+    static _Thread_local fstatat_fn real;
+    REAL(real, "fstatat");
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(dirfd, path, st, flags);
+}
+
+static int bn_py_unlinkat_raw(int dirfd, const char *path, int flags) {
+    typedef int (*unlinkat_fn)(int, const char *, int);
+    static _Thread_local unlinkat_fn real;
+    REAL(real, "unlinkat");
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(dirfd, path, flags);
+}
+
+// Ownership must be the real effective uid, not the guest's virtual root.
+// /dev/shm and its protocol directory are normally root-owned and mode 0777,
+// while the creator writes as the app uid, so the directory owner is not a
+// usable ownership reference.
+static uid_t bn_py_geteuid_raw(void) {
+    typedef uid_t (*fn_t)(void);
+    static _Thread_local fn_t real;
+    REAL(real, "geteuid");
+    if (!real) return (uid_t)-1;
+    return real();
+}
+
 static int bn_py_lstat_raw(const char *path, struct stat *st) {
     typedef int (*lstat_fn)(const char *, struct stat *);
     static _Thread_local lstat_fn real;
@@ -269,9 +316,14 @@ int shm_unlink(const char *name) {
 // and the mutex is reset across fork with pthread_atfork so a child cannot
 // inherit a permanently locked registry.
 
+// The temporary file carries a distinct magic while it is being initialised.
+// Cleanup can therefore distinguish an abandoned in-progress object from an
+// unrelated regular file that merely happens to use the same name prefix.
 #define BN_PY_SEM_MAGIC UINT64_C(0x424e53454d415048) // "BNSEMAPH"
+#define BN_PY_SEM_TEMP_MAGIC UINT64_C(0x424e53454d415054) // "BNSEMAPT"
 #define BN_PY_SEM_VERSION 1u
 #define BN_PY_SEM_TEMP_PREFIX ".bn-sem-tmp-"
+#define BN_PY_SEM_LEGACY_GRACE 60
 
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE 1
@@ -281,8 +333,23 @@ struct bn_py_sem_slot {
     sem_t sem;
     uint64_t magic;
     uint32_t version;
+    // New creators store a hash of the final basename here.  It stays inside
+    // the existing 48-byte ABI; files from the old implementation have zero.
     uint32_t reserved;
 };
+
+_Static_assert(offsetof(struct bn_py_sem_slot, reserved) +
+                   sizeof(uint32_t) == sizeof(struct bn_py_sem_slot),
+               "semaphore name hash must stay inside the existing slot ABI");
+
+static uint32_t bn_py_sem_name_hash(const char *name) {
+    uint32_t hash = UINT32_C(2166136261);
+    for (; name && *name; name++) {
+        hash ^= (unsigned char)*name;
+        hash *= UINT32_C(16777619);
+    }
+    return hash ? hash : 1u;
+}
 
 struct bn_py_sem_entry {
     struct bn_py_sem_entry *next;
@@ -296,6 +363,71 @@ struct bn_py_sem_entry {
 static pthread_mutex_t bn_py_sem_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t bn_py_sem_once = PTHREAD_ONCE_INIT;
 static struct bn_py_sem_entry *bn_py_sem_entries;
+
+// /proc/<pid>/stat field 22 is the process start time in clock ticks since
+// boot.  It is stable for the process lifetime and changes when a pid is
+// reused, unlike the pid alone.  Return 0 on success, 1 when the process does
+// not exist, and -1 when the identity cannot be determined.
+static int bn_py_sem_proc_identity(pid_t pid, unsigned long long *start,
+                                   char *state) {
+    char path[64];
+    int n = snprintf(path, sizeof path, "/proc/%ld/stat", (long)pid);
+    if (n <= 0 || (size_t)n >= sizeof path) return -1;
+    int fd = bn_py_open_raw(path, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
+    char buf[1024];
+    ssize_t got;
+    do {
+        got = read(fd, buf, sizeof buf - 1);
+    } while (got < 0 && errno == EINTR);
+    (void)bn_py_close_raw(fd);
+    if (got <= 0) return -1;
+    buf[got] = 0;
+
+    // comm may contain spaces and ')'.  Fields after the final ')' are
+    // space-separated: state is field 3 and starttime is field 22.
+    char *p = strrchr(buf, ')');
+    if (!p) return -1;
+    p++;
+    while (*p == ' ') p++;
+    int field = 3;
+    while (*p && field <= 22) {
+        if (field == 3 && state) *state = *p;
+        if (field == 22) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long long value = strtoull(p, &end, 10);
+            if (end == p || errno == ERANGE) return -1;
+            *start = value;
+            return 0;
+        }
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+        field++;
+    }
+    return -1;
+}
+
+// The cache is keyed by pid because a forked child inherits these statics but
+// must not inherit the parent's starttime.  Publish the start token before the
+// pid with release/acquire ordering so a concurrent caller cannot observe a
+// matching pid paired with an older token.
+static long bn_py_sem_identity_pid;
+static unsigned long long bn_py_sem_identity_start;
+
+static unsigned long long bn_py_sem_self_identity(void) {
+    long pid = (long)getpid();
+    if (__atomic_load_n(&bn_py_sem_identity_pid, __ATOMIC_ACQUIRE) == pid)
+        return __atomic_load_n(&bn_py_sem_identity_start, __ATOMIC_RELAXED);
+
+    char state = 0;
+    unsigned long long start = 0;
+    if (bn_py_sem_proc_identity((pid_t)pid, &start, &state) != 0 || !start)
+        return 0;
+    __atomic_store_n(&bn_py_sem_identity_start, start, __ATOMIC_RELAXED);
+    __atomic_store_n(&bn_py_sem_identity_pid, pid, __ATOMIC_RELEASE);
+    return start;
+}
 
 static void bn_py_sem_atfork_prepare(void) {
     (void)pthread_mutex_lock(&bn_py_sem_mutex);
@@ -395,13 +527,253 @@ static sem_t *bn_py_sem_fail_locked(int dfd, int error) {
 static int bn_py_sem_temp_path(const char *dir, char *buf, size_t size) {
     static unsigned long sequence;
     sequence++;
-    int written = snprintf(buf, size, "%s/" BN_PY_SEM_TEMP_PREFIX "%ld-%lu",
+    unsigned long long identity = bn_py_sem_self_identity();
+    int written;
+    if (identity)
+        written = snprintf(buf, size,
+                           "%s/" BN_PY_SEM_TEMP_PREFIX "%ld-%llu-%lu", dir,
+                           (long)getpid(), identity, sequence);
+    else
+        written = snprintf(buf, size, "%s/" BN_PY_SEM_TEMP_PREFIX "%ld-%lu",
                            dir, (long)getpid(), sequence);
     if (written < 0 || (size_t)written >= size) {
         errno = ENAMETOOLONG;
         return -1;
     }
     return 0;
+}
+
+static int bn_py_sem_decimal(const char **cursor, unsigned long long *value) {
+    const char *p = *cursor;
+    if (*p < '0' || *p > '9') return -1;
+    if (p[0] == '0' && p[1] >= '0' && p[1] <= '9') return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(p, &end, 10);
+    if (end == p || errno == ERANGE) return -1;
+    *cursor = end;
+    *value = parsed;
+    return 0;
+}
+
+// New temp names are pid-starttime-sequence.  The two-component pid-sequence
+// form is the pre-recovery protocol; it is still recognised so an upgrade can
+// remove old debris, but its lack of a starttime makes it subject to a grace
+// period.  Anything else is foreign and is left alone.
+static int bn_py_sem_parse_temp_name(const char *name, pid_t *pid_out,
+                                     unsigned long long *identity_out,
+                                     int *legacy_out) {
+    const char *p = name;
+    size_t prefix = sizeof BN_PY_SEM_TEMP_PREFIX - 1;
+    if (strncmp(p, BN_PY_SEM_TEMP_PREFIX, prefix)) return -1;
+    p += prefix;
+
+    unsigned long long pid, first, second;
+    if (bn_py_sem_decimal(&p, &pid) < 0) return -1;
+    if (*p++ != '-') return -1;
+    if (bn_py_sem_decimal(&p, &first) < 0) return -1;
+    if (*p == '-') {
+        p++;
+        if (bn_py_sem_decimal(&p, &second) < 0 || *p != '\0') return -1;
+        *identity_out = first;
+        *legacy_out = 0;
+        (void)second;
+    } else if (*p == '\0') {
+        *identity_out = 0;
+        *legacy_out = 1;
+    } else {
+        return -1;
+    }
+    if (pid == 0 || pid > (unsigned long long)INT_MAX) return -1;
+    *pid_out = (pid_t)pid;
+    return 0;
+}
+
+static int bn_py_sem_creator_stale(pid_t pid, unsigned long long identity) {
+    if (pid <= 0 || identity == 0) return 0;
+    unsigned long long actual = 0;
+    char state = 0;
+    int found = bn_py_sem_proc_identity(pid, &actual, &state);
+    if (found == 1) return 1;
+    if (found < 0) return 0; // Unknown identity is not proof of staleness.
+    // The caller holds the directory lock, so an identity mismatch cannot be
+    // an in-protocol creator: it is either pid reuse or a name the creator
+    // never published.  The name's token is evidence of the writer, not a
+    // liveness oracle for the pid that happens to carry it now.
+    if (actual != identity) return 1;
+    if (state == 'Z' || state == 'X' || state == 'x') return 1;
+    return 0;
+}
+
+static int bn_py_sem_file_header(int dirfd, const char *name,
+                                 uint64_t *magic_out, uint32_t *version_out,
+                                 uint32_t *reserved_out,
+                                 struct stat *st_out) {
+    int fd = bn_py_openat_raw(dirfd, name,
+                              O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0);
+    if (fd < 0) return -1;
+    struct stat st;
+    int rc = -1;
+    if (bn_py_fstat_raw(fd, &st) < 0 || !S_ISREG(st.st_mode)) goto out;
+    unsigned char tail[sizeof(uint64_t) + 2 * sizeof(uint32_t)];
+    ssize_t got = pread(fd, tail, sizeof tail,
+                        (off_t)offsetof(struct bn_py_sem_slot, magic));
+    if (got != (ssize_t)sizeof tail) goto out;
+    uint64_t magic;
+    uint32_t version;
+    uint32_t reserved;
+    memcpy(&magic, tail, sizeof magic);
+    memcpy(&version, tail + sizeof(uint64_t), sizeof version);
+    memcpy(&reserved, tail + sizeof(uint64_t) + sizeof(uint32_t),
+           sizeof reserved);
+    *magic_out = magic;
+    *version_out = version;
+    *reserved_out = reserved;
+    *st_out = st;
+    rc = 0;
+out:
+    (void)bn_py_close_raw(fd);
+    return rc;
+}
+
+// Called only while the semaphore directory flock is held.  A creator holds
+// that same lock from before its temp file exists until after publication, so
+// no live creator can be in the middle of the protocol here.  The identity
+// check is a second guard: files owned by a still-live creator are left for a
+// later call, and files whose pid now belongs to a different process are
+// unambiguously stale.
+static int bn_py_sem_cleanup_locked(int dfd) {
+    struct stat dir_st;
+    if (bn_py_fstat_raw(dfd, &dir_st) < 0 || !S_ISDIR(dir_st.st_mode))
+        return -1;
+    uid_t caller = bn_py_geteuid_raw();
+    if (caller == (uid_t)-1) return -1;
+
+    // Keep the lock-bearing directory description out of a concurrent exec.
+    // dup() would clear CLOEXEC until fdopendir() gets a chance to set it.
+    int scanfd = fcntl(dfd, F_DUPFD_CLOEXEC, 0);
+    if (scanfd < 0) return -1;
+    DIR *dir = fdopendir(scanfd);
+    if (!dir) {
+        (void)bn_py_close_raw(scanfd);
+        return -1;
+    }
+
+    int removed = 0;
+    // Removing entries while readdir walks a directory may skip neighbours.
+    // Re-scan a bounded number of times; that matters when a crash left many
+    // files and keeps the work bounded for a hostile directory.
+    for (int pass = 0; pass < 8; pass++) {
+        int removed_here = 0;
+        int scanned = 0;
+        struct dirent *entry;
+        rewinddir(dir);
+        while ((entry = readdir(dir)) != NULL) {
+            if (++scanned > 4096) break;
+            if (strncmp(entry->d_name, BN_PY_SEM_TEMP_PREFIX,
+                        sizeof BN_PY_SEM_TEMP_PREFIX - 1))
+                continue;
+            pid_t pid = 0;
+            unsigned long long identity = 0;
+            int legacy = 0;
+            if (bn_py_sem_parse_temp_name(entry->d_name, &pid, &identity,
+                                          &legacy) < 0)
+                continue;
+
+            struct stat st;
+            if (bn_py_fstatat_raw(dfd, entry->d_name, &st,
+                                  AT_SYMLINK_NOFOLLOW) < 0)
+                continue;
+            if (!S_ISREG(st.st_mode) || st.st_uid != caller)
+                continue;
+            if (st.st_size > (off_t)sizeof(struct bn_py_sem_slot))
+                continue;
+
+            if (legacy) {
+                time_t now = time(NULL);
+                // Legacy names carry no starttime, so a live pid is not
+                // proof of staleness even though the held directory lock
+                // already excludes an in-protocol creator.  Preserve it
+                // until the pid disappears; future mtimes are not old.
+                unsigned long long legacy_start = 0;
+                char legacy_state = 0;
+                int found = bn_py_sem_proc_identity(pid, &legacy_start,
+                                                    &legacy_state);
+                if (found < 0) continue;
+                if (found == 0 && legacy_state != 'Z' &&
+                    legacy_state != 'X' && legacy_state != 'x')
+                    continue;
+                if (now <= st.st_mtime ||
+                    now - st.st_mtime < BN_PY_SEM_LEGACY_GRACE)
+                    continue;
+            } else {
+                if (identity == 0 ||
+                    !bn_py_sem_creator_stale(pid, identity))
+                    continue;
+            }
+
+            // A completed header must carry the in-progress magic.  A final
+            // magic is also accepted: link() publication can briefly leave a
+            // fully formed inode under both names, and a kill after setting
+            // the final magic but before rename must not defeat cleanup.
+            // Zero/partial files are the tiny open-to-pwrite window.
+            if (st.st_size >=
+                (off_t)(offsetof(struct bn_py_sem_slot, magic) +
+                        sizeof(uint64_t))) {
+                uint64_t magic = 0;
+                uint32_t version = 0;
+                uint32_t reserved = 0;
+                struct stat opened;
+                if (bn_py_sem_file_header(dfd, entry->d_name, &magic,
+                                          &version, &reserved, &opened) < 0)
+                    continue;
+                if (opened.st_dev != st.st_dev || opened.st_ino != st.st_ino)
+                    continue;
+                if (legacy) {
+                    // The old protocol only ever left an all-zero header
+                    // (killed in sem_init) or no file at all.  Recognise our
+                    // explicit temp magic for the identity-fallback naming
+                    // path, and preserve every other completed header.
+                    if (version != 0 && version != BN_PY_SEM_VERSION)
+                        continue;
+                    if (version == 0 && magic != 0) continue;
+                    if (version == BN_PY_SEM_VERSION &&
+                        magic != BN_PY_SEM_TEMP_MAGIC)
+                        continue;
+                } else if (version != BN_PY_SEM_VERSION) {
+                    // Unknown or future protocol: never clean it.
+                    continue;
+                } else if (magic == BN_PY_SEM_MAGIC) {
+                    // The requested final name may itself look like a temp
+                    // name.  A matching recorded hash proves this inode was
+                    // published under the name now visible.  Zero is an old
+                    // file without the hash and is preserved conservatively.
+                    if (reserved == 0 ||
+                        reserved == bn_py_sem_name_hash(entry->d_name))
+                        continue;
+                } else if (magic != BN_PY_SEM_TEMP_MAGIC) {
+                    continue;
+                }
+            } else if (legacy && st.st_size != 0) {
+                continue;
+            }
+
+            struct stat current;
+            if (bn_py_fstatat_raw(dfd, entry->d_name, &current,
+                                  AT_SYMLINK_NOFOLLOW) < 0)
+                continue;
+            if (current.st_dev != st.st_dev || current.st_ino != st.st_ino ||
+                current.st_size != st.st_size)
+                continue;
+            if (bn_py_unlinkat_raw(dfd, entry->d_name, 0) == 0) {
+                removed++;
+                removed_here++;
+            }
+        }
+        if (!removed_here) break;
+    }
+    closedir(dir);
+    return removed;
 }
 
 // Publish the fully formed inode under the final name.  RENAME_NOREPLACE is
@@ -436,13 +808,17 @@ static int bn_py_sem_publish(const char *temp, const char *final) {
 
 // Create a private file in the semaphore directory and initialise it
 // completely.  Nothing under the final name changes until publish succeeds.
-static int bn_py_sem_create_temp(const char *dir, mode_t mode,
+static int bn_py_sem_create_temp(const char *dir, const char *final,
+                                 mode_t mode,
                                  unsigned int value, char *temp,
                                  size_t temp_size, int *fd_out,
                                  void **base_out, struct stat *st_out) {
     int fd = -1;
     for (int attempt = 0; attempt < 100; attempt++) {
         if (bn_py_sem_temp_path(dir, temp, temp_size) < 0) return -1;
+        // A legal final name can itself look like a temp name.  Never let a
+        // generated private name be the requested final name.
+        if (!strcmp(temp, final)) continue;
         fd = bn_py_open_raw(temp, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW |
                                       O_CLOEXEC, mode);
         if (fd >= 0) break;
@@ -459,13 +835,16 @@ static int bn_py_sem_create_temp(const char *dir, mode_t mode,
     typedef int (*ftruncate_fn)(int, off_t);
     static _Thread_local ftruncate_fn real_ftruncate;
     REAL(real_ftruncate, "ftruncate");
+    typedef ssize_t (*pwrite_fn)(int, const void *, size_t, off_t);
+    static _Thread_local pwrite_fn real_pwrite;
+    REAL(real_pwrite, "pwrite");
     typedef int (*fsync_fn)(int);
     static _Thread_local fsync_fn real_fsync;
     REAL(real_fsync, "fsync");
 
     void *base = MAP_FAILED;
     int saved = 0;
-    if (!real_fstat || !real_ftruncate || !real_fsync) {
+    if (!real_fstat || !real_ftruncate || !real_pwrite || !real_fsync) {
         saved = ENOSYS;
         goto fail;
     }
@@ -475,6 +854,25 @@ static int bn_py_sem_create_temp(const char *dir, mode_t mode,
     }
     if (st_out->st_size != 0) {
         saved = EINVAL;
+        goto fail;
+    }
+
+    // Stamp the in-progress magic while the file is still empty apart from
+    // this header.  A SIGKILL from here on leaves a file that cleanup can
+    // identify as ours; the only remaining ambiguous state is a zero or
+    // partial header immediately after open().
+    struct bn_py_sem_slot header;
+    memset(&header, 0, sizeof header);
+    header.magic = BN_PY_SEM_TEMP_MAGIC;
+    header.version = BN_PY_SEM_VERSION;
+    const char *leaf = strrchr(final, '/');
+    header.reserved = bn_py_sem_name_hash(leaf ? leaf + 1 : final);
+    ssize_t wrote;
+    do {
+        wrote = real_pwrite(fd, &header, sizeof header, 0);
+    } while (wrote < 0 && errno == EINTR);
+    if (wrote != (ssize_t)sizeof header) {
+        saved = wrote < 0 ? errno : EIO;
         goto fail;
     }
     if (real_ftruncate(fd, (off_t)sizeof(struct bn_py_sem_slot)) < 0) {
@@ -489,7 +887,8 @@ static int bn_py_sem_create_temp(const char *dir, mode_t mode,
     }
 
     struct bn_py_sem_slot *slot = (struct bn_py_sem_slot *)base;
-    memset(slot, 0, sizeof *slot);
+    slot->magic = BN_PY_SEM_TEMP_MAGIC;
+    slot->version = BN_PY_SEM_VERSION;
     if (sem_init(&slot->sem, 1, value) != 0) {
         saved = errno;
         goto fail;
@@ -631,6 +1030,7 @@ sem_t *sem_open(const char *name, int oflag, ...) {
     int dfd = -1;
     if (bn_py_sem_lock_dir((oflag & O_CREAT) != 0, &dfd) < 0)
         return bn_py_sem_fail_locked(-1, errno);
+    (void)bn_py_sem_cleanup_locked(dfd);
 
     void *base = NULL;
     struct stat st;
@@ -649,8 +1049,8 @@ sem_t *sem_open(const char *name, int oflag, ...) {
         } else {
             int tfd = -1;
             void *tbase = NULL;
-            if (bn_py_sem_create_temp(dir, mode, value, temp, sizeof temp,
-                                      &tfd, &tbase, &st) < 0)
+            if (bn_py_sem_create_temp(dir, path, mode, value, temp,
+                                      sizeof temp, &tfd, &tbase, &st) < 0)
                 return bn_py_sem_fail_locked(dfd, errno);
             if (bn_py_sem_publish(temp, path) < 0) {
                 int saved = errno;
@@ -754,6 +1154,7 @@ int sem_unlink(const char *name) {
         errno = saved;
         return -1;
     }
+    (void)bn_py_sem_cleanup_locked(dfd);
 
     int rc = bn_py_unlink_raw(path);
     int saved = errno;

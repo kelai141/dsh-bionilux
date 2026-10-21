@@ -17,6 +17,7 @@ import {
 import path from 'node:path';
 import { defaultRuntimeIdForArch, resolveHostArchitecture, selectRuntime } from './manifest.js';
 import { assertOfficialAssetUrl, isAllowedAssetOrigin } from './asset-installer.js';
+import { ProcessScope } from './process-scope.js';
 
 const ACTIVE_SCHEMA_VERSION = 1;
 const METADATA_SCHEMA_VERSION = 1;
@@ -50,6 +51,49 @@ const ROOTFS_LOADER_CANDIDATES = {
     'usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2',
   ],
 };
+/**
+ * One live manager per data directory in this shared Node realm.
+ *
+ * The execution gate and the child set are instance-local. Two managers that
+ * both believe they own the same tree would each drain only their own
+ * children, so one could replace the rootfs while the other's guest process
+ * was still running. Rejecting the second owner is explicit and keeps dispose
+ * scoped to the manager that actually owns the directory.
+ *
+ * The registry lives on globalThis under a Symbol.for key, so a plugin reload
+ * that evaluates a fresh copy of this module cannot bypass ownership. Entries
+ * are strong references on purpose: an owner must stay reachable until it is
+ * disposed, because dropping it would release the directory while its child
+ * set and gate were still live. A manager therefore owns its dataDir for its
+ * whole lifetime and must be disposed; a failed dispose keeps ownership.
+ * Worker threads and isolated VM contexts have their own globalThis, so they
+ * are not covered by this registry. Source aliases, separate Node processes
+ * and cross-process writers are outside it too.
+ */
+const MANAGER_OWNERS = Symbol.for('dsh-bionilux.runtime.managerOwners');
+
+function liveManagers() {
+  let owners = globalThis[MANAGER_OWNERS];
+  if (!owners) {
+    owners = new Map();
+    Object.defineProperty(globalThis, MANAGER_OWNERS, {
+      value: owners,
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    });
+  }
+  return owners;
+}
+
+function dataDirOwnerError(dataDir) {
+  const error = new Error(
+    `a live Linux runtime manager already owns ${dataDir}; dispose it before creating another manager for this dataDir`,
+  );
+  error.code = 'ERR_RUNTIME_MANAGER_IN_USE';
+  return error;
+}
+
 const HOST_ENV_ALLOWLIST = new Set([
   'PATH',
   'ANDROID_ROOT',
@@ -645,6 +689,11 @@ export class LinuxRuntimeManager {
   constructor(options = {}) {
     if (!options.dataDir) throw new TypeError('dataDir is required');
     this.dataDir = assertSafeDataDir(options.dataDir);
+    this.processScope = new ProcessScope(this.dataDir);
+    this._ownerKey = this.processScope.directory;
+    const owners = liveManagers();
+    const owner = owners.get(this._ownerKey);
+    if (owner && !owner.disposed) throw dataDirOwnerError(this.dataDir);
     this.arch = resolveHostArchitecture(options.arch);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     if (typeof this.fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
@@ -657,6 +706,7 @@ export class LinuxRuntimeManager {
     this.children = new Set();
     this.gate = new ExecutionGate();
     this.disposed = false;
+    owners.set(this._ownerKey, this);
   }
 
   on(event, listener) {
@@ -963,7 +1013,13 @@ export class LinuxRuntimeManager {
     const relayAbort = () => controller.abort(spec.signal?.reason);
     if (spec.signal?.aborted) relayAbort();
     else spec.signal?.addEventListener('abort', relayAbort, { once: true });
-    const effectiveSpec = { ...spec, signal: controller.signal };
+    // Synchronous: introducing an await here would reopen the admission race
+    // between acquiring the shared gate and registering the spawned child.
+    const effectiveSpec = {
+      ...spec,
+      env: this.processScope.environment(spec.env),
+      signal: controller.signal,
+    };
     let raw;
     try {
       raw = this.runCommand(effectiveSpec);
@@ -988,7 +1044,23 @@ export class LinuxRuntimeManager {
   }
 
   async _stopChildren() {
+    // A disposed object may be called again after a replacement has claimed
+    // this directory. Its scope label is stable, so it must not drain the new
+    // owner's processes.
+    if (this.disposed) return;
     const children = [...this.children];
+    if (!children.length && !this.processScope.enabled) return;
+    // Reparented/setsid children can outlive a completed command handle. Drain
+    // the scope alongside tracked process groups, including after host restart.
+    // Wait for both cleanups even if one fails before releasing the gate.
+    const results = await Promise.allSettled([
+      this._stopTrackedChildren(children),
+      this.processScope.terminate(),
+    ]);
+    for (const result of results) if (result.status === 'rejected') throw result.reason;
+  }
+
+  async _stopTrackedChildren(children) {
     if (children.length === 0) return;
     for (const child of children) {
       try {
@@ -1307,7 +1379,7 @@ export class LinuxRuntimeManager {
   }
 
   async dispose() {
-    return this._exclusive(async () => {
+    const result = await this._exclusive(async () => {
       if (this.disposed) return;
       await this._stopChildren();
       this.disposed = true;
@@ -1315,6 +1387,9 @@ export class LinuxRuntimeManager {
       this._emitState();
       this.events.removeAllListeners();
     });
+    const owners = liveManagers();
+    if (owners.get(this._ownerKey) === this) owners.delete(this._ownerKey);
+    return result;
   }
 }
 

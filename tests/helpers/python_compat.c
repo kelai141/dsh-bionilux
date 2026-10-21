@@ -179,6 +179,101 @@ static void sem_cleanup(const char *name) {
         fail("sem_unlink cleanup %s: %s", name, strerror(errno));
 }
 
+static unsigned long long self_start_time(void) {
+    char path[64], buf[1024];
+    int n = snprintf(path, sizeof path, "/proc/%ld/stat", (long)getpid());
+    require(n > 0 && (size_t)n < sizeof path, "self stat path");
+    FILE *stream = fopen(path, "r");
+    require(stream != NULL, "open self stat");
+    require(fgets(buf, sizeof buf, stream) != NULL, "read self stat");
+    fclose(stream);
+    char *p = strrchr(buf, ')');
+    require(p != NULL, "self stat comm");
+    p++;
+    while (*p == ' ') p++;
+    int field = 3;
+    while (*p && field <= 22) {
+        if (field == 22) return strtoull(p, NULL, 10);
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+        field++;
+    }
+    fail("self starttime missing");
+    return 0;
+}
+
+// A legal semaphore name may use the private prefix and even equal the name
+// this process would otherwise choose for its temp file.  Neither the
+// collision nor a later cleanup pass may delete or re-create that object.
+static void test_sem_prefix_names(void) {
+    unsigned long long start = self_start_time();
+    char collide[NAME_MAX], dead[NAME_MAX], other[NAME_MAX];
+    int n = snprintf(collide, sizeof collide,
+                     "/.bn-sem-tmp-%ld-%llu-1", (long)getpid(), start);
+    require(n > 0 && (size_t)n < sizeof collide, "collision sem name");
+    sem_cleanup(collide);
+    sem_t *c = sem_open(collide, O_CREAT | O_EXCL, 0600, 5);
+    require(c != SEM_FAILED, "sem_open final name equal to temp name");
+
+    n = snprintf(other, sizeof other, "/bn-prefix-other-%ld", (long)getpid());
+    require(n > 0 && (size_t)n < sizeof other, "prefix other name");
+    sem_cleanup(other);
+    sem_t *o = sem_open(other, O_CREAT, 0600, 7);
+    require(o != SEM_FAILED, "cleanup opener");
+    require(sem_close(o) == 0, "cleanup opener close");
+    require(sem_unlink(other) == 0, "cleanup opener unlink");
+
+    int value = -1;
+    require(sem_getvalue(c, &value) == 0 && value == 5,
+            "collision object survived cleanup");
+    require(sem_close(c) == 0, "collision close");
+    require(sem_unlink(collide) == 0, "collision unlink");
+
+    // A complete header with an unknown version is a future/foreign protocol
+    // object, not a stale temp this implementation may remove.
+    char foreign[PATH_MAX];
+    physical("/dev/shm/.bionilux-sem/.bn-sem-tmp-999997-7-1", foreign,
+             sizeof foreign);
+    (void)unlink(foreign);
+    struct {
+        sem_t sem;
+        uint64_t magic;
+        uint32_t version;
+        uint32_t reserved;
+    } slot;
+    memset(&slot, 0, sizeof slot);
+    slot.magic = 0x424e53454d415054ULL;
+    slot.version = 99;
+    int fd = open(foreign, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    require(fd >= 0, "create future-version temp");
+    require(write(fd, &slot, sizeof slot) == (ssize_t)sizeof slot,
+            "write future-version temp");
+    require(close(fd) == 0, "close future-version temp");
+    o = sem_open(other, O_CREAT, 0600, 7);
+    require(o != SEM_FAILED, "future-version cleanup opener");
+    require(sem_close(o) == 0, "future-version cleanup close");
+    require(sem_unlink(other) == 0, "future-version cleanup unlink");
+    struct stat fst;
+    require(stat(foreign, &fst) == 0 && fst.st_size == (off_t)sizeof slot,
+            "unknown-version temp was preserved");
+    require(unlink(foreign) == 0, "remove future-version temp");
+
+    n = snprintf(dead, sizeof dead, "/.bn-sem-tmp-999999-123-1");
+    require(n > 0 && (size_t)n < sizeof dead, "dead prefix name");
+    sem_cleanup(dead);
+    sem_t *d = sem_open(dead, O_CREAT, 0600, 5);
+    require(d != SEM_FAILED, "sem_open dead-pid prefix name");
+    o = sem_open(other, O_CREAT, 0600, 7);
+    require(o != SEM_FAILED, "second cleanup opener");
+    require(sem_close(o) == 0, "second cleanup close");
+    require(sem_unlink(other) == 0, "second cleanup unlink");
+    require(sem_getvalue(d, &value) == 0 && value == 5,
+            "published prefix name survived cleanup");
+    require(sem_close(d) == 0, "dead prefix close");
+    require(sem_unlink(dead) == 0, "dead prefix unlink");
+    puts("sem prefix names: OK");
+}
+
 static void test_sem(void) {
     char name[NAME_MAX];
     int n = snprintf(name, sizeof name, "/bn-python-sem-%ld", (long)getpid());
@@ -582,11 +677,46 @@ static void test_sem_check(const char *name, unsigned int expected) {
     require(sem_unlink(name) == 0, "sem-check sem_unlink");
 }
 
+// Populate the parent's cached start-time token, then let a child create a
+// temp file.  The child must encode its own pid/starttime pair.  The shell
+// driver kills the paused child and inspects the name before recovery.
+static void test_sem_fork_create(const char *name) {
+    char parent_name[NAME_MAX];
+    int n = snprintf(parent_name, sizeof parent_name,
+                     "/bn-python-fork-parent-%ld", (long)getpid());
+    require(n > 0 && (size_t)n < sizeof parent_name, "fork parent name");
+    sem_cleanup(parent_name);
+    sem_t *parent = sem_open(parent_name, O_CREAT, 0600, 1);
+    require(parent != SEM_FAILED, "fork parent sem_open");
+    require(sem_close(parent) == 0, "fork parent sem_close");
+    sem_cleanup(parent_name);
+
+    pid_t pid = fork();
+    require(pid >= 0, "fork for creator identity");
+    if (pid == 0) {
+        alarm(10);
+        sem_t *child = sem_open(name, O_CREAT, 0600, 0x5a5a);
+        if (child == SEM_FAILED) _exit(2);
+        int got = -1;
+        if (sem_getvalue(child, &got) != 0 || got != 0x5a5a) _exit(3);
+        (void)sem_close(child);
+        _exit(0);
+    }
+    int status = 0;
+    require(waitpid(pid, &status, 0) == pid, "waitpid fork creator");
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        fail("fork creator child exited %d", WEXITSTATUS(status));
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        (void)sem_unlink(name);
+    puts("sem fork creator: OK");
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
                 "usage: %s xattr|sem|sem-threads|sem-fork|sem-inherit|shm|"
-                "native|p08|sem-create NAME VALUE|sem-check NAME VALUE\n",
+                "native|p08|sem-create NAME VALUE|sem-check NAME VALUE|"
+                "sem-fork-create NAME|sem-prefix\n",
                 argv[0]);
         return 2;
     }
@@ -602,6 +732,10 @@ int main(int argc, char **argv) {
         test_sem_create(argv[2], (unsigned int)strtoul(argv[3], NULL, 0));
     else if (!strcmp(argv[1], "sem-check") && argc == 4)
         test_sem_check(argv[2], (unsigned int)strtoul(argv[3], NULL, 0));
+    else if (!strcmp(argv[1], "sem-fork-create") && argc == 3)
+        test_sem_fork_create(argv[2]);
+    else if (!strcmp(argv[1], "sem-prefix"))
+        test_sem_prefix_names();
     else {
         fprintf(stderr, "unknown mode: %s\n", argv[1]);
         return 2;

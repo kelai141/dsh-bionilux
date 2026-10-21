@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <limits.h>
 #include <assert.h>
 #include <errno.h>
 #include <grp.h>
@@ -154,7 +155,7 @@ static void check_readlink(void) {
 }
 
 static void check_exec(void) {
-    for (int test = 0; test < 14; test++) {
+    for (int test = 0; test < 15; test++) {
         pid_t pid = fork();
         assert(pid >= 0);
         if (!pid) {
@@ -203,6 +204,12 @@ static void check_exec(void) {
             if (test == 10) {
                 char *env_args[] = {"env", "-i", "/usr/bin/bn-probe", "minimal-env", NULL};
                 execve("/usr/bin/env", env_args, environ);
+            }
+            if (test == 14) {
+                char *minimal[] = {"PATH=/usr/bin:/bin", "SSL_CERT_FILE=/explicit.pem",
+                                   "LOCPATH=/explicit-locales", "CUSTOM_KEEP=a:b=c", NULL};
+                args[1] = "minimal-env";
+                execve("/usr/bin/bn-probe", args, minimal);
             }
             if (test == 11) {
                 int dir = open("/usr/bin", O_RDONLY | O_DIRECTORY);
@@ -348,9 +355,39 @@ int main(int argc, char **argv) {
         puts("relative dotdot keeps exposed host workspace semantics: OK");
     }
     else if (!strcmp(argv[1], "argv0")) assert(!strcmp(argv[0], "custom-argv0"));
-    else if (!strcmp(argv[1], "minimal-env")) {
+    else if (!strcmp(argv[1], "minimal-env") || !strcmp(argv[1], "minimal-grandchild")) {
         assert(!getenv("HOME"));
-        assert(getenv("BIONILUX_ROOTFS") && getenv("BIONILUX_BINARY_PATH"));
+        assert(!getenv("BIONILUX_ROOTFS") && !getenv("BIONILUX_BINARY_PATH"));
+        assert(!getenv("BIONILUX_TARGET_EXE") && !getenv("BIONILUX_GUEST_SESSION"));
+        assert(!getenv("LD_PRELOAD") && !getenv("BIONILUX_INTERNAL_ENV_KEEP"));
+        assert(!getenv("BIONILUX_PROCESS_SCOPE"));
+        int environment_fd = open("/proc/self/environ", O_RDONLY);
+        assert(environment_fd >= 0);
+        char environment[16384];
+        ssize_t environment_len = read(environment_fd, environment, sizeof environment);
+        assert(environment_len > 0); close(environment_fd);
+        const char scope[] = "BIONILUX_PROCESS_SCOPE=bn-scope-fixture";
+        assert(memmem(environment, (size_t)environment_len, scope, sizeof scope));
+        if (getenv("CUSTOM_KEEP")) {
+            assert(!strcmp(getenv("CUSTOM_KEEP"), "a:b=c"));
+            assert(!strcmp(getenv("SSL_CERT_FILE"), "/explicit.pem"));
+            assert(!strcmp(getenv("LOCPATH"), "/explicit-locales"));
+        } else {
+            assert(!getenv("SSL_CERT_FILE") && !getenv("SSL_CERT_DIR") && !getenv("LOCPATH"));
+        }
+        int fd = open("/usr/bin/bn-tool", O_RDONLY);
+        assert(fd >= 0); close(fd); // The private rootfs context still works.
+        char self[PATH_MAX];
+        ssize_t self_len = readlink("/proc/self/exe", self, sizeof self - 1);
+        assert(self_len > 0); self[self_len] = 0;
+        assert(!strcmp(self, "/usr/bin/bn-probe"));
+        char *canonical = realpath("/proc/self/exe", NULL);
+        assert(canonical && !strcmp(canonical, "/usr/bin/bn-probe")); free(canonical);
+        if (!strcmp(argv[1], "minimal-env")) {
+            char *args[] = {"bn-probe", "minimal-grandchild", NULL};
+            execve("/usr/bin/bn-probe", args, environ);
+            abort();
+        }
     }
     else if (!strcmp(argv[1], "preload")) {
         pid_t pid = fork();

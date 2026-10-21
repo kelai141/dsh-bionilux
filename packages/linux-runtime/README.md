@@ -86,14 +86,34 @@ child of the Bionilux launcher and returns
   rootfs dynamic loader (links are resolved inside the rootfs, never through
   the host). A non-ELF or wrong-architecture object is unhealthy, even when its
   file name and executable bit look correct.
-* One manager instance owns one `dataDir`. Command execution and
-  install/uninstall are separated by a read/write gate: an in-flight command is
-  aborted before a cutover, and a command issued during a cutover waits for it.
-  Cross-process serialization belongs to the bootstrap plugin's install lock.
+* One manager instance owns one canonical `dataDir` (including existing symlink
+  aliases). Creating a second live manager for
+  the same directory throws `ERR_RUNTIME_MANAGER_IN_USE`; dispose the first
+  manager before replacing it. This prevents two instance-local child sets and
+  gates from mutating the same rootfs independently. Ownership is registered
+  in the shared Node realm under a `globalThis` symbol, so reloading a fresh
+  module copy does not bypass it. The registry holds the owner strongly for its
+  whole lifetime: a failed dispose keeps ownership until its children are
+  confirmed gone, and only a successful dispose releases the directory. Worker
+  threads and isolated VM contexts have separate `globalThis` instances and are
+  not covered. Separate Node processes and cross-process writers
+  are outside this registry; cross-process serialization belongs to the
+  bootstrap plugin's install lock.
+* Command execution and install/uninstall are separated by a read/write gate:
+  an in-flight command is aborted before a cutover, and a command issued during
+  a cutover waits for it.
 * Management registers its intent before draining commands, so no command can
   spawn between the drain and the cutover. Guest children receive `SIGTERM`,
   then `SIGKILL` after a bounded grace period, and the cutover waits for them to
   exit before replacing the tree.
+* On Linux/Android, managed commands also carry a stable process-scope tag
+  derived from the canonical data directory. Lifecycle cleanup scans readable
+  `/proc` environments for that exact tag and the same real UID, and checks PID
+  start times before signalling. This also finds cooperative `setsid` daemons
+  after their direct parent exits or a previous host crashes. The preload
+  preserves the tag across managed `env -i` execution. Cleanup waits for both
+  process groups and scope scans before allowing a cutover; disposing an old
+  owner again cannot terminate its replacement's commands.
 * If a child cannot be confirmed dead after `SIGKILL`, management fails and
   leaves `active.json` and the instance tree untouched. The child stays tracked
   instead of being dropped as if it had exited.
@@ -139,5 +159,8 @@ Node.js. This is an execution-environment choice, and the Debian environment is
 * The architecture probe reads the ELF identity header only. It rejects
   non-ELF and wrong-`e_machine` objects, but it is not a signature or a full
   binary integrity check.
-* Child cleanup uses the child's process group. A guest daemon that creates its
-  own session (`setsid`) can escape that group even when the direct child exits.
+* Process-scope tracking requires a readable exact tag for previously unknown
+  processes. Untagged external sessions, deliberately discarded context and raw
+  syscall bypasses are outside that contract. This is lifecycle cleanup, not
+  kernel containment. Do not externally replace a live manager's data directory
+  or change its symlink target.

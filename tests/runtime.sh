@@ -43,6 +43,7 @@ FAILED=0
 for test in group hosts spawn temporary readlink process pclose-race exec path-interpreters workspace; do
     if ! env -i PATH=/usr/bin:/bin LD_PRELOAD="$TMP/preload.so" \
         BIONILUX_HOST_PATHS="$TMP/workspace" BN_TEST_WORKSPACE="$TMP/workspace" \
+        BIONILUX_PROCESS_SCOPE=bn-scope-fixture \
         BIONILUX_ROOTFS="$TMP/root" BIONILUX_BINARY_PATH="$LAUNCHER" BIONILUX_PRELOAD="$TMP/preload.so" \
         "$TMP/probe" "$test"; then
         echo "FAIL: $test" >&2

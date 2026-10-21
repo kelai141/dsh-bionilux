@@ -1,0 +1,9 @@
+[package]
+name = "bn_rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "bn_rust"
+crate-type = ["staticlib"]

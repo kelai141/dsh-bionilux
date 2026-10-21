@@ -31,6 +31,7 @@ jobs:
           bash tests/identity_compat.sh
           bash tests/syscall_compat.sh
           bash tests/python_compat.sh
+          bash tests/glob_compat.sh
           bash tests/host_paths.sh
           bash tests/sharedlib.sh
           bash tests/prepare_rootfs.sh

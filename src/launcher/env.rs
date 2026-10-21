@@ -39,11 +39,9 @@ const GUEST_TLS_DEFAULTS: &[(&str, &str, bool)] = &[
     ("LOCPATH", "/usr/lib/locale", true),
 ];
 
-// Locale data is deliberately not derived. A Debian guest keeps its locales in
-// locale-archive, which glibc locates through LOCALE_ARCHIVE or its compiled
-// path, not through LOCPATH; pointing LOCPATH into the rootfs would only help a
-// guest that has per-locale directories, and would change the locale a user
-// deliberately asked for.
+// LOCPATH supports unpacked per-locale directories. A guest that only ships
+// locale-archive still needs localedef --no-archive for a non-default locale.
+// Explicit locale variables remain untouched.
 
 /// Variables that are always dropped: they either ask the loader to do
 /// something that cannot work across a libc boundary, or they would be
@@ -224,6 +222,7 @@ fn build_from(cfg: &Config, spec: &GuestEnv<'_>, mut vars: HashMap<String, Strin
     vars.remove(env_keys::INTERNAL_ARGV0);
     if spec.preload.is_none() {
         vars.remove("LD_PRELOAD");
+        vars.remove(env_keys::INTERNAL_ENV_KEEP);
     }
 
     vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
@@ -473,7 +472,10 @@ mod tests {
         let cfg = Config::from_env().unwrap();
         let mut spec = guest_spec(true);
         spec.preload = None;
-        let overrides = [("LD_PRELOAD".into(), "must-not-reach-bionic.so".into())];
+        let overrides = [
+            ("LD_PRELOAD".into(), "must-not-reach-bionic.so".into()),
+            (env_keys::INTERNAL_ENV_KEEP.into(), "PWD:".into()),
+        ];
         spec.overrides = &overrides;
         let vars = unpack(build_from(
             &cfg,
@@ -482,10 +484,12 @@ mod tests {
                 (env_keys::INTERNAL_PRELOAD, "arbitrary-guest.so"),
                 (env_keys::INTERNAL_ARGV0, "internal-name"),
                 ("LD_PRELOAD", "another-guest.so"),
+                (env_keys::INTERNAL_ENV_KEEP, "PWD:"),
             ]),
         ));
         for key in [
             "LD_PRELOAD",
+            env_keys::INTERNAL_ENV_KEEP,
             env_keys::INTERNAL_PRELOAD,
             env_keys::INTERNAL_ARGV0,
         ] {

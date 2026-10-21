@@ -364,6 +364,7 @@ test('a failing install leaves the previous active runtime untouched', async () 
   const { manager } = makeManager(good, { dataDir });
   const first = await manager.install(good.manifest);
   assert.equal(first.healthy, true);
+  await manager.dispose();
 
   const brokenRootfs = { ...ARCHIVE_FILES.rootfs };
   delete brokenRootfs['usr/bin/dpkg'];
@@ -389,6 +390,7 @@ test('shared glibc Node is downloaded once and reused across releases', async ()
   const first = makeManifest({ version: '1.0.0' });
   const { manager } = makeManager(first, { dataDir });
   await manager.install(first.manifest);
+  await manager.dispose();
 
   const nodeDownloads = () => {
     const shared = path.join(dataDir, 'shared', 'node');
@@ -418,6 +420,7 @@ test('a different shared Node archive installs alongside and retires the old one
   const first = makeManifest({ version: '1.0.0' });
   const { manager } = makeManager(first, { dataDir });
   await manager.install(first.manifest);
+  await manager.dispose();
 
   const upgraded = makeManifest({ version: '1.1.0', nodeAsset: makeAsset('node-glibc-v25.0.0-linux-arm64.tar.xz') });
   const io = makeIo(upgraded);
@@ -600,6 +603,102 @@ test('management rejects and preserves the active tree when a child never exits'
   void running;
 });
 
+test('a second live manager for the same dataDir is rejected without touching the first', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager, runner, io } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  const controller = new AbortController();
+  const running = manager.execute({ command: 'sleep 100', signal: controller.signal });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const activeCall = runner.calls.find((call) => String(call.spec.args?.at(-1) ?? '') === 'sleep 100');
+
+  assert.throws(
+    () => makeManager(fixture, { dataDir }),
+    (error) =>
+      error.code === 'ERR_RUNTIME_MANAGER_IN_USE' &&
+      /dispose it before creating another manager/.test(error.message),
+  );
+  assert.equal(activeCall.settled, false, 'rejection must not stop the existing manager child');
+
+  // A hot reload evaluates a fresh module URL. Its module-local state is new,
+  // but the process-wide owner registry must still see the live first manager.
+  const reloaded = await import(`../modules/manager.js?reload=${Date.now()}`);
+  assert.throws(
+    () =>
+      reloaded.createManager({
+        dataDir,
+        arch: 'arm64',
+        downloadAsset: io.downloadAsset,
+        extractArchive: io.extractArchive,
+        runCommand: runner.runCommand,
+      }),
+    (error) => error.code === 'ERR_RUNTIME_MANAGER_IN_USE',
+  );
+
+  controller.abort();
+  assert.equal((await running).exitCode, 130);
+  await manager.dispose();
+
+  const replacement = {
+    manager: reloaded.createManager({
+      dataDir,
+      arch: 'arm64',
+      downloadAsset: io.downloadAsset,
+      extractArchive: io.extractArchive,
+      runCommand: runner.runCommand,
+    }),
+  };
+  assert.equal(replacement.manager.status().healthy, true);
+  assert.equal((await replacement.manager.execute({ command: 'echo released' })).exitCode, 0);
+  await replacement.manager.dispose();
+});
+
+test('a manager whose dispose failed keeps ownership of its dataDir', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const io = makeIo(fixture);
+  const runner = makeUnkillableRunner();
+  const manager = createManager({
+    dataDir,
+    arch: 'arm64',
+    downloadAsset: io.downloadAsset,
+    extractArchive: io.extractArchive,
+    runCommand: runner.runCommand,
+  });
+  await manager.install(fixture.manifest);
+  const running = manager.execute({ command: 'sleep 100' });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  await assert.rejects(
+    () => manager.dispose(),
+    (error) => error.code === 'ERR_RUNTIME_CHILDREN_STILL_RUNNING',
+  );
+  assert.throws(
+    () => makeManager(fixture, { dataDir }),
+    (error) => error.code === 'ERR_RUNTIME_MANAGER_IN_USE',
+  );
+  void running;
+});
+
+test('a dataDir symlink alias cannot bypass manager ownership', { skip: process.platform === 'win32' }, async () => {
+  const base = tempDir();
+  const dataDir = path.join(base, 'real');
+  const alias = path.join(base, 'alias');
+  await mkdir(dataDir, { recursive: true });
+  await symlink(dataDir, alias, 'dir');
+  const first = createManager({ dataDir, arch: 'arm64' });
+  try {
+    assert.throws(() => createManager({ dataDir: alias, arch: 'arm64' }),
+      (error) => error.code === 'ERR_RUNTIME_MANAGER_IN_USE');
+  } finally {
+    await first.dispose();
+  }
+  const replacement = createManager({ dataDir: alias, arch: 'arm64' });
+  await replacement.dispose();
+});
+
 test('uninstall removes the instance and unreferenced Node but keeps foreign data', async () => {
   const dataDir = tempDir();
   const fixture = makeManifest();
@@ -694,6 +793,41 @@ test('plugin teardown leaves a host-owned manager running', async () => {
   await teardown();
   assert.equal(manager.status().state, 'absent', 'the host owns its manager lifecycle');
   await manager.dispose();
+});
+
+test('failed plugin service registration releases its newly owned manager', async () => {
+  const dataDir = tempDir();
+  let failedManager;
+  assert.throws(() => apply({
+    provide(_name, manager) {
+      failedManager = manager;
+      throw new Error('service registration rejected');
+    },
+  }, { dataDir, arch: 'arm64' }), /service registration rejected/);
+  try {
+    const deadline = Date.now() + 3_000;
+    while (!failedManager.disposed && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(failedManager.disposed, true, 'failed apply must roll back its owned resources');
+    const replacement = createManager({ dataDir, arch: 'arm64' });
+    await replacement.dispose();
+  } finally {
+    await failedManager.dispose();
+  }
+});
+
+test('failed plugin service registration detaches without disposing a host manager', async () => {
+  const { manager } = makeManager(makeManifest(), { dataDir: tempDir() });
+  try {
+    assert.throws(() => apply({
+      provide() { throw new Error('service registration rejected'); },
+    }, { manager }), /service registration rejected/);
+    assert.equal(manager.disposed, false);
+    assert.equal(manager.events.listenerCount('change'), 0);
+  } finally {
+    await manager.dispose();
+  }
 });
 
 test('health requires a rootfs entry point to be a file, not a directory', async () => {
@@ -821,19 +955,38 @@ test('a rootfs directory symlink is resolved inside the rootfs', { skip: process
 });
 
 test('spawnCommand escalates a guest session that ignores SIGTERM', { skip: process.platform === 'win32' }, async () => {
-  const started = Date.now();
   const handle = spawnCommand({
     file: process.execPath,
-    args: ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+    args: [
+      '-e',
+      "process.on('SIGTERM', () => {}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000)",
+    ],
     cwd: os.tmpdir(),
     env: process.env,
-    timeout: 100,
   });
+  // Do not start the termination clock until the child has installed its
+  // handler. A fixed sleep shorter than process startup is flaky under load.
+  await new Promise((resolve, reject) => {
+    let stdout = '';
+    const timer = setTimeout(() => reject(new Error('child did not report readiness')), 10_000);
+    handle.child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      if (!stdout.includes('ready')) return;
+      clearTimeout(timer);
+      resolve();
+    });
+    handle.child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+  const signalledAt = Date.now();
+  handle.cancel('SIGTERM');
   const result = await handle.promise;
 
-  assert.equal(result.timedOut, true);
+  assert.equal(result.timedOut, false);
   assert.equal(result.signal, 'SIGKILL');
-  assert.ok(Date.now() - started < 10_000, 'termination must stay bounded');
+  assert.ok(Date.now() - signalledAt < 10_000, 'termination must stay bounded');
 });
 
 test('the guest environment is derived, not inherited from the host', async () => {

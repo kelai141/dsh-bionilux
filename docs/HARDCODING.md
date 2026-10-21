@@ -132,3 +132,13 @@ Linux Environment System 独立于 DSH Mobile APK 版本发布；安装器从版
 rm -rf "$ROOTFS"          # 整个 Linux runtime 目录
 # 宿主侧只额外有 preload 库与可执行文件，位于 BIONILUX_PREFIX 下
 ```
+
+## 最小子进程环境
+
+`execve` / spawn 传入不含 `BIONILUX_ROOTFS` 的最小 envp 时，preload 用
+`BIONILUX_INTERNAL_ENV_KEEP` 传递显式 runtime/default key 列表。launcher
+将配置传给动态 glibc 子进程；constructor 缓存配置后去掉未显式提供的变量及
+transport marker。随后路径、proc 身份与再次 exec 使用私有缓存。
+这允许 `env -i` / `unsetenv_others` 不向应用 ENV 注入运行时配置；显式 SSL、
+LOCPATH 与普通用户值保留。无 preload 的 native 分支移除该 marker。
+静态和绕过钩子的程序不在此透明性保证内，正常会话仍按既有 BIONILUX 环境协议工作。

@@ -338,6 +338,7 @@ pub mod env_keys {
     pub const TARGET_EXE: &str = "BIONILUX_TARGET_EXE";
     pub const INTERNAL_ARGV0: &str = "BIONILUX_INTERNAL_ARGV0";
     pub const INTERNAL_PRELOAD: &str = "BIONILUX_INTERNAL_PRELOAD";
+    pub const INTERNAL_ENV_KEEP: &str = "BIONILUX_INTERNAL_ENV_KEEP";
 }
 
 /// Names stripped from the guest environment.

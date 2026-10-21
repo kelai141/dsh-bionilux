@@ -88,8 +88,60 @@ static struct { const char *key; char *entry; } bn_context[] = {
     {"BIONILUX_GUEST_TMP=", NULL}, {"BIONILUX_GUEST_CWD=", NULL},
     {"BIONILUX_FAKE_ROOT=", NULL}, {"BIONILUX_LENIENT=", NULL},
     {"BIONILUX_BINARY_PATH=", NULL}, {"BIONILUX_DNS=", NULL},
-    {"BIONILUX_DNS_SERVERS=", NULL}
+    {"BIONILUX_DNS_SERVERS=", NULL},
+    {"BIONILUX_TARGET_EXE=", NULL}, {"BIONILUX_GUEST_SESSION=", NULL},
+    {"BIONILUX_PROCESS_SCOPE=", NULL}
 };
+
+// A minimal exec environment still needs private transport to the launcher,
+// but that transport must not become application-visible environment.  These
+// are the only non-context defaults the launcher can add on a rerouted exec.
+#define BN_ENV_KEEP "BIONILUX_INTERNAL_ENV_KEEP="
+static const char *bn_rootfs(void);
+static const char *bn_env_defaults[] = {
+    "LD_PRELOAD=", "LOCPATH=", "SSL_CERT_FILE=", "SSL_CERT_DIR=", "PWD="
+};
+
+static int bn_env_has(char *const envp[], const char *key) {
+    size_t len = strlen(key);
+    for (size_t i = 0; envp && envp[i]; i++)
+        if (!strncmp(envp[i], key, len)) return 1;
+    return 0;
+}
+
+static int bn_env_kept(const char *keep, const char *key) {
+    size_t len = strlen(key) - 1;
+    for (const char *p = keep; p && *p;) {
+        const char *end = strchr(p, ':');
+        if (!end) return 0;
+        if ((size_t)(end - p) == len && !strncmp(p, key, len)) return 1;
+        p = end + 1;
+    }
+    return 0;
+}
+
+static void bn_restore_exec_environment(void) {
+    const char *value = getenv("BIONILUX_INTERNAL_ENV_KEEP");
+    if (!value || !bn_rootfs()) return;
+    for (size_t i = 0; i < sizeof bn_context / sizeof bn_context[0]; i++)
+        if (bn_env_has(environ, bn_context[i].key) && !bn_context[i].entry) return;
+    char *keep = strdup(value);
+    if (!keep) return; // Retain working runtime state on allocation failure.
+    for (size_t i = 0; i < sizeof bn_context / sizeof bn_context[0]; i++) {
+        char name[64];
+        size_t len = strlen(bn_context[i].key) - 1;
+        memcpy(name, bn_context[i].key, len); name[len] = 0;
+        if (!bn_env_kept(keep, bn_context[i].key)) unsetenv(name);
+    }
+    for (size_t i = 0; i < sizeof bn_env_defaults / sizeof bn_env_defaults[0]; i++) {
+        char name[64];
+        size_t len = strlen(bn_env_defaults[i]) - 1;
+        memcpy(name, bn_env_defaults[i], len); name[len] = 0;
+        if (!bn_env_kept(keep, bn_env_defaults[i])) unsetenv(name);
+    }
+    unsetenv("BIONILUX_INTERNAL_ENV_KEEP");
+    free(keep);
+}
 
 static const char *bn_env(const char *name) {
     const char *v = getenv(name);
@@ -392,17 +444,45 @@ static char **strip_ld_preload(char *const envp[]) {
     const char *preload = NULL;
     for (size_t i = 0; i < envc; i++)
         if (!strncmp(envp[i], "LD_PRELOAD=", 11)) preload = envp[i] + 11;
-    size_t slots = envc + sizeof bn_context / sizeof bn_context[0] + 2;
+    int minimal = bn_rootfs() && !bn_env_has(envp, "BIONILUX_ROOTFS=");
+    size_t keep_size = sizeof BN_ENV_KEEP;
+    if (minimal) {
+        for (size_t k = 0; k < sizeof bn_context / sizeof bn_context[0]; k++)
+            if (bn_env_has(envp, bn_context[k].key)) keep_size += strlen(bn_context[k].key);
+        for (size_t k = 0; k < sizeof bn_env_defaults / sizeof bn_env_defaults[0]; k++)
+            if (bn_env_has(envp, bn_env_defaults[k])) keep_size += strlen(bn_env_defaults[k]);
+    }
+    size_t slots = envc + sizeof bn_context / sizeof bn_context[0] + 3;
     size_t extra = preload ? sizeof "BIONILUX_INTERNAL_PRELOAD=" + strlen(preload) : 0;
-    char **ev = malloc(slots * sizeof *ev + extra);
+    char **ev = malloc(slots * sizeof *ev + extra + (minimal ? keep_size : 0));
     if (!ev) return NULL;
     size_t j = 0;
     for (size_t i = 0; i < envc; i++)
         if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0 &&
-            strncmp(envp[i], "BIONILUX_INTERNAL_PRELOAD=", sizeof "BIONILUX_INTERNAL_PRELOAD=" - 1) != 0) ev[j++] = envp[i];
+            strncmp(envp[i], "BIONILUX_INTERNAL_PRELOAD=", sizeof "BIONILUX_INTERNAL_PRELOAD=" - 1) != 0 &&
+            (!minimal || strncmp(envp[i], BN_ENV_KEEP, sizeof BN_ENV_KEEP - 1))) ev[j++] = envp[i];
     if (preload) {
         char *saved = (char *)(ev + slots);
         snprintf(saved, extra, "BIONILUX_INTERNAL_PRELOAD=%s", preload);
+        ev[j++] = saved;
+    }
+    if (minimal) {
+        char *saved = (char *)(ev + slots) + extra;
+        memcpy(saved, BN_ENV_KEEP, sizeof BN_ENV_KEEP - 1);
+        char *out = saved + sizeof BN_ENV_KEEP - 1;
+        for (size_t k = 0; k < sizeof bn_context / sizeof bn_context[0]; k++) {
+            const char *key = bn_context[k].key;
+            if (!bn_env_has(envp, key)) continue;
+            size_t len = strlen(key) - 1;
+            memcpy(out, key, len); out += len; *out++ = ':';
+        }
+        for (size_t k = 0; k < sizeof bn_env_defaults / sizeof bn_env_defaults[0]; k++) {
+            const char *key = bn_env_defaults[k];
+            if (!bn_env_has(envp, key)) continue;
+            size_t len = strlen(key) - 1;
+            memcpy(out, key, len); out += len; *out++ = ':';
+        }
+        *out = 0;
         ev[j++] = saved;
     }
     for (size_t key = 0; key < sizeof bn_context / sizeof bn_context[0]; key++) {
@@ -1581,7 +1661,7 @@ static int bn_self_exe(const char *path) {
 }
 
 static ssize_t fake_exe(char *buf, size_t size) {
-    const char *exe = getenv("BIONILUX_TARGET_EXE");
+    const char *exe = bn_env("BIONILUX_TARGET_EXE");
     if (!exe) return -1;
     if (size == 0) { errno = EINVAL; return -1; }
     size_t len = strlen(exe);
@@ -1629,7 +1709,7 @@ char *realpath(const char *path, char *resolved) {
     typedef char *(*fn_t)(const char *, char *);
     static _Thread_local fn_t real; REAL(real, "realpath");
     if (bn_self_exe(path)) {
-        const char *exe = getenv("BIONILUX_TARGET_EXE");
+        const char *exe = bn_env("BIONILUX_TARGET_EXE");
         if (exe && *exe) path = exe;
     }
     char buf[PATH_MAX];
@@ -3263,6 +3343,7 @@ struct group *getgrgid(gid_t gid) {
 
 #include "compat_syscall.inc.c"
 #include "compat_python.inc.c"
+#include "compat_glob.inc.c"
 
 __attribute__((constructor)) static void on_init(void) {
     for (size_t i = 0; i < sizeof bn_context / sizeof bn_context[0]; i++) {
@@ -3281,6 +3362,7 @@ __attribute__((constructor)) static void on_init(void) {
     (void)bn_lenient();
     (void)bn_dns_enabled();
     (void)bn_under_host_paths("/");
+    bn_restore_exec_environment();
     DBG("Injection successful! rootfs=%s\n",
         bn_rootfs() ? bn_rootfs() : "(none)");
 }

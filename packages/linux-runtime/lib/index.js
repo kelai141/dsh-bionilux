@@ -149,7 +149,11 @@ export function apply(ctx, config = {}) {
 
   let disposeTool = () => {};
   const syncTool = () => {
-    disposeTool();
+    try {
+      disposeTool();
+    } catch {
+      // A broken host tool disposer must not break a runtime state change.
+    }
     disposeTool = () => {};
     if (manager.status().healthy) {
       try {
@@ -160,19 +164,29 @@ export function apply(ctx, config = {}) {
     }
   };
 
-  manager.on('change', syncTool);
-  syncTool();
-
-  if (typeof ctx.provide === 'function') {
-    ctx.provide('linuxRuntimeManager', manager);
-  }
-  if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => {
-      disposeTool();
+  let cleaned = false;
+  let cleanupResult;
+  const cleanup = () => {
+    if (!cleaned) {
+      cleaned = true;
+      try { disposeTool(); } catch { /* Still release owned runtime resources. */ }
+      disposeTool = () => {};
       manager.off('change', syncTool);
-      if (ownsManager) return manager.dispose();
-      return undefined;
-    });
+      cleanupResult = ownsManager ? manager.dispose() : undefined;
+    }
+    return cleanupResult;
+  };
+
+  try {
+    // Register teardown before providing services: a failed plugin apply must
+    // not retain the directory's manager lease indefinitely.
+    if (typeof ctx.effect === 'function') ctx.effect(() => cleanup);
+    manager.on('change', syncTool);
+    syncTool();
+    if (typeof ctx.provide === 'function') ctx.provide('linuxRuntimeManager', manager);
+  } catch (error) {
+    Promise.resolve(cleanup()).catch(() => undefined);
+    throw error;
   }
   return manager;
 }
