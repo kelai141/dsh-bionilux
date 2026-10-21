@@ -56,6 +56,8 @@ chmod 755 "$ROOTFS/usr/bin/bn-tool"
 # A file that exists on the host as a sibling of the rootfs. Guest semantics
 # place it outside the guest, so reaching it means a ".." traversal escaped.
 echo "HOST" > "$TMP/escape-target"
+echo "HOST" > "$TMP/bn-symlink-target"
+echo "guest-escape" > "$ROOTFS/bn-symlink-target"
 
 # The host has /etc/os-release and /etc/hostname. Leaving them out of the
 # rootfs makes any host fallback immediately detectable.
@@ -145,6 +147,10 @@ expect rmdir_guest        "1"
 
 # 7. symlink round trip: created with a guest target, read back as one
 expect symlink_create     "1"
+expect symlink_relative_escape "1"
+expect relative_escape_target "guest-escape"
+expect symlinkat_relative_escape "1"
+expect relative_escape_at_target "guest-escape"
 expect readlink           "/etc/bn-marker"
 expect open_through_link  "guest-etc"
 

@@ -131,7 +131,6 @@ fn launch_cwd(
     rootfs: &launcher::rootfs::Rootfs,
     pwd: &std::path::Path,
     explicit: Option<&str>,
-    rerouted: bool,
 ) -> Result<String, String> {
     if let Some(cwd) = explicit {
         if !cwd.starts_with('/') {
@@ -139,8 +138,47 @@ fn launch_cwd(
         }
         Ok(launcher::config::normalize(cwd))
     } else {
-        Ok(launcher::resolve::guest_cwd_for(cfg, rootfs, pwd, rerouted))
+        Ok(launcher::resolve::guest_cwd_for(cfg, rootfs, pwd))
     }
+}
+
+/// The guest cwd this invocation was explicitly told to use.
+///
+/// --guest-cwd always wins. An inherited BIONILUX_GUEST_CWD is configuration
+/// only for the first entry: once a session runs (marker set, or the preload
+/// reroute), that variable just records where the current process is, so a
+/// launcher call from a different physical directory must not be dragged back
+/// to it. The physical cwd decides in that case, and the same value remains the
+/// configured fallback.
+fn configured_guest_cwd(
+    cli: Option<&str>,
+    inherited: Option<String>,
+    rerouted: bool,
+    session: bool,
+) -> Option<String> {
+    if let Some(cwd) = cli {
+        return Some(cwd.to_string());
+    }
+    if rerouted || session {
+        return None;
+    }
+    inherited.filter(|cwd| !cwd.is_empty())
+}
+
+/// Guest path of the program, as /proc/self/exe should report it.
+///
+/// The kernel reports the resolved file, not the name that was typed, so a
+/// symlinked entry point (/usr/local/bin/dart, for example) has to be
+/// canonicalised before it is unmapped. Tools derive their install layout from
+/// that path; reporting the link would send them looking in the wrong place.
+/// The canonical path is used only when it stays inside the rootfs, so a link
+/// that escapes cannot turn into a host path.
+fn guest_target(original: &std::path::Path, rootfs: &launcher::rootfs::Rootfs) -> String {
+    let canonical = original.canonicalize().ok();
+    let chosen = canonical
+        .filter(|path| !rootfs.enabled() || rootfs.contains(path))
+        .unwrap_or_else(|| original.to_path_buf());
+    rootfs.unmap(&chosen.to_string_lossy())
 }
 
 fn main() {
@@ -178,13 +216,14 @@ fn main() {
             exit(1);
         }
     };
-    let explicit_cwd = cli.guest_cwd.clone().or_else(|| {
-        (!rerouted)
-            .then(|| env::var(launcher::config::env_keys::GUEST_CWD).ok())
-            .flatten()
-            .filter(|cwd| !cwd.is_empty())
-    });
-    let mut guest_cwd = match launch_cwd(cfg, &rootfs, &pwd, explicit_cwd.as_deref(), rerouted) {
+    let session = env::var(launcher::env::SESSION_MARKER).is_ok();
+    let explicit_cwd = configured_guest_cwd(
+        cli.guest_cwd.as_deref(),
+        env::var(launcher::config::env_keys::GUEST_CWD).ok(),
+        rerouted,
+        session,
+    );
+    let mut guest_cwd = match launch_cwd(cfg, &rootfs, &pwd, explicit_cwd.as_deref()) {
         Ok(cwd) => cwd,
         Err(error) => {
             eprintln!("error: {error}");
@@ -219,10 +258,29 @@ fn main() {
         execution.preload = None;
     }
 
-    let library_path = if execution.is_native() {
+    let library_path = if execution.loader.is_none() {
+        // A native run needs no loader arguments. A direct loader invocation
+        // already carries its translated --library-path in argv.
         Vec::new()
     } else {
-        launcher::resolve::execution_library_path(cfg, execution.arch, execution.execution_arch)
+        let guest_ld = launcher::env::effective_value(&execution.env_overrides, "LD_LIBRARY_PATH");
+        let main_elf = execution
+            .main_elf
+            .clone()
+            .unwrap_or_else(|| execution.original_target.clone());
+        launcher::resolve::loader_search_path(
+            cfg,
+            &rootfs,
+            &launcher::resolve::LoaderSearch {
+                target: execution.arch,
+                execution: execution.execution_arch,
+                main_elf: &main_elf,
+                rpath: &execution.rpath,
+                runpath: &execution.runpath,
+                guest_library_path: guest_ld.as_deref(),
+                guest_cwd: &guest_cwd,
+            },
+        )
     };
 
     let chdir_to = if env::var_os("BIONILUX_CHDIR_TO_BINARY").is_some() {
@@ -236,7 +294,14 @@ fn main() {
     };
 
     let current_exe = env::current_exe().expect("cannot resolve current executable");
-    let target_guest = rootfs.unmap(&execution.original_target.to_string_lossy());
+    // A shebang script is an argument to its interpreter, not the process
+    // executable. Perl's $^X, for example, must name perl rather than prove;
+    // otherwise prove starts itself again when it tries to run a test.
+    let process_image = execution
+        .main_elf
+        .as_deref()
+        .unwrap_or(&execution.exec_target);
+    let target_guest = guest_target(process_image, &rootfs);
     let target_env = launcher::env::build(
         cfg,
         &launcher::env::GuestEnv {
@@ -304,14 +369,58 @@ mod tests {
         cfg.rootfs = Some(tmp.path().to_path_buf());
         let rootfs = launcher::rootfs::Rootfs::from_config(&cfg);
         let pwd = tmp.path().join("work");
+        assert_eq!(launch_cwd(&cfg, &rootfs, &pwd, Some("/")).unwrap(), "/");
+        assert_eq!(launch_cwd(&cfg, &rootfs, &pwd, None).unwrap(), "/work");
+        assert!(launch_cwd(&cfg, &rootfs, &pwd, Some("relative")).is_err());
+    }
+
+    #[test]
+    fn inherited_guest_cwd_is_only_configuration_for_the_first_entry() {
+        let inherited = || Some("/old/session".to_string());
+        // The first entry may be configured by the host environment.
         assert_eq!(
-            launch_cwd(&cfg, &rootfs, &pwd, Some("/"), true).unwrap(),
-            "/"
+            configured_guest_cwd(None, inherited(), false, false).as_deref(),
+            Some("/old/session")
+        );
+        // Inside a running session the physical directory decides instead.
+        assert_eq!(configured_guest_cwd(None, inherited(), false, true), None);
+        assert_eq!(configured_guest_cwd(None, inherited(), true, false), None);
+        // An explicit flag wins in every case.
+        assert_eq!(
+            configured_guest_cwd(Some("/work"), inherited(), true, true).as_deref(),
+            Some("/work")
         );
         assert_eq!(
-            launch_cwd(&cfg, &rootfs, &pwd, None, true).unwrap(),
-            "/work"
+            configured_guest_cwd(None, Some(String::new()), false, false),
+            None
         );
-        assert!(launch_cwd(&cfg, &rootfs, &pwd, Some("relative"), false).is_err());
+    }
+
+    #[test]
+    fn guest_target_reports_the_resolved_entry_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rootfs");
+        std::fs::create_dir_all(root.join("opt/sdk/bin")).unwrap();
+        std::fs::create_dir_all(root.join("usr/local/bin")).unwrap();
+        std::fs::write(root.join("opt/sdk/bin/tool"), b"x").unwrap();
+        // Relative link, as prepare-rootfs leaves them.
+        std::os::unix::fs::symlink("../../../opt/sdk/bin/tool", root.join("usr/local/bin/tool"))
+            .unwrap();
+
+        let mut cfg = launcher::config::Config::from_env().unwrap();
+        cfg.rootfs = Some(root.clone());
+        let rootfs = launcher::rootfs::Rootfs::from_config(&cfg);
+        assert_eq!(
+            guest_target(&root.join("usr/local/bin/tool"), &rootfs),
+            "/opt/sdk/bin/tool"
+        );
+
+        // A link that leaves the rootfs keeps the name the guest used, so no
+        // host path can be reported.
+        std::os::unix::fs::symlink("/etc/hostname", root.join("usr/local/bin/escape")).unwrap();
+        assert_eq!(
+            guest_target(&root.join("usr/local/bin/escape"), &rootfs),
+            "/usr/local/bin/escape"
+        );
     }
 }

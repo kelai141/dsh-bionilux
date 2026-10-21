@@ -18,6 +18,31 @@ use crate::launcher::rootfs::Rootfs;
 
 const BIONIC_PRELOAD_BLOCKLIST: &[&str] = &["libtermux-exec"];
 
+/// Marks an environment that this launcher exported.
+///
+/// A child of a running guest session inherits it even when the preload
+/// reroute is not involved, for example a static Go binary that starts a
+/// compiler through bionilux. The next launcher call uses it to tell "the host
+/// configured a default" apart from "this is where the session already is".
+pub const SESSION_MARKER: &str = "BIONILUX_GUEST_SESSION";
+
+/// Variables whose natural default is a guest path the host cannot find.
+///
+/// TLS clients inside the guest read their trust store through these, and an
+/// unset variable sends them to the host's own store, which knows nothing
+/// about the rootfs. The last element says whether the guest path is a
+/// directory. Values are only filled in when the guest has the file and did
+/// not set the variable itself: an inherited value is a deliberate choice.
+const GUEST_TLS_DEFAULTS: &[(&str, &str, bool)] = &[
+    ("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt", false),
+    ("SSL_CERT_DIR", "/etc/ssl/certs", true),
+    ("LOCPATH", "/usr/lib/locale", true),
+];
+
+// LOCPATH supports unpacked per-locale directories. A guest that only ships
+// locale-archive still needs localedef --no-archive for a non-default locale.
+// Explicit locale variables remain untouched.
+
 /// Variables that are always dropped: they either ask the loader to do
 /// something that cannot work across a libc boundary, or they would be
 /// re-derived incorrectly for the guest.
@@ -119,6 +144,7 @@ fn build_from(cfg: &Config, spec: &GuestEnv<'_>, mut vars: HashMap<String, Strin
     vars.insert(env_keys::GUEST_HOME.into(), cfg.guest_home.clone());
     vars.insert(env_keys::GUEST_TMP.into(), cfg.guest_tmp.clone());
     vars.insert(env_keys::GUEST_CWD.into(), spec.guest_cwd.to_string());
+    vars.insert(SESSION_MARKER.into(), "1".into());
     match &cfg.rootfs {
         Some(root) => vars.insert(env_keys::ROOTFS.into(), root.to_string_lossy().into_owned()),
         None => vars.remove(env_keys::ROOTFS),
@@ -171,6 +197,24 @@ fn build_from(cfg: &Config, spec: &GuestEnv<'_>, mut vars: HashMap<String, Strin
 
     configure_box64(&mut vars, cfg, spec.arch, Arch::host());
 
+    if spec.rootfs_enabled {
+        let rootfs = Rootfs::from_config(cfg);
+        for (key, guest_path, is_dir) in GUEST_TLS_DEFAULTS {
+            if vars.contains_key(*key) {
+                continue;
+            }
+            let physical = rootfs.physical(guest_path);
+            let found = if *is_dir {
+                physical.is_dir()
+            } else {
+                physical.is_file()
+            };
+            if found {
+                vars.insert((*key).to_string(), physical.to_string_lossy().into_owned());
+            }
+        }
+    }
+
     for (k, v) in spec.overrides {
         vars.insert(k.clone(), v.clone());
     }
@@ -178,9 +222,23 @@ fn build_from(cfg: &Config, spec: &GuestEnv<'_>, mut vars: HashMap<String, Strin
     vars.remove(env_keys::INTERNAL_ARGV0);
     if spec.preload.is_none() {
         vars.remove("LD_PRELOAD");
+        vars.remove(env_keys::INTERNAL_ENV_KEEP);
     }
 
     vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+/// The value a variable will have in the guest.
+///
+/// env shebang assignments are applied after everything else, so they win over
+/// the inherited environment exactly as they do in the built environment.
+pub fn effective_value(overrides: &[(String, String)], key: &str) -> Option<String> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+        .or_else(|| env::var(key).ok())
 }
 
 fn configure_box64(vars: &mut HashMap<String, String>, cfg: &Config, target: Arch, host: Arch) {
@@ -414,7 +472,10 @@ mod tests {
         let cfg = Config::from_env().unwrap();
         let mut spec = guest_spec(true);
         spec.preload = None;
-        let overrides = [("LD_PRELOAD".into(), "must-not-reach-bionic.so".into())];
+        let overrides = [
+            ("LD_PRELOAD".into(), "must-not-reach-bionic.so".into()),
+            (env_keys::INTERNAL_ENV_KEEP.into(), "PWD:".into()),
+        ];
         spec.overrides = &overrides;
         let vars = unpack(build_from(
             &cfg,
@@ -423,10 +484,12 @@ mod tests {
                 (env_keys::INTERNAL_PRELOAD, "arbitrary-guest.so"),
                 (env_keys::INTERNAL_ARGV0, "internal-name"),
                 ("LD_PRELOAD", "another-guest.so"),
+                (env_keys::INTERNAL_ENV_KEEP, "PWD:"),
             ]),
         ));
         for key in [
             "LD_PRELOAD",
+            env_keys::INTERNAL_ENV_KEEP,
             env_keys::INTERNAL_PRELOAD,
             env_keys::INTERNAL_ARGV0,
         ] {
@@ -484,5 +547,95 @@ mod tests {
         // PREFIX must never reach a guest: programs would use it to find
         // Termux' user space.
         assert!(config::host_env_leaks().contains(&"PREFIX"));
+    }
+
+    #[test]
+    fn guest_trust_store_is_exported_only_when_the_guest_owns_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.rootfs = Some(tmp.path().to_path_buf());
+        cfg.host_paths.clear();
+        let spec = guest_spec(false);
+
+        // Without a bundle in the guest nothing is invented.
+        let vars = unpack(build_from(&cfg, &spec, environment(&[])));
+        assert!(!vars.contains_key("SSL_CERT_FILE"));
+        assert!(!vars.contains_key("SSL_CERT_DIR"));
+
+        std::fs::create_dir_all(tmp.path().join("etc/ssl/certs")).unwrap();
+        std::fs::write(tmp.path().join("etc/ssl/certs/ca-certificates.crt"), b"ca").unwrap();
+        let vars = unpack(build_from(&cfg, &spec, environment(&[])));
+        assert_eq!(
+            vars["SSL_CERT_FILE"],
+            tmp.path()
+                .join("etc/ssl/certs/ca-certificates.crt")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            vars["SSL_CERT_DIR"],
+            tmp.path().join("etc/ssl/certs").display().to_string()
+        );
+
+        // A value the guest set itself is never replaced.
+        let vars = unpack(build_from(
+            &cfg,
+            &spec,
+            environment(&[("SSL_CERT_FILE", "/guest/custom.pem")]),
+        ));
+        assert_eq!(vars["SSL_CERT_FILE"], "/guest/custom.pem");
+    }
+
+    #[test]
+    fn trust_store_defaults_do_not_apply_without_a_rootfs() {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.rootfs = None;
+        let mut spec = guest_spec(false);
+        spec.rootfs_enabled = false;
+        let vars = unpack(build_from(&cfg, &spec, environment(&[])));
+        assert!(!vars.contains_key("SSL_CERT_FILE"));
+        assert!(!vars.contains_key("SSL_CERT_DIR"));
+    }
+
+    #[test]
+    fn locale_directory_is_physical_and_an_explicit_value_is_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.rootfs = Some(tmp.path().to_path_buf());
+        cfg.host_paths.clear();
+        let spec = guest_spec(false);
+        let vars = unpack(build_from(&cfg, &spec, environment(&[])));
+        assert!(!vars.contains_key("LOCPATH"));
+        std::fs::create_dir_all(tmp.path().join("usr/lib/locale/C.utf8")).unwrap();
+        let vars = unpack(build_from(&cfg, &spec, environment(&[])));
+        assert_eq!(
+            vars["LOCPATH"],
+            tmp.path().join("usr/lib/locale").display().to_string()
+        );
+        let vars = unpack(build_from(
+            &cfg,
+            &spec,
+            environment(&[("LOCPATH", "/custom/locales")]),
+        ));
+        assert_eq!(vars["LOCPATH"], "/custom/locales");
+    }
+
+    #[test]
+    fn shebang_assignments_take_precedence_over_the_inherited_value() {
+        let overrides = vec![("LD_LIBRARY_PATH".to_string(), "/guest/lib".to_string())];
+        assert_eq!(
+            effective_value(&overrides, "LD_LIBRARY_PATH").as_deref(),
+            Some("/guest/lib")
+        );
+        assert!(effective_value(&[], "BIONILUX_TEST_UNSET_VARIABLE").is_none());
+    }
+
+    #[test]
+    fn every_guest_environment_is_marked_as_a_running_session() {
+        let cfg = Config::from_env().unwrap();
+        for rerouted in [false, true] {
+            let vars = unpack(build_from(&cfg, &guest_spec(rerouted), environment(&[])));
+            assert_eq!(vars[SESSION_MARKER], "1");
+        }
     }
 }

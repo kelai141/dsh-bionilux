@@ -14,7 +14,16 @@
 import { createManager, LinuxRuntimeManager, ExecutionGate } from '../modules/manager.js';
 
 export { createManager, LinuxRuntimeManager, ExecutionGate };
-export { selectRuntime, validateManifest, validateAsset, MANIFEST_SCHEMA_VERSION, PACKAGE_VERSION } from '../modules/manifest.js';
+export {
+  selectRuntime,
+  validateManifest,
+  validateAsset,
+  MANIFEST_SCHEMA_VERSION,
+  PACKAGE_VERSION,
+  DEFAULT_RUNTIME_IDS,
+  defaultRuntimeIdForArch,
+  resolveHostArchitecture,
+} from '../modules/manifest.js';
 export { installPluginAsset, assertOfficialAssetUrl, isAllowedAssetOrigin, verifyDownloadedAsset } from '../modules/asset-installer.js';
 
 export const name = 'dsh-linux-runtime';
@@ -123,6 +132,9 @@ export function registerLinuxBash(ctx, manager, options = {}) {
  * @returns {import('../modules/manager.js').LinuxRuntimeManager} the manager.
  */
 export function apply(ctx, config = {}) {
+  // A manager supplied by the host belongs to the host. One created here must
+  // stop its guest sessions when the plugin is unloaded.
+  const ownsManager = config.manager == null;
   const manager =
     config.manager ??
     createManager({
@@ -137,7 +149,11 @@ export function apply(ctx, config = {}) {
 
   let disposeTool = () => {};
   const syncTool = () => {
-    disposeTool();
+    try {
+      disposeTool();
+    } catch {
+      // A broken host tool disposer must not break a runtime state change.
+    }
     disposeTool = () => {};
     if (manager.status().healthy) {
       try {
@@ -148,17 +164,29 @@ export function apply(ctx, config = {}) {
     }
   };
 
-  manager.on('change', syncTool);
-  syncTool();
-
-  if (typeof ctx.provide === 'function') {
-    ctx.provide('linuxRuntimeManager', manager);
-  }
-  if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => {
-      disposeTool();
+  let cleaned = false;
+  let cleanupResult;
+  const cleanup = () => {
+    if (!cleaned) {
+      cleaned = true;
+      try { disposeTool(); } catch { /* Still release owned runtime resources. */ }
+      disposeTool = () => {};
       manager.off('change', syncTool);
-    });
+      cleanupResult = ownsManager ? manager.dispose() : undefined;
+    }
+    return cleanupResult;
+  };
+
+  try {
+    // Register teardown before providing services: a failed plugin apply must
+    // not retain the directory's manager lease indefinitely.
+    if (typeof ctx.effect === 'function') ctx.effect(() => cleanup);
+    manager.on('change', syncTool);
+    syncTool();
+    if (typeof ctx.provide === 'function') ctx.provide('linuxRuntimeManager', manager);
+  } catch (error) {
+    Promise.resolve(cleanup()).catch(() => undefined);
+    throw error;
   }
   return manager;
 }

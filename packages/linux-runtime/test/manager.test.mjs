@@ -1,13 +1,21 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { createManager, GUEST_PATH_PREFIXES, isGuestPath } from '../modules/manager.js';
-import { validateManifest, validateAsset, selectRuntime } from '../modules/manifest.js';
+import { createManager, GUEST_PATH_PREFIXES, isGuestPath, spawnCommand } from '../modules/manager.js';
+import {
+  DEFAULT_RUNTIME_IDS,
+  defaultRuntimeIdForArch,
+  resolveHostArchitecture,
+  validateManifest,
+  validateAsset,
+  selectRuntime,
+} from '../modules/manifest.js';
+import { apply } from '../lib/index.js';
 
 const temporaryRoot = path.join(os.tmpdir(), `bionilux-runtime-tests-${process.pid}`);
 
@@ -15,14 +23,32 @@ function sha256(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
 }
 
+const ELF_MACHINE = { arm64: 0xb7, x64: 0x3e };
+
+/**
+ * Minimal real ELF64 header (64 bytes). The health check reads the first 20
+ * bytes, so this fixture exercises the production parser instead of a script
+ * that would have to bypass it.
+ */
+function makeElf(architecture = 'arm64', { type = 2 } = {}) {
+  const bytes = Buffer.alloc(64);
+  bytes.set([0x7f, 0x45, 0x4c, 0x46], 0);
+  bytes[4] = 2; // ELFCLASS64
+  bytes[5] = 1; // little endian
+  bytes[6] = 1; // EV_CURRENT
+  bytes.writeUInt16LE(type, 16); // ET_EXEC (2) or ET_DYN (3)
+  bytes.writeUInt16LE(ELF_MACHINE[architecture], 18);
+  return bytes;
+}
+
 const ARCHIVE_FILES = {
   node: {
-    'bin/node': '#!/bin/sh\n',
+    'bin/node': makeElf('arm64'),
     'lib/node_modules/npm/index.js': '// npm\n',
   },
   backend: {
-    'bin/bionilux': '#!/bin/sh\n',
-    'lib/libbionilux_preload.so': 'shared object\n',
+    'bin/bionilux': makeElf('arm64'),
+    'lib/libbionilux_preload.so': makeElf('arm64', { type: 3 }),
     'scripts/prepare-rootfs.sh': '#!/bin/sh\n',
   },
   rootfs: {
@@ -31,6 +57,7 @@ const ARCHIVE_FILES = {
     'usr/bin/apt-get': '#!/bin/sh\n',
     'usr/bin/dpkg': '#!/bin/sh\n',
     'etc/os-release': 'ID=debian\n',
+    'lib/ld-linux-aarch64.so.1': makeElf('arm64', { type: 3 }),
   },
 };
 
@@ -76,6 +103,15 @@ function makeManifest({ nodeAsset, rootfsFiles = ARCHIVE_FILES.rootfs, version =
       ],
     },
   };
+}
+
+function makeDualManifest() {
+  const fixture = makeManifest();
+  const x64 = structuredClone(fixture.manifest.runtimes[0]);
+  x64.id = 'debian-minimal-x64';
+  x64.label = 'Debian minimal x64';
+  x64.architecture = 'x64';
+  return { ...fixture.manifest, runtimes: [fixture.manifest.runtimes[0], x64] };
 }
 
 /**
@@ -164,6 +200,130 @@ function makeRunner({ instant } = {}) {
   };
 }
 
+/**
+ * A runner that acknowledges an abort only after a short delay. That delay is
+ * the window in which a command used to be admitted while a cutover was still
+ * draining the previous one.
+ */
+function makeDeferredAbortRunner({ abortDelayMs = 75 } = {}) {
+  const calls = [];
+  let notifyStarted;
+  let notifyAborted;
+  const started = new Promise((resolve) => { notifyStarted = resolve; });
+  const aborted = new Promise((resolve) => { notifyAborted = resolve; });
+  return {
+    calls,
+    started,
+    aborted,
+    runCommand(spec) {
+      const record = {
+        spec,
+        startedAt: process.hrtime.bigint(),
+        aborted: false,
+        cancelled: false,
+        forceKilled: false,
+        settled: false,
+      };
+      calls.push(record);
+      let resolvePromise;
+      const promise = new Promise((resolve) => {
+        resolvePromise = resolve;
+      });
+      record.settle = (result) => {
+        if (record.settled) return;
+        record.settled = true;
+        resolvePromise(result);
+      };
+      if (String(spec.args?.at(-1) ?? '').includes('sleep')) notifyStarted(record);
+      spec.signal?.addEventListener(
+        'abort',
+        () => {
+          record.aborted = true;
+          notifyAborted(record);
+          if (abortDelayMs !== null) {
+            setTimeout(() => record.settle({ stdout: '', stderr: 'aborted', exitCode: 130 }), abortDelayMs);
+          }
+        },
+        { once: true },
+      );
+      if (!String(spec.args?.at(-1) ?? '').includes('sleep')) {
+        record.settle({ stdout: 'ok', stderr: '', exitCode: 0 });
+      }
+      return {
+        promise,
+        cancel: () => {
+          record.cancelled = true;
+        },
+        forceKill: () => {
+          record.forceKilled = true;
+          record.settle({ stdout: '', stderr: 'killed', exitCode: 137 });
+        },
+      };
+    },
+  };
+}
+
+/** A runner that ignores polite termination until forceKill, then exits late. */
+function makeStubbornRunner({ forceKillDelayMs = 100 } = {}) {
+  const calls = [];
+  return {
+    calls,
+    runCommand(spec) {
+      const record = { spec, aborted: false, cancelled: false, forceKilled: false, settled: false };
+      calls.push(record);
+      let resolvePromise;
+      const promise = new Promise((resolve) => {
+        resolvePromise = resolve;
+      });
+      record.settle = (result) => {
+        if (record.settled) return;
+        record.settled = true;
+        resolvePromise(result);
+      };
+      spec.signal?.addEventListener('abort', () => {
+        record.aborted = true;
+      }, { once: true });
+      if (!String(spec.args?.at(-1) ?? '').includes('sleep')) {
+        record.settle({ stdout: 'ok', stderr: '', exitCode: 0 });
+      }
+      return {
+        promise,
+        cancel: () => {
+          record.cancelled = true;
+        },
+        forceKill: () => {
+          record.forceKilled = true;
+          setTimeout(() => record.settle({ stdout: '', stderr: 'killed', exitCode: 137 }), forceKillDelayMs);
+        },
+      };
+    },
+  };
+}
+
+/** A runner that never settles and ignores every termination request. */
+function makeUnkillableRunner() {
+  const calls = [];
+  return {
+    calls,
+    runCommand(spec) {
+      const record = { spec, aborted: false, cancelled: false, forceKilled: false };
+      calls.push(record);
+      if (!String(spec.args?.at(-1) ?? '').includes('sleep')) {
+        return { promise: Promise.resolve({ stdout: 'ok', stderr: '', exitCode: 0 }) };
+      }
+      return {
+        promise: new Promise(() => {}),
+        cancel: () => {
+          record.cancelled = true;
+        },
+        forceKill: () => {
+          record.forceKilled = true;
+        },
+      };
+    },
+  };
+}
+
 function makeManager(fixture, { dataDir, ioOptions, runnerOptions, arch = 'arm64' } = {}) {
   const io = makeIo(fixture, ioOptions);
   const runner = makeRunner(runnerOptions);
@@ -214,6 +374,7 @@ test('a failing install leaves the previous active runtime untouched', async () 
   const { manager } = makeManager(good, { dataDir });
   const first = await manager.install(good.manifest);
   assert.equal(first.healthy, true);
+  await manager.dispose();
 
   const brokenRootfs = { ...ARCHIVE_FILES.rootfs };
   delete brokenRootfs['usr/bin/dpkg'];
@@ -227,6 +388,11 @@ test('a failing install leaves the previous active runtime untouched', async () 
   assert.equal(after.version, '1.0.0');
   const record = JSON.parse(await readFile(path.join(dataDir, 'active.json'), 'utf8'));
   assert.equal(record.version, '1.0.0');
+  assert.deepEqual(
+    (await readdir(path.join(dataDir, 'instances'))).sort(),
+    [first.instanceId],
+    'the failed staged instance must not be left behind as an orphan',
+  );
 });
 
 test('shared glibc Node is downloaded once and reused across releases', async () => {
@@ -234,6 +400,7 @@ test('shared glibc Node is downloaded once and reused across releases', async ()
   const first = makeManifest({ version: '1.0.0' });
   const { manager } = makeManager(first, { dataDir });
   await manager.install(first.manifest);
+  await manager.dispose();
 
   const nodeDownloads = () => {
     const shared = path.join(dataDir, 'shared', 'node');
@@ -263,6 +430,7 @@ test('a different shared Node archive installs alongside and retires the old one
   const first = makeManifest({ version: '1.0.0' });
   const { manager } = makeManager(first, { dataDir });
   await manager.install(first.manifest);
+  await manager.dispose();
 
   const upgraded = makeManifest({ version: '1.1.0', nodeAsset: makeAsset('node-glibc-v25.0.0-linux-arm64.tar.xz') });
   const io = makeIo(upgraded);
@@ -319,6 +487,231 @@ test('a command issued during a cutover waits for it instead of running against 
   assert.equal(lastSpec.args.at(-1), 'echo after');
 });
 
+test('management refuses a command admitted while it drains in-flight children', { timeout: 15_000 }, async (t) => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const io = makeIo(fixture);
+  const runner = makeDeferredAbortRunner({ abortDelayMs: null });
+  const manager = createManager({
+    dataDir,
+    arch: 'arm64',
+    downloadAsset: io.downloadAsset,
+    extractArchive: io.extractArchive,
+    runCommand: runner.runCommand,
+  });
+  await manager.install(fixture.manifest);
+  let cutoverCompletedAt;
+  manager.on('change', (state) => {
+    if (state.version === '1.1.0') cutoverCompletedAt = process.hrtime.bigint();
+  });
+
+  const running = manager.execute({ command: 'sleep 100', timeout: 60_000 });
+  await runner.started;
+
+  const installing = manager.install(makeManifest({ version: '1.1.0' }).manifest);
+  const draining = await runner.aborted;
+  assert.equal(draining.settled, false, 'hold the aborted child until the queued command is issued');
+
+  // Issued while the manager is still waiting for the aborted child to settle.
+  const queuedController = new AbortController();
+  t.after(() => {
+    queuedController.abort();
+    for (const call of runner.calls) call.settle({ stdout: '', stderr: 'cleanup', exitCode: 130 });
+  });
+  const queued = manager.execute({ command: 'sleep 500', signal: queuedController.signal });
+  draining.settle({ stdout: '', stderr: 'aborted', exitCode: 130 });
+  // A deadlock still fails via the test timeout, but /proc scanning and fixture
+  // extraction are no longer required to finish within a 400 ms benchmark.
+  await installing;
+  for (const call of runner.calls.filter((candidate) => String(candidate.spec.args?.at(-1) ?? '') === 'sleep 500')) {
+    assert.equal(cutoverCompletedAt !== undefined, true);
+    assert.ok(
+      call.startedAt >= cutoverCompletedAt,
+      'a command admitted during the drain must not spawn before the cutover completes',
+    );
+  }
+
+  // Deferred, not dropped: the command runs once the cutover releases the gate.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(
+    runner.calls.filter((call) => String(call.spec.args?.at(-1) ?? '') === 'sleep 500').length,
+    1,
+  );
+  queuedController.abort();
+  const queuedCall = runner.calls.find((call) => String(call.spec.args?.at(-1) ?? '') === 'sleep 500');
+  assert.equal(queuedCall.aborted, true);
+  queuedCall.settle({ stdout: '', stderr: 'aborted', exitCode: 130 });
+  assert.equal((await queued).exitCode, 130);
+  assert.equal((await running).exitCode, 130);
+});
+
+test('a cutover waits for a force-killed child to exit before activating the new tree', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const io = makeIo(fixture);
+  const runner = makeStubbornRunner();
+  const manager = createManager({
+    dataDir,
+    arch: 'arm64',
+    downloadAsset: io.downloadAsset,
+    extractArchive: io.extractArchive,
+    runCommand: runner.runCommand,
+  });
+  await manager.install(fixture.manifest);
+
+  const running = manager.execute({ command: 'sleep 100', timeout: 60_000 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const status = await manager.install(makeManifest({ version: '1.1.0' }).manifest);
+  const stubborn = runner.calls.find((call) => String(call.spec.args?.at(-1) ?? '') === 'sleep 100');
+
+  assert.equal(stubborn.forceKilled, true);
+  assert.equal(stubborn.settled, true, 'management must wait for the child to exit, not only send SIGKILL');
+  assert.equal(status.healthy, true);
+  assert.equal((await running).exitCode, 137);
+});
+
+test('management rejects and preserves the active tree when a child never exits', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const io = makeIo(fixture);
+  const runner = makeUnkillableRunner();
+  const manager = createManager({
+    dataDir,
+    arch: 'arm64',
+    downloadAsset: io.downloadAsset,
+    extractArchive: io.extractArchive,
+    runCommand: runner.runCommand,
+  });
+  const installed = await manager.install(fixture.manifest);
+  assert.equal(installed.healthy, true);
+  const activeBefore = await readFile(path.join(dataDir, 'active.json'), 'utf8');
+  const rootfsFile = path.join(installed.paths.rootfs, 'etc', 'os-release');
+
+  const running = manager.execute({ command: 'sleep 100' });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  await assert.rejects(
+    () => manager.install(makeManifest({ version: '1.1.0' }).manifest),
+    (error) =>
+      error.code === 'ERR_RUNTIME_CHILDREN_STILL_RUNNING' &&
+      /did not exit after SIGKILL/.test(error.message),
+  );
+
+  const status = manager.status();
+  assert.equal(status.healthy, true);
+  assert.equal(status.version, '1.0.0');
+  assert.equal(await readFile(path.join(dataDir, 'active.json'), 'utf8'), activeBefore);
+  assert.equal(existsSync(rootfsFile), true, 'the active rootfs must stay in place');
+  assert.deepEqual((await readdir(path.join(dataDir, 'instances'))).sort(), [installed.instanceId]);
+  assert.deepEqual(await readdir(path.join(dataDir, '.staging')), []);
+  assert.equal(manager.children.size, 1, 'an unconfirmed child must stay tracked');
+  const afterFailure = await manager.execute({ command: 'echo after' });
+  assert.equal(afterFailure.exitCode, 0, 'a failed drain must not leave the gate permanently held');
+  assert.equal(manager.children.size, 1, 'the unconfirmed child is still tracked after later commands');
+  assert.equal(
+    runner.calls.find((call) => String(call.spec.args?.at(-1) ?? '') === 'sleep 100').forceKilled,
+    true,
+  );
+  void running;
+});
+
+test('a second live manager for the same dataDir is rejected without touching the first', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager, runner, io } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  const controller = new AbortController();
+  const running = manager.execute({ command: 'sleep 100', signal: controller.signal });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const activeCall = runner.calls.find((call) => String(call.spec.args?.at(-1) ?? '') === 'sleep 100');
+
+  assert.throws(
+    () => makeManager(fixture, { dataDir }),
+    (error) =>
+      error.code === 'ERR_RUNTIME_MANAGER_IN_USE' &&
+      /dispose it before creating another manager/.test(error.message),
+  );
+  assert.equal(activeCall.settled, false, 'rejection must not stop the existing manager child');
+
+  // A hot reload evaluates a fresh module URL. Its module-local state is new,
+  // but the process-wide owner registry must still see the live first manager.
+  const reloaded = await import(`../modules/manager.js?reload=${Date.now()}`);
+  assert.throws(
+    () =>
+      reloaded.createManager({
+        dataDir,
+        arch: 'arm64',
+        downloadAsset: io.downloadAsset,
+        extractArchive: io.extractArchive,
+        runCommand: runner.runCommand,
+      }),
+    (error) => error.code === 'ERR_RUNTIME_MANAGER_IN_USE',
+  );
+
+  controller.abort();
+  assert.equal((await running).exitCode, 130);
+  await manager.dispose();
+
+  const replacement = {
+    manager: reloaded.createManager({
+      dataDir,
+      arch: 'arm64',
+      downloadAsset: io.downloadAsset,
+      extractArchive: io.extractArchive,
+      runCommand: runner.runCommand,
+    }),
+  };
+  assert.equal(replacement.manager.status().healthy, true);
+  assert.equal((await replacement.manager.execute({ command: 'echo released' })).exitCode, 0);
+  await replacement.manager.dispose();
+});
+
+test('a manager whose dispose failed keeps ownership of its dataDir', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const io = makeIo(fixture);
+  const runner = makeUnkillableRunner();
+  const manager = createManager({
+    dataDir,
+    arch: 'arm64',
+    downloadAsset: io.downloadAsset,
+    extractArchive: io.extractArchive,
+    runCommand: runner.runCommand,
+  });
+  await manager.install(fixture.manifest);
+  const running = manager.execute({ command: 'sleep 100' });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  await assert.rejects(
+    () => manager.dispose(),
+    (error) => error.code === 'ERR_RUNTIME_CHILDREN_STILL_RUNNING',
+  );
+  assert.throws(
+    () => makeManager(fixture, { dataDir }),
+    (error) => error.code === 'ERR_RUNTIME_MANAGER_IN_USE',
+  );
+  void running;
+});
+
+test('a dataDir symlink alias cannot bypass manager ownership', { skip: process.platform === 'win32' }, async () => {
+  const base = tempDir();
+  const dataDir = path.join(base, 'real');
+  const alias = path.join(base, 'alias');
+  await mkdir(dataDir, { recursive: true });
+  await symlink(dataDir, alias, 'dir');
+  const first = createManager({ dataDir, arch: 'arm64' });
+  try {
+    assert.throws(() => createManager({ dataDir: alias, arch: 'arm64' }),
+      (error) => error.code === 'ERR_RUNTIME_MANAGER_IN_USE');
+  } finally {
+    await first.dispose();
+  }
+  const replacement = createManager({ dataDir: alias, arch: 'arm64' });
+  await replacement.dispose();
+});
+
 test('uninstall removes the instance and unreferenced Node but keeps foreign data', async () => {
   const dataDir = tempDir();
   const fixture = makeManifest();
@@ -340,6 +733,273 @@ test('uninstall removes the instance and unreferenced Node but keeps foreign dat
     const { readdir } = await import('node:fs/promises');
     assert.deepEqual(await readdir(shared), []);
   }
+});
+
+test('health rejects an active record that targets another architecture', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  const activeFile = path.join(dataDir, 'active.json');
+  const record = JSON.parse(await readFile(activeFile, 'utf8'));
+  record.architecture = 'x64';
+  await writeFile(activeFile, JSON.stringify(record, null, 2));
+
+  const status = manager.status();
+  assert.equal(status.installed, true);
+  assert.equal(status.healthy, false);
+  assert.equal(status.state, 'unhealthy');
+  assert.match(status.reason, /architecture/);
+  await assert.rejects(() => manager.execute({ command: 'echo hi' }), /architecture/);
+});
+
+test('plugin teardown disposes the manager it created and stops guest sessions', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const io = makeIo(fixture);
+  const runner = makeDeferredAbortRunner({ abortDelayMs: 25 });
+  let teardown;
+  const ctx = {
+    tools: { register: () => () => {} },
+    effect: (setup) => {
+      teardown = setup();
+    },
+  };
+  const manager = apply(ctx, {
+    dataDir,
+    arch: 'arm64',
+    downloadAsset: io.downloadAsset,
+    extractArchive: io.extractArchive,
+    runCommand: runner.runCommand,
+  });
+  await manager.install(fixture.manifest);
+
+  const running = manager.execute({ command: 'sleep 100' });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await teardown();
+
+  assert.equal(manager.status().state, 'disposed');
+  assert.equal((await running).exitCode, 130);
+});
+
+test('plugin teardown leaves a host-owned manager running', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const io = makeIo(fixture);
+  const manager = createManager({
+    dataDir,
+    arch: 'arm64',
+    downloadAsset: io.downloadAsset,
+    extractArchive: io.extractArchive,
+    runCommand: makeRunner().runCommand,
+  });
+  let teardown;
+  const ctx = {
+    tools: { register: () => () => {} },
+    effect: (setup) => {
+      teardown = setup();
+    },
+  };
+  apply(ctx, { manager });
+
+  await teardown();
+  assert.equal(manager.status().state, 'absent', 'the host owns its manager lifecycle');
+  await manager.dispose();
+});
+
+test('failed plugin service registration releases its newly owned manager', async () => {
+  const dataDir = tempDir();
+  let failedManager;
+  assert.throws(() => apply({
+    provide(_name, manager) {
+      failedManager = manager;
+      throw new Error('service registration rejected');
+    },
+  }, { dataDir, arch: 'arm64' }), /service registration rejected/);
+  try {
+    const deadline = Date.now() + 3_000;
+    while (!failedManager.disposed && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(failedManager.disposed, true, 'failed apply must roll back its owned resources');
+    const replacement = createManager({ dataDir, arch: 'arm64' });
+    await replacement.dispose();
+  } finally {
+    await failedManager.dispose();
+  }
+});
+
+test('failed plugin service registration detaches without disposing a host manager', async () => {
+  const { manager } = makeManager(makeManifest(), { dataDir: tempDir() });
+  try {
+    assert.throws(() => apply({
+      provide() { throw new Error('service registration rejected'); },
+    }, { manager }), /service registration rejected/);
+    assert.equal(manager.disposed, false);
+    assert.equal(manager.events.listenerCount('change'), 0);
+  } finally {
+    await manager.dispose();
+  }
+});
+
+test('health requires a rootfs entry point to be a file, not a directory', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  const bash = path.join(manager.status().paths.rootfs, 'bin', 'bash');
+  await rm(bash, { force: true });
+  await mkdir(bash);
+
+  const status = manager.status();
+  assert.equal(status.healthy, false);
+  assert.match(status.reason, /rootfs file is missing: \/bin\/bash/);
+});
+
+test('health rejects a non-ELF launcher instead of trusting its file name', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  await writeFile(path.join(manager.status().paths.backend, 'bin', 'bionilux'), Buffer.alloc(64, 0x41));
+
+  const status = manager.status();
+  assert.equal(status.healthy, false);
+  assert.match(status.reason, /backend launcher.*is not an ELF object/);
+});
+
+test('health rejects a wrong-architecture backend ELF object', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  await writeFile(
+    path.join(manager.status().paths.backend, 'lib', 'libbionilux_preload.so'),
+    makeElf('x64', { type: 3 }),
+  );
+
+  const status = manager.status();
+  assert.equal(status.healthy, false);
+  assert.match(status.reason, /backend preload.*x64 ELF object; expected arm64/);
+});
+
+test('health rejects a wrong-architecture rootfs dynamic loader', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  await writeFile(
+    path.join(manager.status().paths.rootfs, 'lib', 'ld-linux-aarch64.so.1'),
+    makeElf('x64', { type: 3 }),
+  );
+
+  const status = manager.status();
+  assert.equal(status.healthy, false);
+  assert.match(status.reason, /rootfs dynamic loader.*x64 ELF object; expected arm64/);
+});
+
+test('health requires a native loader but allows a cross-development loader', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  await manager.install(fixture.manifest);
+  const rootfs = manager.status().paths.rootfs;
+  await mkdir(path.join(rootfs, 'lib64'), { recursive: true });
+  await writeFile(path.join(rootfs, 'lib64', 'ld-linux-x86-64.so.2'), makeElf('x64', { type: 3 }));
+  assert.equal(manager.status().healthy, true);
+  await rm(path.join(rootfs, 'lib', 'ld-linux-aarch64.so.1'));
+  const missing = manager.status();
+  assert.equal(missing.healthy, false);
+  assert.match(missing.reason, /rootfs dynamic loader for arm64 is missing/);
+});
+
+test('a rootfs loader symlink is resolved inside the rootfs and cannot escape', { skip: process.platform === 'win32' }, async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  const loader = path.join(manager.status().paths.rootfs, 'lib', 'ld-linux-aarch64.so.1');
+  const real = path.join(manager.status().paths.rootfs, 'lib', 'aarch64-linux-gnu', 'ld-linux-aarch64.so.1');
+  await mkdir(path.dirname(real), { recursive: true });
+  await writeFile(real, makeElf('arm64', { type: 3 }));
+  await rm(loader, { force: true });
+  await symlink('/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1', loader);
+
+  const resolved = manager.status();
+  assert.equal(resolved.healthy, true, resolved.reason);
+
+  await rm(loader, { force: true });
+  await symlink(real, loader);
+  const legacy = manager.status();
+  assert.equal(legacy.healthy, true, legacy.reason);
+
+  await rm(loader, { force: true });
+  await symlink('../../outside-loader', loader);
+  const escaped = manager.status();
+  assert.equal(escaped.healthy, false);
+  assert.match(escaped.reason, /escapes the runtime rootfs/);
+});
+
+test('a rootfs directory symlink is resolved inside the rootfs', { skip: process.platform === 'win32' }, async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+
+  const rootfs = manager.status().paths.rootfs;
+  await rm(path.join(rootfs, 'lib'), { recursive: true, force: true });
+  const loaderDirectory = path.join(rootfs, 'usr', 'lib', 'other');
+  await mkdir(loaderDirectory, { recursive: true });
+  await writeFile(path.join(loaderDirectory, 'ld-linux-aarch64.so.1'), makeElf('x64', { type: 3 }));
+  await symlink('/usr/lib/other', path.join(rootfs, 'lib'));
+
+  const status = manager.status();
+  assert.equal(status.healthy, false);
+  assert.match(
+    status.reason,
+    /rootfs dynamic loader.*x64 ELF object; expected arm64/,
+    'the absolute directory link must be resolved inside the rootfs, not on the host',
+  );
+});
+
+test('spawnCommand escalates a guest session that ignores SIGTERM', { skip: process.platform === 'win32' }, async () => {
+  const handle = spawnCommand({
+    file: process.execPath,
+    args: [
+      '-e',
+      "process.on('SIGTERM', () => {}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000)",
+    ],
+    cwd: os.tmpdir(),
+    env: process.env,
+  });
+  // Do not start the termination clock until the child has installed its
+  // handler. A fixed sleep shorter than process startup is flaky under load.
+  await new Promise((resolve, reject) => {
+    let stdout = '';
+    const timer = setTimeout(() => reject(new Error('child did not report readiness')), 10_000);
+    handle.child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      if (!stdout.includes('ready')) return;
+      clearTimeout(timer);
+      resolve();
+    });
+    handle.child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+  const signalledAt = Date.now();
+  handle.cancel('SIGTERM');
+  const result = await handle.promise;
+
+  assert.equal(result.timedOut, false);
+  assert.equal(result.signal, 'SIGKILL');
+  assert.ok(Date.now() - signalledAt < 10_000, 'termination must stay bounded');
 });
 
 test('the guest environment is derived, not inherited from the host', async () => {
@@ -497,6 +1157,54 @@ test('manifest validation rejects unsafe assets and unsupported selections', () 
   traversal.runtimes[0].id = '../escape';
   assert.throws(() => validateManifest(traversal), /unsafe path/);
 
-  assert.throws(() => selectRuntime(fixture.manifest, 'debian-minimal', 'x64'), /not present in the manifest/);
+  assert.throws(() => selectRuntime(fixture.manifest, 'debian-minimal', 'x64'), /targets arm64, but this host is x64/);
   assert.throws(() => validateAsset({ url: fixture.manifest.runtimes[0].rootfsAsset.url, sha256: 'a'.repeat(64), size: 0, unpackedSize: 1 }), /size/);
+});
+
+test('runtime defaults derive from the host architecture and never retarget an explicit id', () => {
+  assert.deepEqual(DEFAULT_RUNTIME_IDS, { arm64: 'debian-minimal', x64: 'debian-minimal-x64' });
+  assert.equal(defaultRuntimeIdForArch('arm64'), 'debian-minimal');
+  assert.equal(defaultRuntimeIdForArch('x64'), 'debian-minimal-x64');
+  assert.throws(() => defaultRuntimeIdForArch('riscv64'), /arm64 or x64/);
+  assert.equal(resolveHostArchitecture('arm64'), 'arm64');
+  assert.equal(resolveHostArchitecture('x64'), 'x64');
+  assert.throws(() => resolveHostArchitecture('riscv64'), /arm64 or x64/);
+  if (process.arch === 'arm64' || process.arch === 'x64') {
+    assert.equal(resolveHostArchitecture(), process.arch);
+  }
+
+  const dual = makeDualManifest();
+  assert.equal(selectRuntime(dual, 'debian-minimal-x64', 'x64').runtime.architecture, 'x64');
+  assert.throws(() => selectRuntime(dual, 'debian-minimal', 'x64'), /targets arm64, but this host is x64/);
+  assert.throws(() => selectRuntime(dual, 'debian-minimal-x64', 'arm64'), /targets x64, but this host is arm64/);
+});
+
+test('the manager derives arch from the host when it is not supplied', () => {
+  if (process.arch !== 'arm64' && process.arch !== 'x64') return;
+  const manager = createManager({
+    dataDir: tempDir(),
+    runCommand: () => {
+      throw new Error('not used');
+    },
+  });
+  assert.equal(manager.arch, process.arch);
+});
+
+test('manager install defaults to the runtime id for its own architecture', async () => {
+  for (const [arch, expected] of [['arm64', 'debian-minimal'], ['x64', 'debian-minimal-x64']]) {
+    const manager = createManager({
+      dataDir: tempDir(),
+      arch,
+      runCommand: () => {
+        throw new Error('not used');
+      },
+    });
+    let selected;
+    manager._installLocked = async (_manifest, runtimeId) => {
+      selected = runtimeId;
+      return { healthy: true };
+    };
+    await manager.install(makeDualManifest());
+    assert.equal(selected, expected);
+  }
 });

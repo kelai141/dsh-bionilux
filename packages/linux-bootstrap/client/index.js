@@ -32,7 +32,7 @@ export function LinuxEnvironmentSection({ linuxBootstrap }) {
   const [status, setStatus] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [runtimeId, setRuntimeId] = useState('debian-minimal')
+  const [runtimeId, setRuntimeId] = useState('')
 
   useEffect(() => {
     if (!linuxBootstrap) {
@@ -59,6 +59,22 @@ export function LinuxEnvironmentSection({ linuxBootstrap }) {
     }
   }, [linuxBootstrap])
 
+  useEffect(() => {
+    if (!status) return
+    const choices = (Array.isArray(status.runtimes) ? status.runtimes : []).filter(
+      (runtime) => !status.architecture || runtime.architecture === status.architecture,
+    )
+    const installedId = status.installed
+      ? (status.runtime?.id ?? status.runtime?.runtimeId ?? status.runtimeId ?? null)
+      : null
+    const preferred = installedId ?? (
+      choices.some((runtime) => runtime.id === runtimeId)
+        ? runtimeId
+        : status.defaultRuntimeId ?? choices[0]?.id
+    )
+    if (preferred && preferred !== runtimeId) setRuntimeId(preferred)
+  }, [status, runtimeId])
+
   const run = async (action) => {
     setBusy(true)
     setError('')
@@ -76,8 +92,13 @@ export function LinuxEnvironmentSection({ linuxBootstrap }) {
   const installed = Boolean(status?.installed)
   const autoUpdateEnabled = status?.autoUpdate ?? false
   const urls = status?.pluginReleaseUrls ?? {}
-  const runtimes = Array.isArray(status?.runtimes) ? status.runtimes : []
-  const selectedRuntime = status?.installed && status?.runtime?.id ? status.runtime.id : runtimeId
+  const runtimes = (Array.isArray(status?.runtimes) ? status.runtimes : []).filter(
+    (runtime) => !status?.architecture || runtime.architecture === status.architecture,
+  )
+  const selectedRuntime =
+    status?.installed && (status?.runtime?.id ?? status?.runtime?.runtimeId ?? status?.runtimeId)
+      ? (status?.runtime?.id ?? status?.runtime?.runtimeId ?? status?.runtimeId)
+      : (runtimes.some((runtime) => runtime.id === runtimeId) ? runtimeId : status?.defaultRuntimeId ?? runtimes[0]?.id ?? '')
   const confirmInstall = () =>
     window.confirm(
       '安装 Linux 环境会下载 Bionilux、Debian minimal rootfs 与共享 glibc Node.js（数百 MB），' +
@@ -139,7 +160,13 @@ export function LinuxEnvironmentSection({ linuxBootstrap }) {
           disabled: busy || !linuxBootstrap,
           onClick: () => {
             if (!confirmInstall()) return undefined
-            return run(() => linuxBootstrap.install({ runtimeId: selectedRuntime, confirmed: true, activate: true }))
+            return run(() =>
+              linuxBootstrap.install({
+                ...(selectedRuntime ? { runtimeId: selectedRuntime } : {}),
+                confirmed: true,
+                activate: true,
+              }),
+            )
           },
         },
         installed ? '安装 Linux 更新' : '安装 Linux 环境',

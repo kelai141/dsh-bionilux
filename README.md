@@ -117,6 +117,10 @@ Bionilux、rootfs 与一份共享的 glibc Node.js 包都以带校验和的 Rele
 
 ## 已知限制
 
+2026-10-21 两轮验收后的修复、实测结果与剩余问题集中记录在
+[验收修复台账](docs/ACCEPTANCE_FIXES.md)；新增的 syscall、Python IPC、动态库及
+架构兼容范围见 [rootfs 契约](docs/ROOTFS.md#2026-10-21-验收修正)。历史验收记录不由修复结果覆盖。
+
 其中一些是 Android 平台事实，另一些是用 `LD_PRELOAD`（而不是内核沙箱）实现这件事本身
 固有的。它们被如实记录，而不是被粉饰。
 

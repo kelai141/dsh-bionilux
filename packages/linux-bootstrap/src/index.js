@@ -2,12 +2,20 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fetchLatestManifest } from './github.js'
-import { findRuntime, RUNTIME_ENTRY, RUNTIME_PACKAGE_NAME, validateManifestShape } from './manifest.js'
+import {
+  defaultRuntimeIdForArch,
+  resolveHostArchitecture,
+  RUNTIME_ENTRY,
+  RUNTIME_PACKAGE_NAME,
+  selectRuntimeForArch,
+  validateManifestShape,
+} from './manifest.js'
 import { installVerifiedPluginBundle } from './asset-bundle.js'
 import { compareVersions, parseVersion } from './version.js'
 
 export const name = 'dsh-linux-bootstrap'
 export const inject = ['linuxPluginHost']
+/** @deprecated Historical ARM64 ID; use defaultRuntimeIdForArch for host selection. */
 export const DEFAULT_RUNTIME_ID = 'debian-minimal'
 export const BOOTSTRAP_VERSION = '0.5.0'
 export const STATE_FILE_NAME = 'linux-bootstrap-state.json'
@@ -54,17 +62,17 @@ function initialState(autoUpdate) {
 /**
  * Runtime choices offered by the newest manifest this service has seen.
  *
- * Debian minimal is the default and the only one published today; the list is
- * data-driven so additional runtimes appear in the settings selector as soon as
- * the release manifest carries them.
+ * The list is data-driven, but only runtimes for this host's architecture are
+ * offered: selecting an x64 runtime on an arm64 device is never a valid install.
  *
  * @param {object} state - Persisted bootstrap state.
+ * @param {'arm64'|'x64'} arch - Architecture of this host.
  * @returns {Array<{id: string, label: string, architecture: string, installed: boolean}>} Choices.
  */
-function availableRuntimes(state) {
+function availableRuntimes(state, arch) {
   const manifest = state.availableManifest ?? state.pinnedManifest
   if (!Array.isArray(manifest?.runtimes)) return []
-  return manifest.runtimes.map((runtime) => ({
+  return manifest.runtimes.filter((runtime) => runtime.architecture === arch).map((runtime) => ({
     id: runtime.id,
     label: runtime.label,
     architecture: runtime.architecture,
@@ -72,9 +80,8 @@ function availableRuntimes(state) {
   }))
 }
 
-function statusShape(state, mobileVersion, operation, packageVersion) {
+function statusShape(state, mobileVersion, operation, packageVersion, arch) {
   return Object.freeze({
-    experimental: true,
     experimental: true,
     enabledByDefault: false,
     sandboxed: false,
@@ -92,9 +99,11 @@ function statusShape(state, mobileVersion, operation, packageVersion) {
     updateBlocked: state.updateBlocked,
     busy: operation !== 'idle',
     operation,
+    runtimeId: state.runtimeId,
     runtime: state.runtime ?? (state.runtimeId ? { id: state.runtimeId } : null),
-    runtimes: availableRuntimes(state),
-    defaultRuntimeId: DEFAULT_RUNTIME_ID,
+    runtimes: availableRuntimes(state, arch),
+    defaultRuntimeId: defaultRuntimeIdForArch(arch),
+    architecture: arch,
     plugins: {
       bootstrap: { version: packageVersion, builtIn: true },
       runtime: state.installedLinuxVersion ? { version: state.installedLinuxVersion, package: RUNTIME_PACKAGE_NAME, directory: state.pluginDirectory } : null,
@@ -174,6 +183,7 @@ export function createMobileBootstrap(options = {}) {
     arch,
   } = options
 
+  const hostArch = resolveHostArchitecture(arch)
   if (typeof dataDir !== 'string' || !dataDir) throw new TypeError('dataDir is required')
   if (typeof releaseUrl !== 'string' || !releaseUrl) throw new TypeError('releaseUrl is required')
   if (!pluginHost || typeof pluginHost.install !== 'function' || typeof pluginHost.uninstall !== 'function') throw new TypeError('linuxPluginHost.install and uninstall are required')
@@ -199,7 +209,7 @@ export function createMobileBootstrap(options = {}) {
   let tail = Promise.resolve()
   const listeners = new Set()
 
-  const statusValue = () => statusShape(state, mobileVersion, operation, options.version ?? BOOTSTRAP_VERSION)
+  const statusValue = () => statusShape(state, mobileVersion, operation, options.version ?? BOOTSTRAP_VERSION, hostArch)
   const emit = () => {
     lastStatus = statusValue()
     for (const listener of listeners) {
@@ -296,14 +306,14 @@ export function createMobileBootstrap(options = {}) {
     ...runtimePluginConfig,
     dataDir: path.join(root, 'runtime'),
     cacheDir: cacheRoot,
-    arch,
+    arch: hostArch,
     manifest: publicManifest(manifest),
     runtimeId,
   })
 
   async function installRuntime({ manifest, runtimeId, reinstall = false, automatic = false, activate = false }) {
-    const runtime = findRuntime(manifest, runtimeId)
-    if (!runtime) throw new Error(`Unknown runtime id: ${runtimeId}`)
+    const runtime = selectRuntimeForArch(manifest, runtimeId, hostArch)
+    runtimeId = runtime.id
     await updateMobileVersion()
     ensureMobileCompatible(manifest, mobileVersion)
     if (state.installedLinuxVersion) {
@@ -406,7 +416,7 @@ export function createMobileBootstrap(options = {}) {
       if (automatic) {
         state.lastAutomaticCheckMobileVersion = mobileVersion
         await save()
-        if (state.updateAvailable && state.enabled && state.injectionActivated) await installRuntime({ manifest, runtimeId: state.runtimeId ?? DEFAULT_RUNTIME_ID, automatic: true })
+        if (state.updateAvailable && state.enabled && state.injectionActivated) await installRuntime({ manifest, runtimeId: state.runtimeId ?? defaultRuntimeIdForArch(hostArch), automatic: true })
       } else {
         await save()
       }
@@ -475,7 +485,7 @@ export function createMobileBootstrap(options = {}) {
     },
     /** Re-read the host's injection view (used after the user changes the injection directory). */
     syncInjectionState: () => ready.then(() => serial(async () => { await synchronizeInjectionState(); return emit() })),
-    install: ({ runtimeId = DEFAULT_RUNTIME_ID, confirmed = false, activate = false } = {}) => ready.then(() => serial(async () => {
+    install: ({ runtimeId, confirmed = false, activate = false } = {}) => ready.then(() => serial(async () => {
       if (confirmed !== true || activate !== true) throw new Error('install requires confirmed:true and activate:true')
       const manifest = await fetchManifest()
       return installRuntime({ manifest, runtimeId, activate: true })
@@ -484,7 +494,7 @@ export function createMobileBootstrap(options = {}) {
       if (confirmed !== true || activate !== true) throw new Error('reinstall requires confirmed:true and activate:true')
       if (!state.pinnedManifest || !state.installedLinuxVersion) throw new Error('There is no installed Linux runtime to reinstall')
       const manifest = validateManifestShape(state.pinnedManifest)
-      return installRuntime({ manifest, runtimeId: state.runtimeId ?? DEFAULT_RUNTIME_ID, reinstall: true, activate: true })
+      return installRuntime({ manifest, runtimeId: state.runtimeId ?? defaultRuntimeIdForArch(hostArch), reinstall: true, activate: true })
     })),
     uninstall: ({ confirmed = false } = {}) => ready.then(() => serial(async () => {
       if (confirmed !== true) throw new Error('uninstall requires confirmed:true')
@@ -555,5 +565,15 @@ export function apply(ctx, config = {}) {
 
 export { installVerifiedPluginBundle } from './asset-bundle.js'
 export { compareVersions, parseVersion } from './version.js'
-export { validateManifestShape, findRuntime, RUNTIME_ENTRY, RUNTIME_PACKAGE_NAME } from './manifest.js'
+export {
+  validateManifestShape,
+  findRuntime,
+  selectRuntimeForArch,
+  defaultRuntimeIdForArch,
+  resolveHostArchitecture,
+  DEFAULT_RUNTIME_IDS,
+  SUPPORTED_ARCHITECTURES,
+  RUNTIME_ENTRY,
+  RUNTIME_PACKAGE_NAME,
+} from './manifest.js'
 export { LINUX_ENVIRONMENT_ROUTES, createRouteHandlers } from './routes.js'

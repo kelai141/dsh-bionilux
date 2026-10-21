@@ -32,11 +32,22 @@ pub struct Execution {
     pub execution_arch: Arch,
     /// `VAR=VALUE` entries from an `env` shebang, applied to the guest env.
     pub env_overrides: Vec<(String, String)>,
+    /// ELF the loader will treat as the main object. Its directory is what
+    /// $ORIGIN means to the guest.
+    pub main_elf: Option<PathBuf>,
+    /// DT_RPATH entries of main_elf, as the guest wrote them.
+    pub rpath: Vec<String>,
+    /// DT_RUNPATH entries of main_elf, as the guest wrote them.
+    pub runpath: Vec<String>,
 }
 
 impl Execution {
+    /// True when no glibc runtime is involved: no loader and no hook.
+    ///
+    /// A program started by executing the rootfs loader itself has no loader
+    /// field but keeps its preload, because it is still a guest process.
     pub fn is_native(&self) -> bool {
-        self.loader.is_none()
+        self.loader.is_none() && self.preload.is_none()
     }
 }
 
@@ -162,6 +173,21 @@ fn resolve_at(
 
     let cfg = config();
     let host = Arch::host();
+
+    // A glibc loader has no PT_INTERP of its own, so it looks like a static
+    // binary. Running it is still meaningful: it can inspect and load a guest
+    // program (ld.so --list, --verify, or a bare program name). Treat it as
+    // such only when it really is the rootfs' loader.
+    if info.dynamic && info.interpreter.is_none() && is_guest_loader(cfg, &target, arch) {
+        if arch != host {
+            return Err(Error::Unsupported(format!(
+                "cross-architecture {arch:?} loader invocation on {host:?}"
+            )));
+        }
+        debug!("guest loader invocation");
+        return direct_loader(&target, args, guest_cwd, arch, inject_preload);
+    }
+
     let box64 = if arch == Arch::X86_64 && host == Arch::Aarch64 && info.libc == Libc::Glibc {
         let path = cfg
             .box64
@@ -191,6 +217,9 @@ fn resolve_at(
             arch: architecture.target,
             execution_arch: architecture.execution,
             env_overrides: Vec::new(),
+            main_elf: None,
+            rpath: Vec::new(),
+            runpath: Vec::new(),
         });
     }
 
@@ -235,6 +264,7 @@ fn resolve_at(
 
     Ok(Execution {
         exec_target,
+        main_elf: Some(target.clone()),
         original_target: target,
         argv,
         loader: Some(loader),
@@ -242,6 +272,8 @@ fn resolve_at(
         arch: architecture.target,
         execution_arch: architecture.execution,
         env_overrides: Vec::new(),
+        rpath: info.rpath.clone(),
+        runpath: info.runpath.clone(),
     })
 }
 
@@ -471,6 +503,9 @@ fn script(
         preload: inner.preload,
         arch: inner.arch,
         execution_arch: inner.execution_arch,
+        main_elf: inner.main_elf,
+        rpath: inner.rpath,
+        runpath: inner.runpath,
         env_overrides: {
             let mut o = overrides;
             o.extend(inner.env_overrides);
@@ -589,11 +624,210 @@ fn parse_shebang(path: &Path) -> Option<(String, Option<String>)> {
     Some((interp, arg))
 }
 
+/// True when path is the rootfs' own glibc loader.
+///
+/// The name check alone is not enough: a static binary can be called anything.
+/// Requiring the file name, a dynamic segment (checked by the caller) and a
+/// location inside the configured rootfs keeps ordinary static executables on
+/// the normal path.
+fn is_guest_loader(cfg: &Config, path: &Path, arch: Arch) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some(arch.loader_name()) {
+        return false;
+    }
+    if cfg.loader.as_deref() == Some(path) {
+        return true;
+    }
+    cfg.rootfs
+        .as_ref()
+        .is_some_and(|root| path.starts_with(root))
+}
+
+/// Loader options whose following argument belongs to the loader rather than
+/// to the guest program.
+const LOADER_VALUE_OPTIONS: &[&str] = &[
+    "--library-path",
+    "--preload",
+    "--audit",
+    "--argv0",
+    "--inhibit-rpath",
+    "--glibc-hwcaps-prepend",
+    "--glibc-hwcaps-mask",
+];
+
+/// Run the rootfs loader itself with a translated guest program.
+///
+/// Only the pieces that cannot work otherwise are touched: the program name is
+/// mapped into the rootfs, and the loader receives a physical --library-path.
+/// Everything after the program name is passed through untouched, and so are
+/// options this code does not understand. Other options that name guest paths
+/// (--preload, --audit) are left as written.
+fn direct_loader(
+    loader: &Path,
+    args: &[String],
+    guest_cwd: &str,
+    arch: Arch,
+    inject_preload: bool,
+) -> Result<Execution, Error> {
+    let cfg = config();
+    let rootfs = Rootfs::current();
+    let mut argv: Vec<String> = vec![
+        args.first()
+            .cloned()
+            .unwrap_or_else(|| loader.display().to_string()),
+    ];
+    let mut program: Option<PathBuf> = None;
+    let mut program_slot = 0;
+    let mut library_slot: Option<usize> = None;
+    let mut library_value: Option<String> = None;
+    let mut diagnostic = false;
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if program.is_some() {
+            // Arguments of the guest program are not the loader's business.
+            argv.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        if let Some(option) = arg.strip_prefix("--") {
+            let (name, inline_value) = match option.split_once('=') {
+                Some((name, value)) => (format!("--{name}"), Some(value)),
+                None => (arg.clone(), None),
+            };
+            let has_inline_value = inline_value.is_some();
+            if matches!(
+                arg.as_str(),
+                "--list"
+                    | "--verify"
+                    | "--help"
+                    | "--version"
+                    | "--list-tunables"
+                    | "--list-diagnostics"
+            ) {
+                // These options inspect the loader's inputs and exit without
+                // starting the program.
+                diagnostic = true;
+                argv.push(arg.clone());
+                index += 1;
+                continue;
+            }
+            if LOADER_VALUE_OPTIONS.contains(&name.as_str()) {
+                let value = match inline_value {
+                    Some(value) => {
+                        index += 1;
+                        value.to_string()
+                    }
+                    None => {
+                        let value = args.get(index + 1).ok_or_else(|| {
+                            Error::Unsupported(format!("{name} needs an argument"))
+                        })?;
+                        index += 2;
+                        value.clone()
+                    }
+                };
+                if name == "--library-path" {
+                    // A guest path list would be read as host paths. It is
+                    // translated once the program (and therefore $ORIGIN) is
+                    // known, then inserted at the same position.
+                    if library_slot.is_none() {
+                        library_slot = Some(argv.len());
+                    }
+                    library_value = Some(value);
+                } else if has_inline_value {
+                    argv.push(arg.clone());
+                } else {
+                    argv.push(arg.clone());
+                    argv.push(value);
+                }
+                continue;
+            }
+            // --inhibit-cache or an option this code does not know: keep it
+            // verbatim rather than guessing what it means.
+            argv.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        // First non-option argument: the guest program the loader acts on.
+        let physical =
+            resolve_target(arg, guest_cwd).ok_or_else(|| Error::NotFound(arg.clone()))?;
+        program_slot = argv.len();
+        argv.push(physical.to_string_lossy().into_owned());
+        program = Some(physical);
+        index += 1;
+    }
+
+    let mut rpath = Vec::new();
+    let mut runpath = Vec::new();
+    if let Some(path) = &program {
+        if let Some(info) = elf::analyze(path) {
+            rpath = info.rpath;
+            runpath = info.runpath;
+        }
+        let inherited = library_value
+            .clone()
+            .or_else(|| env::var("LD_LIBRARY_PATH").ok());
+        let dirs = loader_search_path(
+            cfg,
+            rootfs,
+            &LoaderSearch {
+                target: arch,
+                execution: arch,
+                main_elf: path,
+                rpath: &rpath,
+                runpath: &runpath,
+                guest_library_path: inherited.as_deref(),
+                guest_cwd,
+            },
+        );
+        if !dirs.is_empty() {
+            let slot = library_slot.unwrap_or(program_slot);
+            argv.insert(slot, dirs.join(":"));
+            argv.insert(slot, "--library-path".into());
+        }
+    } else if let Some(value) = library_value {
+        // Nothing to translate the path against; keep the invocation as the
+        // guest wrote it.
+        let slot = library_slot.unwrap_or(argv.len());
+        argv.insert(slot, value);
+        argv.insert(slot, "--library-path".into());
+    }
+
+    // Running a program through the loader is still a guest process: without
+    // the hook it would see host paths. Diagnostics never start the program,
+    // so they stay usable even when the hook is not installed.
+    let preload = if inject_preload && program.is_some() && !diagnostic {
+        Some(find_preload(arch).ok_or(Error::NoPreload)?)
+    } else {
+        None
+    };
+
+    Ok(Execution {
+        exec_target: loader.to_path_buf(),
+        original_target: program.clone().unwrap_or_else(|| loader.to_path_buf()),
+        argv,
+        loader: None,
+        preload,
+        arch,
+        execution_arch: arch,
+        env_overrides: Vec::new(),
+        main_elf: program,
+        rpath,
+        runpath,
+    })
+}
+
 /// Guest working directory for a launch.
 ///
-/// When the host cwd already sits inside the rootfs the guest keeps it — that
-/// is how a child inherits its parent's directory without a `chdir`.
-pub fn guest_cwd_for(cfg: &Config, rootfs: &Rootfs, pwd: &Path, rerouted: bool) -> String {
+/// The host cwd is kept whenever the guest can already see it under the same
+/// name: inside the rootfs it becomes the matching guest path, and under an
+/// authorized host directory (--host-path, the install prefix, the runtime
+/// directory) the physical path is the guest path. A compiler invoked from a
+/// workspace therefore keeps that workspace instead of starting in /.
+///
+/// A directory that belongs to the host alone is replaced by the configured
+/// default. An explicit --guest-cwd is handled before this function and wins
+/// in every case.
+pub fn guest_cwd_for(cfg: &Config, rootfs: &Rootfs, pwd: &Path) -> String {
     let physical = pwd.to_string_lossy();
     if !rootfs.enabled() {
         return physical.into_owned();
@@ -601,10 +835,109 @@ pub fn guest_cwd_for(cfg: &Config, rootfs: &Rootfs, pwd: &Path, rerouted: bool) 
     if rootfs.contains(pwd) {
         return rootfs.unmap(&physical);
     }
-    if rerouted && rootfs.passthrough(&physical) {
+    if rootfs.passthrough(&physical) {
         return physical.into_owned();
     }
     cfg.guest_cwd.clone()
+}
+
+/// What the loader of one invocation has to look for.
+pub struct LoaderSearch<'a> {
+    /// Architecture of the program the guest asked for.
+    pub target: Arch,
+    /// Architecture of the process that actually loads libraries.
+    pub execution: Arch,
+    /// Physical path of the object whose DT_RPATH/DT_RUNPATH apply.
+    pub main_elf: &'a Path,
+    pub rpath: &'a [String],
+    pub runpath: &'a [String],
+    /// Guest-visible LD_LIBRARY_PATH, if the guest set one.
+    pub guest_library_path: Option<&'a str>,
+    pub guest_cwd: &'a str,
+}
+
+/// Physical loader search path for one invocation.
+///
+/// The order is the one glibc itself uses: the main object's DT_RPATH (only
+/// when it has no DT_RUNPATH), the guest's LD_LIBRARY_PATH, its DT_RUNPATH,
+/// then the rootfs' own default directories.
+///
+/// The guest list has to be translated because --library-path replaces
+/// LD_LIBRARY_PATH for the loader: left alone, /opt/lib would be read as a
+/// host directory. Directories that do not exist in the guest are dropped, so
+/// a host-injected value cannot keep a host path alive.
+///
+/// One approximation follows from the loader's single --library-path list: the
+/// translated RUNPATH is visible to indirect lookups as well, which is wider
+/// than DT_RUNPATH's own scope. A dependency's own RPATH/RUNPATH is not
+/// translated at all, so a dependency that relies on one still needs the guest
+/// paths it names to be reachable another way.
+pub fn loader_search_path(cfg: &Config, rootfs: &Rootfs, search: &LoaderSearch<'_>) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    // Box64 resolves the target's libraries itself and reads its own guest
+    // list from BOX64_LD_LIBRARY_PATH, so x86 paths must not reach the host
+    // loader.
+    if search.target == search.execution {
+        let origin = search
+            .main_elf
+            .parent()
+            .map(|dir| rootfs.unmap(&dir.to_string_lossy()))
+            .unwrap_or_else(|| "/".to_string());
+        let mut add = |entry: &str| {
+            if let Some(dir) = map_search_entry(rootfs, entry, &origin, search.guest_cwd)
+                && !dirs.contains(&dir)
+            {
+                dirs.push(dir);
+            }
+        };
+        if search.runpath.is_empty() {
+            for entry in search.rpath {
+                add(entry);
+            }
+        }
+        if let Some(list) = search.guest_library_path.filter(|list| !list.is_empty()) {
+            for entry in list.split(':') {
+                add(entry);
+            }
+        }
+        for entry in search.runpath {
+            add(entry);
+        }
+    }
+    for dir in execution_library_path(cfg, search.target, search.execution) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Translate one loader search-path entry into a physical directory.
+///
+/// ORIGIN is expanded against the guest-visible directory of the main object.
+/// Letting glibc expand it inside --library-path would use the loader's own
+/// directory instead, which is not what the program's DT_RPATH meant.
+fn map_search_entry(rootfs: &Rootfs, entry: &str, origin: &str, guest_cwd: &str) -> Option<String> {
+    let expanded = entry
+        .replace("${ORIGIN}", origin)
+        .replace("$ORIGIN", origin);
+    // LIB and PLATFORM depend on the loader's platform. Guessing them would
+    // silently choose a directory the guest did not ask for.
+    if expanded.contains('$') {
+        return None;
+    }
+    let logical = if expanded.is_empty() {
+        // An empty element means the current directory.
+        normalize(guest_cwd)
+    } else if expanded.starts_with('/') {
+        normalize(&expanded)
+    } else {
+        normalize(&join_guest(guest_cwd, &expanded))
+    };
+    let physical = rootfs.physical(&logical);
+    physical
+        .is_dir()
+        .then(|| physical.to_string_lossy().into_owned())
 }
 
 /// Physical directories the loader must be told about.
@@ -781,13 +1114,13 @@ mod tests {
         cfg.rootfs = None;
         let rootfs = Rootfs::from_config(&cfg);
         assert_eq!(
-            guest_cwd_for(&cfg, &rootfs, Path::new("/actual/cwd"), false),
+            guest_cwd_for(&cfg, &rootfs, Path::new("/actual/cwd")),
             "/actual/cwd"
         );
     }
 
     #[test]
-    fn rerouted_cwd_preserves_exposed_workspace_and_guest_subdirectories() {
+    fn authorized_host_workspace_is_kept_for_rerouted_and_explicit_launches() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::from_env().unwrap();
         cfg.rootfs = Some(tmp.path().join("rootfs"));
@@ -795,20 +1128,20 @@ mod tests {
         let workspace = tmp.path().join("workspace");
         cfg.host_paths = vec![workspace.clone()];
         let rootfs = Rootfs::from_config(&cfg);
+        // A compiler started by go in its build directory must keep that
+        // directory, whether it arrived through the preload reroute or was
+        // invoked directly.
         assert_eq!(
-            guest_cwd_for(&cfg, &rootfs, &workspace, true),
+            guest_cwd_for(&cfg, &rootfs, &workspace),
             workspace.to_string_lossy()
         );
-        assert_eq!(guest_cwd_for(&cfg, &rootfs, &workspace, false), "/");
         assert_eq!(
-            guest_cwd_for(
-                &cfg,
-                &rootfs,
-                &cfg.rootfs.as_ref().unwrap().join("work"),
-                true
-            ),
+            guest_cwd_for(&cfg, &rootfs, &cfg.rootfs.as_ref().unwrap().join("work")),
             "/work"
         );
+        // A host-only directory is not visible to the guest, so the configured
+        // default still applies.
+        assert_eq!(guest_cwd_for(&cfg, &rootfs, Path::new("/host/only")), "/");
     }
 
     #[test]
@@ -836,6 +1169,9 @@ mod tests {
             machine: elf::EM_AARCH64,
             libc: Libc::Glibc,
             interpreter: Some("/lib/ld-linux-aarch64.so.1".into()),
+            dynamic: true,
+            rpath: Vec::new(),
+            runpath: Vec::new(),
         }
     }
 
@@ -989,5 +1325,155 @@ mod tests {
     #[test]
     fn find_loader_missing_outside_any_rootfs() {
         assert!(find_loader("/nonexistent/foo/ld-fake.so", Arch::Aarch64).is_none());
+    }
+
+    // ── loader search paths ────────────────────────────────────────
+
+    fn rootfs_fixture(dirs: &[&str]) -> (tempfile::TempDir, Config, Rootfs) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rootfs");
+        for dir in dirs {
+            std::fs::create_dir_all(root.join(dir.trim_start_matches('/'))).unwrap();
+        }
+        let mut cfg = Config::from_env().unwrap();
+        cfg.rootfs = Some(root);
+        cfg.prefix = None;
+        cfg.runtime_dir = None;
+        cfg.host_paths.clear();
+        cfg.guest_cwd = "/".into();
+        let rootfs = Rootfs::from_config(&cfg);
+        (tmp, cfg, rootfs)
+    }
+
+    fn physical(cfg: &Config, relative: &str) -> String {
+        cfg.rootfs
+            .as_ref()
+            .unwrap()
+            .join(relative)
+            .display()
+            .to_string()
+    }
+
+    #[test]
+    fn rpath_precedes_library_path_and_origin_names_the_main_object_directory() {
+        let (_tmp, cfg, rootfs) =
+            rootfs_fixture(&["opt/app/bin", "opt/app/lib", "opt/rpath", "opt/ld"]);
+        let elf = cfg.rootfs.as_ref().unwrap().join("opt/app/bin/app");
+        let rpath = ["$ORIGIN/../lib".to_string(), "/opt/rpath".to_string()];
+        let dirs = loader_search_path(
+            &cfg,
+            &rootfs,
+            &LoaderSearch {
+                target: Arch::host(),
+                execution: Arch::host(),
+                main_elf: &elf,
+                rpath: &rpath,
+                runpath: &[],
+                guest_library_path: Some("/opt/ld"),
+                guest_cwd: "/",
+            },
+        );
+        assert_eq!(dirs[0], physical(&cfg, "opt/app/lib"));
+        assert_eq!(dirs[1], physical(&cfg, "opt/rpath"));
+        assert!(dirs.contains(&physical(&cfg, "opt/ld")));
+    }
+
+    #[test]
+    fn runpath_replaces_rpath_and_follows_library_path() {
+        let (_tmp, cfg, rootfs) =
+            rootfs_fixture(&["opt/bin", "opt/rpath", "opt/runpath", "opt/ld"]);
+        let elf = cfg.rootfs.as_ref().unwrap().join("opt/bin/app");
+        let rpath = ["/opt/rpath".to_string()];
+        let runpath = ["/opt/runpath".to_string()];
+        let dirs = loader_search_path(
+            &cfg,
+            &rootfs,
+            &LoaderSearch {
+                target: Arch::host(),
+                execution: Arch::host(),
+                main_elf: &elf,
+                rpath: &rpath,
+                runpath: &runpath,
+                guest_library_path: Some("/opt/ld"),
+                guest_cwd: "/",
+            },
+        );
+        let library = dirs
+            .iter()
+            .position(|dir| dir == &physical(&cfg, "opt/ld"))
+            .expect("guest LD_LIBRARY_PATH directory");
+        let runpath = dirs
+            .iter()
+            .position(|dir| dir == &physical(&cfg, "opt/runpath"))
+            .expect("mapped DT_RUNPATH directory");
+        assert!(library < runpath, "LD_LIBRARY_PATH must precede DT_RUNPATH");
+        assert!(
+            !dirs.contains(&physical(&cfg, "opt/rpath")),
+            "DT_RPATH is ignored when DT_RUNPATH is present"
+        );
+    }
+
+    #[test]
+    fn missing_guest_directories_are_dropped_and_entries_are_deduplicated() {
+        let (_tmp, cfg, rootfs) = rootfs_fixture(&["opt/ld", "opt/app"]);
+        let elf = cfg.rootfs.as_ref().unwrap().join("opt/app/tool");
+        let dirs = loader_search_path(
+            &cfg,
+            &rootfs,
+            &LoaderSearch {
+                target: Arch::host(),
+                execution: Arch::host(),
+                main_elf: &elf,
+                rpath: &[],
+                runpath: &[],
+                guest_library_path: Some("/opt/ld:/opt/ld:/opt/missing::"),
+                guest_cwd: "/opt/app",
+            },
+        );
+        assert_eq!(
+            dirs.iter()
+                .filter(|dir| **dir == physical(&cfg, "opt/ld"))
+                .count(),
+            1
+        );
+        assert!(dirs.contains(&physical(&cfg, "opt/app")));
+        assert!(!dirs.iter().any(|dir| dir.contains("missing")));
+    }
+
+    #[test]
+    fn box64_does_not_hand_guest_library_paths_to_the_host_loader() {
+        let (_tmp, cfg, rootfs) = rootfs_fixture(&["opt/ld", "opt/rpath"]);
+        let elf = cfg.rootfs.as_ref().unwrap().join("opt/app");
+        let rpath = ["/opt/rpath".to_string()];
+        let dirs = loader_search_path(
+            &cfg,
+            &rootfs,
+            &LoaderSearch {
+                target: Arch::X86_64,
+                execution: Arch::Aarch64,
+                main_elf: &elf,
+                rpath: &rpath,
+                runpath: &[],
+                guest_library_path: Some("/opt/ld"),
+                guest_cwd: "/",
+            },
+        );
+        assert!(!dirs.contains(&physical(&cfg, "opt/ld")));
+        assert!(!dirs.contains(&physical(&cfg, "opt/rpath")));
+    }
+
+    #[test]
+    fn only_the_rootfs_loader_is_recognised_as_a_loader() {
+        let (_tmp, cfg, _rootfs) = rootfs_fixture(&["lib64", "bin"]);
+        let root = cfg.rootfs.as_ref().unwrap();
+        let arch = Arch::host();
+        assert!(is_guest_loader(
+            &cfg,
+            &root.join("lib64").join(arch.loader_name()),
+            arch
+        ));
+        let elsewhere = Path::new("/usr/lib").join(arch.loader_name());
+        assert!(!is_guest_loader(&cfg, &elsewhere, arch));
+        assert!(!is_guest_loader(&cfg, &root.join("bin/sh"), arch));
     }
 }

@@ -69,6 +69,7 @@ function harness({ dataDir = path.join(root, `state-${Math.random().toString(16)
   const calls = { downloads: 0 }
   const service = createMobileBootstrap({
     dataDir,
+    arch: 'arm64',
     releaseUrl: 'https://api.github.com/repos/acme/dsh-bionilux/releases/latest',
     appVersionProvider: () => '0.14.0',
     pluginHost: {

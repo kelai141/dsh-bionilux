@@ -165,3 +165,29 @@ guest 视角：取当前目录的**物理**路径（`/proc/self/fd/N`，且必�
 不能走会把结果改写成 guest 路径的那个钩子，否则匹配不上 rootfs 前缀、回落成 `/`，
 每次 `..` 都会跳到 guest 根目录——`find`/`rm -rf` 的深目录失败就是这么来的），
 反解成 guest 路径，拼上 `..` 后按词法归一化（`..` 在 guest 根处钳住），再映射回物理路径。
+
+## 2026-10-21 验收修正
+
+普通相对路径仍以物理 cwd/dirfd 为基准；但当逐组件遍历到 `--host-path` 边界时，
+会切换到该授权目录。这样 `mkdir -p` 不会在 rootfs 下另建同名的宿主工作区。
+
+公开的 `syscall()` 入口现在映射 statx、newfstatat、openat、readlink/readlinkat；其他
+系统调用在汇编入口直接转交 libc，保持参数与调用栈。应用内联汇编和静态工具自身的
+系统调用仍不经过这一入口，不能据此视为完整系统调用虚拟化。
+
+xattr 路径入口、旧 glibc `__xstat*` ABI、`shm_open` 和命名信号量已补齐。
+共享内存及信号量使用 rootfs 的可写 `/dev/shm`，需要文件锁、共享 mmap 和进程共享
+futex 支持；创建、重开、互斥创建、引用计数、unlink 和跨进程同步有独立回归。
+它们是文件支持的对象，不能假定具备 tmpfs 的容量或整机重启清空特性。
+
+`readlink` 与 `realpath` 的自身 exe 查询报告实际程序；启动入口为符号链接时，
+报告其在 rootfs 内的规范目标。`uname.machine` 报告 guest ABI，其余字段保留内核值。
+
+对于显式查询 libc 实现的 `dlsym`，若该符号有本 preload 的实现，则使用该实现；
+另一个 DSO 自己定义的同名符号不替换。`RTLD_NEXT` 和 `RTLD_DEFAULT` 通过汇编尾转发
+保留原调用者。启用 rootfs 时，`dlopen` 去掉 `RTLD_DEEPBIND`，以免 Julia 等插件的
+文件与 DNS 操作绕过映射；这意味着不承诺该标志原有的符号优先级。无 rootfs 时保持原标志。
+
+准备脚本以及 `symlink` / `symlinkat` 钩子会归一化越过 guest 根的词法 `..`；
+普通相对链接保留原目标。该修正不提供对绕过钩子的链接写入、链接链或竞态的内核级隔离。
+完整问题、残留边界与设备证据见 [验收修复台账](ACCEPTANCE_FIXES.md)。

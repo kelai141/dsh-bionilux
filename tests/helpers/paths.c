@@ -138,6 +138,15 @@ int main(void) {
     }
     probe_open("open_through_link", "/usr/share/bn-link");
 
+    unlink("/bn-relative-escape");
+    printf("symlink_relative_escape=%d\n", symlink("../bn-symlink-target", "/bn-relative-escape") == 0);
+    probe_open("relative_escape_target", "/bn-relative-escape");
+    int linkfd = open("/usr/share", O_RDONLY | O_DIRECTORY);
+    unlink("/usr/share/bn-relative-at");
+    printf("symlinkat_relative_escape=%d\n", linkfd >= 0 && symlinkat("../../../bn-symlink-target", linkfd, "bn-relative-at") == 0);
+    if (linkfd >= 0) close(linkfd);
+    probe_open("relative_escape_at_target", "/usr/share/bn-relative-at");
+
     // 10. realpath reports the guest's own view.
     char rp[PATH_MAX] = {0};
     printf("realpath=%s\n", realpath("/usr/share/bn-marker", rp) ? rp : "ERR");

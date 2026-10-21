@@ -24,6 +24,16 @@ Bionilux, the Debian minimal rootfs and the Node.js package are **release
 assets**, downloaded and checksum-verified by the bootstrap plugin. They are not
 code in this package, and they are never committed to Git or stored in Git LFS.
 
+## Host architecture
+
+The manager accepts an explicit arm64 or x64 architecture. When it is omitted,
+the host architecture is read from process.arch; any other host architecture
+fails with an explicit error instead of defaulting to arm64.
+
+install() and reinstall() default to debian-minimal on arm64 and
+debian-minimal-x64 on x64. An explicit runtime id that belongs to another
+architecture is rejected rather than retargeted.
+
 ## Shared glibc Node.js
 
 DSH Mobile keeps running on its own Bionic Node.js, and Termux tooling is
@@ -70,10 +80,45 @@ child of the Bionilux launcher and returns
 * Installation stages the backend, rootfs and Node, proves health on the staged
   tree, and only then swaps `active.json` atomically. A failed install leaves the
   previously active instance running.
-* One manager instance owns one `dataDir`. Command execution and
-  install/uninstall are separated by a read/write gate: an in-flight command is
-  aborted before a cutover, and a command issued during a cutover waits for it.
-  Cross-process serialization belongs to the bootstrap plugin's install lock.
+* Health validates the active record against this manager's architecture,
+  requires rootfs entry points to be files, not directories, and reads the real
+  ELF `e_machine` of the backend launcher, preload, shared Node and any
+  rootfs dynamic loader (links are resolved inside the rootfs, never through
+  the host). A non-ELF or wrong-architecture object is unhealthy, even when its
+  file name and executable bit look correct.
+* One manager instance owns one canonical `dataDir` (including existing symlink
+  aliases). Creating a second live manager for
+  the same directory throws `ERR_RUNTIME_MANAGER_IN_USE`; dispose the first
+  manager before replacing it. This prevents two instance-local child sets and
+  gates from mutating the same rootfs independently. Ownership is registered
+  in the shared Node realm under a `globalThis` symbol, so reloading a fresh
+  module copy does not bypass it. The registry holds the owner strongly for its
+  whole lifetime: a failed dispose keeps ownership until its children are
+  confirmed gone, and only a successful dispose releases the directory. Worker
+  threads and isolated VM contexts have separate `globalThis` instances and are
+  not covered. Separate Node processes and cross-process writers
+  are outside this registry; cross-process serialization belongs to the
+  bootstrap plugin's install lock.
+* Command execution and install/uninstall are separated by a read/write gate:
+  an in-flight command is aborted before a cutover, and a command issued during
+  a cutover waits for it.
+* Management registers its intent before draining commands, so no command can
+  spawn between the drain and the cutover. Guest children receive `SIGTERM`,
+  then `SIGKILL` after a bounded grace period, and the cutover waits for them to
+  exit before replacing the tree.
+* On Linux/Android, managed commands also carry a stable process-scope tag
+  derived from the canonical data directory. Lifecycle cleanup scans readable
+  `/proc` environments for that exact tag and the same real UID, and checks PID
+  start times before signalling. This also finds cooperative `setsid` daemons
+  after their direct parent exits or a previous host crashes. The preload
+  preserves the tag across managed `env -i` execution. Cleanup waits for both
+  process groups and scope scans before allowing a cutover; disposing an old
+  owner again cannot terminate its replacement's commands.
+* If a child cannot be confirmed dead after `SIGKILL`, management fails and
+  leaves `active.json` and the instance tree untouched. The child stays tracked
+  instead of being dropped as if it had exited.
+* A failed install removes the instance it had promoted but never activated.
+  Retiring the previous instance is best effort after the new record is active.
 * `uninstall` removes only the runtime instance, its metadata and unreferenced
   shared Node directories; user workspaces and DSH data are untouched.
 
@@ -86,7 +131,7 @@ import linuxRuntime from '@dsh-android/linux-runtime'
 // coordinates; it then returns the manager to the bootstrap plugin.
 const manager = ctx.plugin(linuxRuntime, {
   dataDir: '<filesDir>/linux-environment/runtime',
-  arch: 'arm64',
+  arch: 'arm64',   // or omit to use process.arch
   downloadAsset,   // checksum-verifying downloader
   extractArchive,  // safe extractor (no shell tar)
 })
@@ -111,3 +156,11 @@ Node.js. This is an execution-environment choice, and the Debian environment is
 * Android PID/namespace facts (`/proc`) are not virtualized.
 * `LD_PRELOAD` reaches only dynamically linked glibc programs; static binaries
   behave differently.
+* The architecture probe reads the ELF identity header only. It rejects
+  non-ELF and wrong-`e_machine` objects, but it is not a signature or a full
+  binary integrity check.
+* Process-scope tracking requires a readable exact tag for previously unknown
+  processes. Untagged external sessions, deliberately discarded context and raw
+  syscall bypasses are outside that contract. This is lifecycle cleanup, not
+  kernel containment. Do not externally replace a live manager's data directory
+  or change its symlink target.
