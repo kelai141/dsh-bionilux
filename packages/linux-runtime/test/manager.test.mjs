@@ -207,8 +207,14 @@ function makeRunner({ instant } = {}) {
  */
 function makeDeferredAbortRunner({ abortDelayMs = 75 } = {}) {
   const calls = [];
+  let notifyStarted;
+  let notifyAborted;
+  const started = new Promise((resolve) => { notifyStarted = resolve; });
+  const aborted = new Promise((resolve) => { notifyAborted = resolve; });
   return {
     calls,
+    started,
+    aborted,
     runCommand(spec) {
       const record = {
         spec,
@@ -228,11 +234,15 @@ function makeDeferredAbortRunner({ abortDelayMs = 75 } = {}) {
         record.settled = true;
         resolvePromise(result);
       };
+      if (String(spec.args?.at(-1) ?? '').includes('sleep')) notifyStarted(record);
       spec.signal?.addEventListener(
         'abort',
         () => {
           record.aborted = true;
-          setTimeout(() => record.settle({ stdout: '', stderr: 'aborted', exitCode: 130 }), abortDelayMs);
+          notifyAborted(record);
+          if (abortDelayMs !== null) {
+            setTimeout(() => record.settle({ stdout: '', stderr: 'aborted', exitCode: 130 }), abortDelayMs);
+          }
         },
         { once: true },
       );
@@ -477,11 +487,11 @@ test('a command issued during a cutover waits for it instead of running against 
   assert.equal(lastSpec.args.at(-1), 'echo after');
 });
 
-test('management refuses a command admitted while it drains in-flight children', async () => {
+test('management refuses a command admitted while it drains in-flight children', { timeout: 15_000 }, async (t) => {
   const dataDir = tempDir();
   const fixture = makeManifest();
   const io = makeIo(fixture);
-  const runner = makeDeferredAbortRunner();
+  const runner = makeDeferredAbortRunner({ abortDelayMs: null });
   const manager = createManager({
     dataDir,
     arch: 'arm64',
@@ -496,23 +506,23 @@ test('management refuses a command admitted while it drains in-flight children',
   });
 
   const running = manager.execute({ command: 'sleep 100', timeout: 60_000 });
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await runner.started;
 
   const installing = manager.install(makeManifest({ version: '1.1.0' }).manifest);
-  for (let attempt = 0; attempt < 100 && !runner.calls.some((call) => call.aborted); attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 2));
-  }
-  assert.equal(runner.calls.some((call) => call.aborted), true, 'the running command must be aborted');
+  const draining = await runner.aborted;
+  assert.equal(draining.settled, false, 'hold the aborted child until the queued command is issued');
 
   // Issued while the manager is still waiting for the aborted child to settle.
   const queuedController = new AbortController();
+  t.after(() => {
+    queuedController.abort();
+    for (const call of runner.calls) call.settle({ stdout: '', stderr: 'cleanup', exitCode: 130 });
+  });
   const queued = manager.execute({ command: 'sleep 500', signal: queuedController.signal });
-  const outcome = await Promise.race([
-    installing.then(() => 'installed'),
-    new Promise((resolve) => setTimeout(() => resolve('blocked'), 400)),
-  ]);
-
-  assert.equal(outcome, 'installed', 'a command admitted during the drain must not hold up management');
+  draining.settle({ stdout: '', stderr: 'aborted', exitCode: 130 });
+  // A deadlock still fails via the test timeout, but /proc scanning and fixture
+  // extraction are no longer required to finish within a 400 ms benchmark.
+  await installing;
   for (const call of runner.calls.filter((candidate) => String(candidate.spec.args?.at(-1) ?? '') === 'sleep 500')) {
     assert.equal(cutoverCompletedAt !== undefined, true);
     assert.ok(
@@ -528,6 +538,9 @@ test('management refuses a command admitted while it drains in-flight children',
     1,
   );
   queuedController.abort();
+  const queuedCall = runner.calls.find((call) => String(call.spec.args?.at(-1) ?? '') === 'sleep 500');
+  assert.equal(queuedCall.aborted, true);
+  queuedCall.settle({ stdout: '', stderr: 'aborted', exitCode: 130 });
   assert.equal((await queued).exitCode, 130);
   assert.equal((await running).exitCode, 130);
 });
