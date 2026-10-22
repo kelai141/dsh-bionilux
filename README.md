@@ -296,6 +296,9 @@ release；用 `BIONILUX_REPO`/`BIONILUX_VERSION` 选择其它已发布的 releas
 
 ## 文档
 
+双架构调试构建、draft release 与 notes.md 传入方式见
+[构建与发布工作流](docs/RELEASE_WORKFLOWS.md)。
+
 | 文档 | 内容 |
 |------|------|
 | [`docs/README.md`](docs/README.md) | 导览与阅读顺序 |

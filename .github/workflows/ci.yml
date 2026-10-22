@@ -11,6 +11,23 @@ permissions:
   contents: read
 
 jobs:
+  release-workflows:
+    name: release workflow contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release metadata and manifest positive/negative tests
+        run: python3 tests/test_release_workflows.py -v
+      - name: Validate Actions syntax with pinned actionlint
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            -o "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck= .github/workflows/*.yml
+
   test:
     name: test
     runs-on: ubuntu-latest
@@ -258,27 +275,3 @@ jobs:
         with:
           name: x86_64-libs
           path: x86_64-libs.tar.xz
-
-  release:
-    name: release
-    needs: [test, preload-paths, preload, bionilux, box64, x86-libs]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, 'rc')
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: flatten artifacts
-        run: |
-          mkdir -p out
-          find artifacts -type f -exec cp {} out/ \;
-          ls -la out/
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: out/*
-          generate_release_notes: true
-          draft: false
