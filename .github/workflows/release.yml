@@ -127,12 +127,7 @@ jobs:
             echo 'Release or draft already exists; refusing to overwrite it.' >&2
             exit 1
           fi
-          if tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha 2> "$RUNNER_TEMP/tag-error"); then
-            test "$tag_sha" = "$SOURCE_SHA" || { echo 'Tag source changed during build.' >&2; exit 1; }
-          elif ! grep -F 'HTTP 404' "$RUNNER_TEMP/tag-error" > /dev/null; then
-            cat "$RUNNER_TEMP/tag-error" >&2
-            exit 1
-          fi
+          python3 scripts/check_release_tag.py
           gh release create "$RELEASE_TAG" target/release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$SOURCE_SHA" \

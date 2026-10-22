@@ -17,6 +17,9 @@ sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("metadata", ROOT / "scripts/release_metadata.py")
 metadata = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(metadata)
+tag_spec = importlib.util.spec_from_file_location("tag_check", ROOT / "scripts/check_release_tag.py")
+tag_check = importlib.util.module_from_spec(tag_spec)
+tag_spec.loader.exec_module(tag_check)
 SHA = "a" * 40
 
 
@@ -78,6 +81,40 @@ class MetadataTests(unittest.TestCase):
                                 env={**os.environ, "BUILD_TAG": ""}, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("requires an explicit tag", result.stderr)
+
+
+class TagTests(unittest.TestCase):
+    def test_absent_tag_is_allowed(self):
+        paths = []
+        def request(path):
+            paths.append(path)
+            return None
+        tag_check.check_tag("owner/repo", "v0.5.0", SHA, request)
+        self.assertEqual(paths, ["repos/owner/repo/git/ref/tags/v0.5.0"])
+
+    def test_lightweight_tag_matches(self):
+        tag_check.check_tag("owner/repo", "v0.5.0", SHA,
+                            lambda _: {"object": {"type": "commit", "sha": SHA}})
+
+    def test_wrong_commit_is_rejected(self):
+        with self.assertRaises(ValueError):
+            tag_check.check_tag("owner/repo", "v0.5.0", SHA,
+                                lambda _: {"object": {"type": "commit", "sha": "b" * 40}})
+
+    def test_annotated_tag_is_peeled(self):
+        objects = iter(({"object": {"type": "tag", "sha": "c" * 40}},
+                        {"object": {"type": "commit", "sha": SHA}}))
+        tag_check.check_tag("owner/repo", "v0.5.0", SHA, lambda _: next(objects))
+
+    def test_cyclic_tag_is_rejected(self):
+        with self.assertRaises(ValueError):
+            tag_check.check_tag("owner/repo", "v0.5.0", SHA,
+                                lambda _: {"object": {"type": "tag", "sha": "c" * 40}})
+
+    def test_auth_error_is_not_missing_tag(self):
+        result = subprocess.CompletedProcess([], 1, "", "HTTP 403: forbidden")
+        with patch.object(tag_check.subprocess, "run", return_value=result), self.assertRaises(RuntimeError):
+            tag_check.github("repos/owner/repo/git/ref/tags/v0.5.0")
 
 
 class ManifestTests(unittest.TestCase):
