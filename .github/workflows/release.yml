@@ -1,567 +1,139 @@
-name: release
+name: Draft release
+run-name: Draft ${{ inputs.tag }} (${{ inputs.source_ref || github.ref_name }})
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag matching both plugin package versions (for example v0.5.0)
+        required: true
+        type: string
+      source_ref:
+        description: Source branch, tag or SHA (empty uses the selected workflow commit)
+        type: string
+        default: ''
+      notes:
+        description: Release notes content; CLI supports -F notes=@notes.md
+        type: string
+        default: ''
+      notes_file:
+        description: Repository-relative notes file used when notes is empty
+        type: string
+        default: notes.md
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
+  group: draft-release-${{ inputs.tag }}
   cancel-in-progress: false
 
-env:
-  DEBIAN_SUITE: trixie
-  DEBIAN_SNAPSHOT: https://snapshot.debian.org/archive/debian/20261016T000000Z
-  DEBIAN_INRELEASE_SHA256: 0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675
-  NODE_VERSION: 24.22.0
-  # Official SHASUMS256.txt for v24.22.0, checked 2026-10-21.
-  NODE_ARCHIVE_SHA256_ARM64: fef00bb4d36e1c50104a9775a10359beee98f162b4104dd12472c75065c6a143
-  NODE_ARCHIVE_SHA256_X64: cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008
-  MIN_MOBILE_VERSION: 0.14.0
-
 jobs:
-  source-guard:
-    name: tracked release assets and LFS guard
+  prepare:
+    name: validate release identity and notes
     runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+      tag: ${{ steps.identity.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-      - name: Reject tracked binaries, release archives, and LFS pointers
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import os
-          import re
-          import subprocess
-          import sys
-
-          forbidden_suffixes = (
-              ".so", ".dylib", ".dll", ".exe", ".apk", ".deb", ".tar",
-              ".tar.gz", ".tar.xz", ".tgz", ".xz", ".a", ".o", ".node",
-              ".png", ".jpg", ".jpeg", ".webp", ".avif", ".mp4", ".mov",
-          )
-          lfs_pointer = b"version https://git-lfs.github.com/spec/v1\n"
-          errors = []
-          paths = subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0")
-          for raw_path in paths:
-              if not raw_path:
-                  continue
-              path = os.fsdecode(raw_path)
-              if path.lower().endswith(forbidden_suffixes):
-                  errors.append(f"tracked release/binary asset: {path}")
-              object_name = f"HEAD:{path}"
-              try:
-                  object_size = int(subprocess.check_output(["git", "cat-file", "-s", object_name], text=True))
-                  if object_size <= 1024:
-                      prefix = subprocess.check_output(["git", "cat-file", "blob", object_name])
-                  else:
-                      prefix = b""
-              except subprocess.CalledProcessError:
-                  prefix = b""
-              if prefix.startswith(lfs_pointer):
-                  errors.append(f"tracked Git LFS pointer: {path}")
-              if os.path.basename(path) == ".gitattributes":
-                  with open(path, "r", encoding="utf-8", errors="replace") as attributes_file:
-                      text = attributes_file.read()
-                  if re.search(r"(?im)^\s*[^#\n]*\bfilter\s*=\s*lfs\b", text):
-                      errors.append(f"Git LFS tracking rule in {path}")
-          if errors:
-              print("::error::Release binaries and generated archives belong in GitHub Releases, not Git/LFS.")
-              print("\n".join(errors))
-              sys.exit(1)
-          print("Tracked source contains no release binaries, archives, or Git LFS pointers.")
-          PY
-
-  validate:
-    name: tests and package validation
-    needs: source-guard
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-      - name: Install AArch64 glibc test tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
-      - name: Rust format, lint, and unit tests
-        run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked --verbose
-      - name: Native and host regressions
-        run: |
-          cargo build --locked
-          BIONILUX_TEST_LAUNCHER="$PWD/target/debug/bionilux" bash tests/make.sh
-          BIONILUX_TEST_LAUNCHER="$PWD/target/debug/bionilux" bash tests/runtime.sh
-          BIONILUX_TEST_BIN="$PWD/target/debug/bionilux" bash tests/sharedlib.sh
-          bash tests/identity_compat.sh
-          bash tests/syscall_compat.sh
-          bash tests/python_compat.sh
-          bash tests/glob_compat.sh
-          bash tests/host_paths.sh
-          bash tests/preload_paths.sh
-          bash tests/ubsan.sh
-          bash tests/prepare_rootfs.sh
-          bash tests/aarch64.sh
-      - name: Plugin package tests
-        run: |
-          node --test packages/linux-bootstrap/test/*.test.mjs packages/linux-runtime/test/*.test.mjs
-
-  build-runtime-assets:
-    name: build ${{ matrix.architecture }} runtime assets
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: validate
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - architecture: aarch64
-            runtime_architecture: arm64
-            rust_target: aarch64-linux-android
-            ndk_clang_triple: aarch64-linux-android
-            debian_architecture: arm64
-            node_architecture: arm64
-            preload_cc: aarch64-linux-gnu-gcc
-            preload_readelf: aarch64-linux-gnu-readelf
-            preload_rpath: /usr/lib/aarch64-linux-gnu
-            elf_machine: AArch64
-            debian_loader: /lib/ld-linux-aarch64.so.1
-            cross_arch: true
-          - architecture: x86_64
-            runtime_architecture: x64
-            rust_target: x86_64-linux-android
-            ndk_clang_triple: x86_64-linux-android
-            debian_architecture: amd64
-            node_architecture: x64
-            preload_cc: gcc
-            preload_readelf: readelf
-            preload_rpath: /usr/lib/x86_64-linux-gnu
-            elf_machine: X86-64
-            debian_loader: /lib64/ld-linux-x86-64.so.2
-            cross_arch: false
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: android-${{ matrix.architecture }}
-      - uses: nttld/setup-ndk@v1
-        id: ndk
-        with:
-          ndk-version: r27
-      - uses: docker/setup-qemu-action@v3
-        if: matrix.cross_arch
-        with:
-          platforms: arm64
-      - name: Install compiler and Debian bootstrap tools
+          ref: ${{ inputs.source_ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag and exact source commit
+        id: identity
         env:
-          CROSS_ARCH: ${{ matrix.cross_arch }}
-        shell: bash
+          BUILD_TAG: ${{ inputs.tag }}
+        run: python3 scripts/release_metadata.py identity --release --output BUILD_INFO.json
+      - name: Resolve notes.md without evaluating its contents
+        env:
+          NOTES_CONTENT: ${{ inputs.notes }}
+          NOTES_FILE: ${{ inputs.notes_file }}
+        run: python3 scripts/release_metadata.py notes --output resolved-notes.md
+      - name: Refuse an existing release or a tag pointing at another commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
         run: |
           set -euo pipefail
-          sudo apt-get update
-          packages="binutils build-essential debootstrap debian-archive-keyring xz-utils"
-          if [[ "$CROSS_ARCH" == "true" ]]; then
-            packages="$packages gcc-aarch64-linux-gnu qemu-user-static binfmt-support"
-          fi
-          sudo apt-get install -y $packages
-          if [[ "$CROSS_ARCH" == "true" ]]; then
-            sudo update-binfmts --enable qemu-aarch64
-            command -v qemu-aarch64-static
-          fi
-      - name: Build the Android launcher, glibc preload, and backend bundle
-        env:
-          NDK: ${{ steps.ndk.outputs.ndk-path }}
-          TARGET: ${{ matrix.rust_target }}
-          ARCH: ${{ matrix.architecture }}
-          NDK_CLANG_TRIPLE: ${{ matrix.ndk_clang_triple }}
-          PRELOAD_CC: ${{ matrix.preload_cc }}
-          PRELOAD_READELF: ${{ matrix.preload_readelf }}
-          PRELOAD_RPATH: ${{ matrix.preload_rpath }}
-          ELF_MACHINE: ${{ matrix.elf_machine }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
-            echo "Invalid release tag: $GITHUB_REF_NAME" >&2
-            exit 1
-          }
-          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
-          tc="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-          target_key="${TARGET//-/_}"
-          target_upper="$(printf '%s' "$TARGET" | tr '[:lower:]-' '[:upper:]_')"
-          linker="$tc/bin/${NDK_CLANG_TRIPLE}24-clang"
-          test -x "$linker"
-          export "CARGO_TARGET_${target_upper}_LINKER=$linker"
-          export "CC_${target_key}=$linker"
-          export "AR_${target_key}=$tc/bin/llvm-ar"
-          cargo build --release --locked --target "$TARGET"
-
-          stage="$GITHUB_WORKSPACE/target/release-assets"
-          backend="$GITHUB_WORKSPACE/target/backend-$ARCH"
-          mkdir -p "$stage" "$backend/bin" "$backend/lib" "$backend/scripts"
-          install -m 755 "target/$TARGET/release/bionilux" "$stage/bionilux-$ARCH"
-          "$PRELOAD_CC" -shared -fPIC -O2 -Wall -Wextra -Werror \
-            -Wl,-soname,libbionilux_preload.so \
-            -Wl,-rpath,"$PRELOAD_RPATH" \
-            -o "$stage/libbionilux_preload-$ARCH.so" \
-            src/preload/hooks.c -pthread -ldl
-          install -m 755 "$stage/bionilux-$ARCH" "$backend/bin/bionilux"
-          install -m 755 "$stage/libbionilux_preload-$ARCH.so" "$backend/lib/libbionilux_preload.so"
-          install -m 755 scripts/prepare-rootfs.sh "$backend/scripts/prepare-rootfs.sh"
-          tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
-            -cJf "$stage/bionilux-backend-$ARCH.tar.xz" -C "$backend" bin lib scripts
-          file "$stage/bionilux-$ARCH" "$stage/libbionilux_preload-$ARCH.so"
-          "$tc/bin/llvm-readelf" -h "$stage/bionilux-$ARCH" | grep -q "Machine:.*$ELF_MACHINE"
-          "$PRELOAD_READELF" -h "$stage/libbionilux_preload-$ARCH.so" | grep -q "Machine:.*$ELF_MACHINE"
-      - name: Build Debian 13 trixie ${{ matrix.debian_architecture }} minimal rootfs
-        env:
-          ARCH: ${{ matrix.architecture }}
-          DEBIAN_ARCHITECTURE: ${{ matrix.debian_architecture }}
-          DEBIAN_LOADER: ${{ matrix.debian_loader }}
-          CROSS_ARCH: ${{ matrix.cross_arch }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          stage="$GITHUB_WORKSPACE/target/release-assets"
-          rootfs="$GITHUB_WORKSPACE/target/debian-rootfs-$ARCH"
-          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
-          sudo rm -rf "$rootfs"
-          sudo mkdir -p "$rootfs"
-          snapshot_release="$GITHUB_WORKSPACE/target/debian-trixie-InRelease"
-          curl --fail --location --retry 4 --retry-all-errors \
-            "$DEBIAN_SNAPSHOT/dists/$DEBIAN_SUITE/InRelease" -o "$snapshot_release"
-          echo "$DEBIAN_INRELEASE_SHA256  $snapshot_release" | sha256sum --check --strict
-          gpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg "$snapshot_release"
-          sudo debootstrap --arch="$DEBIAN_ARCHITECTURE" --foreign --variant=minbase \
-            --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
-            --include=apt,bash,ca-certificates,debian-archive-keyring,libstdc++6 \
-            --components=main "$DEBIAN_SUITE" "$rootfs" "$DEBIAN_SNAPSHOT"
-          if [[ "$CROSS_ARCH" == "true" ]]; then
-            sudo install -m 755 /usr/bin/qemu-aarch64-static "$rootfs/usr/bin/qemu-aarch64-static"
-          fi
-          sudo mkdir -p "$rootfs/dev" "$rootfs/proc"
-          sudo mount --bind /dev "$rootfs/dev"
-          sudo mount -t proc proc "$rootfs/proc"
-          cleanup_mounts() {
-            sudo umount "$rootfs/proc" 2>/dev/null || true
-            sudo umount "$rootfs/dev" 2>/dev/null || true
-          }
-          trap cleanup_mounts EXIT
-          sudo chroot "$rootfs" /debootstrap/debootstrap --second-stage
-          test "$(sudo chroot "$rootfs" dpkg --print-architecture)" = "$DEBIAN_ARCHITECTURE"
-          grep -q '^VERSION_CODENAME=trixie$' "$rootfs/etc/os-release"
-          test -x "$rootfs/usr/bin/apt-get"
-          sudo chroot "$rootfs" "$DEBIAN_LOADER" --version >/dev/null
-          sudo chroot "$rootfs" /usr/bin/apt-get --version >/dev/null
-          if [[ "$CROSS_ARCH" == "true" ]]; then
-            sudo rm -f "$rootfs/usr/bin/qemu-aarch64-static"
-          fi
-          cleanup_mounts
-          trap - EXIT
-
-          sudo rm -rf "$rootfs/debootstrap" "$rootfs/var/lib/apt/lists/"*
-          sudo rm -rf "$rootfs/etc/apt/sources.list.d"/*
-          sudo tee "$rootfs/etc/apt/sources.list" >/dev/null <<'SOURCES'
-          deb https://deb.debian.org/debian trixie main
-          deb https://deb.debian.org/debian trixie-updates main
-          deb https://security.debian.org/debian-security trixie-security main
-          SOURCES
-          sudo rm -f "$rootfs/etc/resolv.conf"
-          sudo cp /etc/resolv.conf "$rootfs/etc/resolv.conf"
-          if ! sudo chroot "$rootfs" /usr/bin/apt-get -o Acquire::Languages=none update \
-            > "$GITHUB_WORKSPACE/target/apt-update.log" 2>&1; then
-            cat "$GITHUB_WORKSPACE/target/apt-update.log"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release already exists; drafts and public releases are never overwritten." >&2
             exit 1
           fi
-          sudo rm -f "$rootfs/etc/resolv.conf" "$rootfs/etc/machine-id" "$rootfs/var/lib/dbus/machine-id"
-          sudo rm -rf "$rootfs/var/lib/apt/lists/"* "$rootfs/var/cache/apt/archives/"*
-          sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links
-          sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links --verify
-          sudo tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
-            --xattrs --xattrs-include='*' --acls -cJf "$stage/debian-minimal-$ARCH.tar.xz" \
-            -C "$rootfs" .
-          sudo chmod 644 "$stage/debian-minimal-$ARCH.tar.xz"
-          tar -tJf "$stage/debian-minimal-$ARCH.tar.xz" | grep -q '^\./etc/os-release$'
-          tar -tJf "$stage/debian-minimal-$ARCH.tar.xz" | grep -q '^\./usr/bin/apt-get$'
-      - name: Download and package the pinned official glibc Node.js runtime
-        env:
-          ARCH: ${{ matrix.architecture }}
-          NODE_ARCHITECTURE: ${{ matrix.node_architecture }}
-          ELF_MACHINE: ${{ matrix.elf_machine }}
-          CROSS_ARCH: ${{ matrix.cross_arch }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          stage="$GITHUB_WORKSPACE/target/release-assets"
-          node_stage="$GITHUB_WORKSPACE/target/node-glibc-$NODE_ARCHITECTURE"
-          node_source="$GITHUB_WORKSPACE/target/node-source"
-          case "$NODE_ARCHITECTURE" in
-            arm64) expected_sha256="$NODE_ARCHIVE_SHA256_ARM64" ;;
-            x64) expected_sha256="$NODE_ARCHIVE_SHA256_X64" ;;
-            *) echo "Unsupported Node architecture: $NODE_ARCHITECTURE" >&2; exit 1 ;;
-          esac
-          upstream="node-v${NODE_VERSION}-linux-${NODE_ARCHITECTURE}.tar.xz"
-          asset="node-glibc-v${NODE_VERSION}-linux-${NODE_ARCHITECTURE}.tar.xz"
-          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
-          mkdir -p "$stage" "$node_stage" "$node_source"
-          curl --fail --location --retry 4 --retry-all-errors \
-            "https://nodejs.org/dist/v${NODE_VERSION}/$upstream" -o "$node_source/$upstream"
-          echo "$expected_sha256  $node_source/$upstream" | sha256sum --check --strict
-          python3 - "$node_source/$upstream" "$node_source" <<'PY'
-          import pathlib
-          import sys
-          import tarfile
-          with tarfile.open(sys.argv[1], "r:xz") as archive:
-              for member in archive.getmembers():
-                  path = pathlib.PurePosixPath(member.name)
-                  if path.is_absolute() or ".." in path.parts:
-                      raise SystemExit(f"Unsafe official Node archive member: {member.name}")
-              archive.extractall(sys.argv[2], filter="data")
-          PY
-          node_root="$node_source/node-v${NODE_VERSION}-linux-${NODE_ARCHITECTURE}"
-          test -x "$node_root/bin/node"
-          test -x "$node_root/lib/node_modules/npm/bin/npm-cli.js"
-          readelf -h "$node_root/bin/node" | grep -q "Machine:.*$ELF_MACHINE"
-          if [[ "$CROSS_ARCH" == "true" ]]; then
-            qemu-aarch64-static -L "$GITHUB_WORKSPACE/target/debian-rootfs-$ARCH" \
-              "$node_root/bin/node" --version | grep -Fx "v${NODE_VERSION}"
-          else
-            "$node_root/bin/node" --version | grep -Fx "v${NODE_VERSION}"
-          fi
-          install -d "$node_stage/lib"
-          cp -a "$node_root/bin" "$node_stage/"
-          cp -a "$node_root/lib/node_modules" "$node_stage/lib/"
-          tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
-            -cJf "$stage/$asset" -C "$node_stage" .
-          tar -tJf "$stage/$asset" | grep -q '^\./bin/node$'
-          tar -tJf "$stage/$asset" | grep -q '^\./lib/node_modules/npm/'
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-runtime-${{ matrix.architecture }}
-          path: target/release-assets/*
-          if-no-files-found: error
-          retention-days: 3
-
-  build-plugin-assets:
-    name: package installable plugins
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: validate
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-      - name: Pack bootstrap and runtime plugins as standalone tar.xz assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
-            echo "Invalid release tag: $GITHUB_REF_NAME" >&2
-            exit 1
-          }
-          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
-          stage="$GITHUB_WORKSPACE/target/release-assets"
-          mkdir -p "$stage" "$GITHUB_WORKSPACE/target/npm-packs" "$GITHUB_WORKSPACE/target/npm-unpacked"
-
-          for package in linux-bootstrap linux-runtime; do
-            package_dir="packages/$package"
-            package_version="$(node -p "require('./$package_dir/package.json').version")"
-            if [[ "$package_version" != "$version" ]]; then
-              echo "Tag version $version does not match $package_dir version $package_version" >&2
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_SHA" || {
+              echo "Existing tag does not point at the selected source commit." >&2
               exit 1
-            fi
-            mkdir -p "$GITHUB_WORKSPACE/target/npm-packs/$package" \
-              "$GITHUB_WORKSPACE/target/npm-unpacked/$package"
-            npm pack "./$package_dir" --json \
-              --pack-destination "$GITHUB_WORKSPACE/target/npm-packs/$package" \
-              > "$GITHUB_WORKSPACE/target/npm-packs/$package/pack.json"
-            tarball="$(node -e 'const fs=require("node:fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8"))[0].filename)' \
-              "$GITHUB_WORKSPACE/target/npm-packs/$package/pack.json")"
-            python3 -c 'import sys,tarfile; a=tarfile.open(sys.argv[1],"r:gz"); bad=[m.name for m in a.getmembers() if m.issym() or m.islnk()]; sys.exit("Refusing package symlink: "+bad[0]) if bad else a.extractall(sys.argv[2], filter="data")' \
-              "$GITHUB_WORKSPACE/target/npm-packs/$package/$tarball" \
-              "$GITHUB_WORKSPACE/target/npm-unpacked/$package"
-            test -f "$GITHUB_WORKSPACE/target/npm-unpacked/$package/package/package.json"
-            case "$package" in
-              linux-bootstrap) output="$stage/linux-bootstrap-plugin.tar.xz" ;;
-              linux-runtime) output="$stage/linux-runtime-plugin.tar.xz" ;;
-              *) echo "Unknown plugin package: $package" >&2; exit 1 ;;
-            esac
-            tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
-              -cJf "$output" -C "$GITHUB_WORKSPACE/target/npm-unpacked/$package/package" .
-          done
+            }
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: release-plugins
-          path: target/release-assets/*
-          if-no-files-found: error
-          retention-days: 3
+          name: draft-request
+          path: |
+            BUILD_INFO.json
+            resolved-notes.md
+          retention-days: 7
+
+  build:
+    name: build verified ARM64 and x86_64 assets
+    needs: prepare
+    uses: ./.github/workflows/debug-build.yml
+    with:
+      source_ref: ${{ needs.prepare.outputs.source_sha }}
+      tag: ${{ needs.prepare.outputs.tag }}
+    permissions:
+      contents: read
 
   publish:
-    name: publish tagged release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [source-guard, validate, build-runtime-assets, build-plugin-assets]
+    name: create draft release only
+    needs: [prepare, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          pattern: release-*
-          merge-multiple: true
+          name: linux-assets
           path: target/release-assets
-      - name: Verify assets and generate runtime/bootstrap manifest
-        shell: bash
+      - uses: actions/download-artifact@v4
+        with:
+          name: draft-request
+          path: target/draft-request
+      - name: Recheck asset checksums and source identity
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          version="${tag#v}"
-          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
-            echo "Invalid release tag: $tag" >&2
+          test -s target/draft-request/resolved-notes.md
+          cmp target/draft-request/BUILD_INFO.json target/release-assets/BUILD_INFO.json
+          cd target/release-assets
+          sha256sum --check --strict SHA256SUMS
+      - name: Create draft with the supplied notes and both architectures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Recheck after the build; a tag may have appeared or moved meanwhile.
+          # Draft visibility requires push access; this check runs with the
+          # publish job's contents:write token, not the read-only build token.
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo 'Release or draft already exists; refusing to overwrite it.' >&2
             exit 1
-          }
-          python3 - "$GITHUB_WORKSPACE/target/release-assets" "$GITHUB_REPOSITORY" "$tag" "$version" "$MIN_MOBILE_VERSION" "$NODE_VERSION" <<'PY'
-          import hashlib
-          import json
-          import os
-          import pathlib
-          import sys
-          import tarfile
-          from urllib.parse import quote
-
-          root = pathlib.Path(sys.argv[1])
-          repository, tag, version, min_mobile, node_version = sys.argv[2:]
-          runtime_specs = (
-              ("aarch64", "debian-minimal", "arm64", "arm64", "ARM64"),
-              ("x86_64", "debian-minimal-x64", "x64", "x64", "x86_64"),
-          )
-          required = [
-              "linux-bootstrap-plugin.tar.xz",
-              "linux-runtime-plugin.tar.xz",
-          ]
-          for asset_arch, _runtime_id, _runtime_arch, node_arch, _label in runtime_specs:
-              required.extend((
-                  f"bionilux-{asset_arch}",
-                  f"libbionilux_preload-{asset_arch}.so",
-                  f"bionilux-backend-{asset_arch}.tar.xz",
-                  f"debian-minimal-{asset_arch}.tar.xz",
-                  f"node-glibc-v{node_version}-linux-{node_arch}.tar.xz",
-              ))
-          pointer = b"version https://git-lfs.github.com/spec/v1\n"
-          for name in required:
-              path = root / name
-              if not path.is_file() or path.stat().st_size <= 0:
-                  raise SystemExit(f"Missing or empty required release asset: {name}")
-              if path.stat().st_size >= 2**31:
-                  raise SystemExit(f"Release asset exceeds GitHub's 2 GiB per-file limit: {name}")
-              with path.open("rb") as stream:
-                  if stream.read(1024).startswith(pointer):
-                      raise SystemExit(f"Refusing to publish a Git LFS pointer as an asset: {name}")
-
-          base_url = f"https://github.com/{repository}/releases/download/{quote(tag, safe='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-')}"
-          page_url = f"https://github.com/{repository}/releases/tag/{quote(tag, safe='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-')}"
-
-          def describe(name):
-              path = root / name
-              digest = hashlib.sha256()
-              with path.open("rb") as stream:
-                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                      digest.update(chunk)
-              unpacked = 0
-              with tarfile.open(path, mode="r:xz") as archive:
-                  for member in archive:
-                      member_path = pathlib.PurePosixPath(member.name)
-                      if member_path.is_absolute() or ".." in member_path.parts:
-                          raise SystemExit(f"Unsafe archive member in {name}: {member.name}")
-                      if member.isreg():
-                          unpacked += member.size
-              if unpacked <= 0:
-                  raise SystemExit(f"Archive has no regular-file payload: {name}")
-              return {
-                  "url": f"{base_url}/{quote(name, safe='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-')}" ,
-                  "sha256": digest.hexdigest(),
-                  "size": path.stat().st_size,
-                  "unpackedSize": unpacked,
-              }
-
-          bootstrap = describe("linux-bootstrap-plugin.tar.xz")
-          runtime_plugin = describe("linux-runtime-plugin.tar.xz")
-          bootstrap["pluginReleaseUrl"] = page_url
-          runtime_plugin["pluginReleaseUrl"] = page_url
-          manifest = {
-              "schemaVersion": 1,
-              "version": version,
-              "minMobileVersion": min_mobile,
-              "plugins": {
-                  "bootstrap": bootstrap,
-                  "runtime": runtime_plugin,
-              },
-              "runtimes": [{
-                  "id": runtime_id,
-                  "label": f"Debian 13 (trixie) for {label}",
-                  "architecture": runtime_arch,
-                  "backend": "bionilux",
-                  "backendAsset": describe(f"bionilux-backend-{asset_arch}.tar.xz"),
-                  "rootfsAsset": describe(f"debian-minimal-{asset_arch}.tar.xz"),
-                  "nodeAsset": describe(f"node-glibc-v{node_version}-linux-{node_arch}.tar.xz"),
-              } for asset_arch, runtime_id, runtime_arch, node_arch, label in runtime_specs],
-          }
-          out = root / "linux-release.json"
-          out.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-          print(f"Generated {out} for {repository}@{tag}")
-          PY
-          node --input-type=module -e 'import fs from "node:fs"; import {validateManifest} from "./packages/linux-runtime/modules/manifest.js"; validateManifest(JSON.parse(fs.readFileSync("target/release-assets/linux-release.json", "utf8"))); console.log("Manifest validated by the runtime package.");'
-          node --input-type=module -e 'import fs from "node:fs"; import {validateManifestShape} from "./packages/linux-bootstrap/src/manifest.js"; validateManifestShape(JSON.parse(fs.readFileSync("target/release-assets/linux-release.json", "utf8")), process.env.GITHUB_REF_NAME); console.log("Manifest validated by the bootstrap package.");'
-          python3 - "$NODE_VERSION" <<'PY'
-          from pathlib import Path
-          import sys
-          root = Path("target/release-assets")
-          node_version = sys.argv[1]
-          expected = {
-              "linux-bootstrap-plugin.tar.xz", "linux-runtime-plugin.tar.xz",
-              "linux-release.json",
-          }
-          for asset_arch, node_arch in (("aarch64", "arm64"), ("x86_64", "x64")):
-              expected.update({
-                  f"bionilux-{asset_arch}",
-                  f"libbionilux_preload-{asset_arch}.so",
-                  f"bionilux-backend-{asset_arch}.tar.xz",
-                  f"debian-minimal-{asset_arch}.tar.xz",
-                  f"node-glibc-v{node_version}-linux-{node_arch}.tar.xz",
-              })
-          actual = {path.name for path in root.iterdir() if path.is_file()}
-          if actual != expected:
-              raise SystemExit(f"Unexpected release asset set: missing={expected-actual}, extra={actual-expected}")
-          print("Release asset set contains all required stable filenames and no build leftovers.")
-          PY
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Linux runtime ${{ github.ref_name }}
-          files: target/release-assets/*
-          generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          fail_on_unmatched_files: true
-          overwrite_files: true
+          fi
+          python3 scripts/check_release_tag.py
+          gh release create "$RELEASE_TAG" target/release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "Linux runtime $RELEASE_TAG" \
+            --draft \
+            --notes-file target/draft-request/resolved-notes.md
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,url --jq 'if .isDraft then .url else error("Release is not a draft") end' \
+            >> "$GITHUB_STEP_SUMMARY"
