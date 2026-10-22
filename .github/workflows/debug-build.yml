@@ -220,11 +220,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          packages="binutils build-essential debootstrap debian-archive-keyring xz-utils"
+          packages="binutils build-essential debootstrap debian-archive-keyring gnupg xz-utils"
           if [[ "$CROSS_ARCH" == "true" ]]; then
             packages="$packages gcc-aarch64-linux-gnu qemu-user-static binfmt-support"
           fi
           sudo apt-get install -y $packages
+          bash scripts/prepare-debian-keyring.sh "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg"
           if [[ "$CROSS_ARCH" == "true" ]]; then
             sudo update-binfmts --enable qemu-aarch64
             command -v qemu-aarch64-static
@@ -288,9 +289,9 @@ jobs:
           curl --fail --location --retry 4 --retry-all-errors \
             "$DEBIAN_SNAPSHOT/dists/$DEBIAN_SUITE/InRelease" -o "$snapshot_release"
           echo "$DEBIAN_INRELEASE_SHA256  $snapshot_release" | sha256sum --check --strict
-          gpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg "$snapshot_release"
+          gpgv --keyring "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" "$snapshot_release"
           sudo debootstrap --arch="$DEBIAN_ARCHITECTURE" --foreign --variant=minbase \
-            --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+            --keyring="$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" \
             --include=apt,bash,ca-certificates,debian-archive-keyring,libstdc++6 \
             --components=main "$DEBIAN_SUITE" "$rootfs" "$DEBIAN_SNAPSHOT"
           if [[ "$CROSS_ARCH" == "true" ]]; then

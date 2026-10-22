@@ -4,6 +4,10 @@
 包含 Android/Bionic launcher、glibc preload、Debian 13 rootfs、匹配架构的 glibc Node，以及两份安装插件。
 构建和 QEMU 检查不能替代 Android ARM64 真机验收。
 
+Ubuntu 24.04 的 Debian keyring 可能早于 trixie。构建脚本从
+[Debian 官方密钥页面](https://ftp-master.debian.org/keys.html) 下载 Debian 13 签名密钥，
+核对固定 SHA-256 后合并到构建专用 keyring；快照哈希、gpgv 和 debootstrap 验签均保留。
+
 ## 调试构建
 
 在 Actions 选择 **Debug dual-architecture build**，点击 Run workflow。
