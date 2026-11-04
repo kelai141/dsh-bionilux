@@ -163,6 +163,25 @@ class ManifestTests(unittest.TestCase):
         (self.root / "bionilux-x86_64").write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
         self.assertNotEqual(self.run_manifest().returncode, 0)
 
+    def test_android_unextractable_members_fail(self):
+        for kind in (tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.FIFOTYPE, tarfile.LNKTYPE):
+            with self.subTest(kind=kind):
+                name = 'debian-minimal-x86_64.tar.xz'
+                self.archive(name)
+                with tarfile.open(self.root / name, 'r:xz') as archive:
+                    payload = archive.extractfile('bin/program').read()
+                with tarfile.open(self.root / name, 'w:xz') as archive:
+                    ordinary = tarfile.TarInfo('bin/program')
+                    ordinary.size = len(payload)
+                    archive.addfile(ordinary, io.BytesIO(payload))
+                    unsupported = tarfile.TarInfo('dev/unsupported')
+                    unsupported.type = kind
+                    unsupported.linkname = 'bin/program' if kind == tarfile.LNKTYPE else ''
+                    archive.addfile(unsupported)
+                result = self.run_manifest()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Android app cannot extract', result.stderr)
+
     def test_unexpected_asset_fails(self):
         (self.root / "unreviewed.txt").write_text("extra")
         self.assertNotEqual(self.run_manifest().returncode, 0)

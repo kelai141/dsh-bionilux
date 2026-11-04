@@ -12,12 +12,14 @@ import {
   readSync,
   readdirSync,
   readlinkSync,
+  realpathSync,
   statSync,
 } from 'node:fs';
 import path from 'node:path';
 import { defaultRuntimeIdForArch, resolveHostArchitecture, selectRuntime } from './manifest.js';
 import { assertOfficialAssetUrl, isAllowedAssetOrigin } from './asset-installer.js';
 import { ProcessScope } from './process-scope.js';
+import { assertResolvConfWritable, inspectResolvConf, resolveDnsServers } from './dns-config.js';
 
 const ACTIVE_SCHEMA_VERSION = 1;
 const METADATA_SCHEMA_VERSION = 1;
@@ -25,6 +27,8 @@ const DEFAULT_GUEST_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 const SIGTERM_GRACE_MS = 2_000;
 const STOP_SETTLE_MS = 2_000;
 const FORCE_KILL_SETTLE_MS = 1_000;
+const HOST_SCRIPT_INTERPRETER =
+  process.platform === 'android' && existsSync('/system/bin/sh') ? '/system/bin/sh' : 'sh';
 const ROOTFS_REQUIRED_FILES = [
   'bin/sh',
   'bin/bash',
@@ -701,6 +705,25 @@ export class LinuxRuntimeManager {
     this.extractArchive = options.extractArchive;
     this.runCommand = options.runCommand ?? spawnCommand;
     if (typeof this.runCommand !== 'function') throw new TypeError('runCommand must be a function');
+    if (options.dnsServers !== undefined && !Array.isArray(options.dnsServers)) {
+      throw new TypeError('dnsServers must be an array of IP addresses');
+    }
+    if (options.dnsServersProvider !== undefined && typeof options.dnsServersProvider !== 'function') {
+      throw new TypeError('dnsServersProvider must be a function');
+    }
+    if (options.dnsProbe !== undefined && typeof options.dnsProbe !== 'function') {
+      throw new TypeError('dnsProbe must be a function');
+    }
+    if (
+      options.dnsProbeTimeoutMs !== undefined &&
+      (!Number.isFinite(options.dnsProbeTimeoutMs) || options.dnsProbeTimeoutMs <= 0)
+    ) {
+      throw new TypeError('dnsProbeTimeoutMs must be a positive number');
+    }
+    this.dnsServers = options.dnsServers;
+    this.dnsServersProvider = options.dnsServersProvider;
+    this.dnsProbe = options.dnsProbe;
+    this.dnsProbeTimeoutMs = options.dnsProbeTimeoutMs;
     this.onStateChange = typeof options.onStateChange === 'function' ? options.onStateChange : undefined;
     this.events = new EventEmitter();
     this.children = new Set();
@@ -1100,18 +1123,68 @@ export class LinuxRuntimeManager {
 
   async _prepareRootfs(instance, signal) {
     const script = path.join(instance.backend, 'scripts', 'prepare-rootfs.sh');
+    // Release rootfs archives intentionally omit resolv.conf. Keep a valid guest
+    // file if a caller already supplied one; otherwise obtain reachable
+    // nameservers and let the existing preparation script write them.
+    const resolv = inspectResolvConf(path.join(instance.rootfs, 'etc', 'resolv.conf'));
+    let dns = { servers: [], source: 'existing' };
+    if (!resolv.usable) {
+      assertResolvConfWritable(resolv);
+      dns = await resolveDnsServers({
+        dnsServers: this.dnsServers,
+        dnsServersProvider: this.dnsServersProvider,
+        dnsProbe: this.dnsProbe,
+        dnsProbeTimeoutMs: this.dnsProbeTimeoutMs,
+        allowPublicDnsFallback: process.platform === 'android',
+        requireDns: process.platform === 'android',
+        platform: process.platform,
+        rootfs: instance.rootfs,
+        signal,
+      });
+    }
+    const args = [script, '--rootfs', instance.rootfs, '--relative-links'];
+    if (dns.servers.length > 0) args.push('--dns', dns.servers.join(' '));
+    // Host preparation runs Termux tools, not guest programs. It needs the host
+    // loader path (for example libandroid-glob) and must not reuse the guest's
+    // clean environment. Guest execute remains cleanHostEnvironment-based.
+    const hostEnvironment = cleanHostEnvironment();
+    if (process.env.LD_LIBRARY_PATH) hostEnvironment.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH;
     const result = normaliseCommandResult(
       await this._runManaged({
-        file: 'sh',
-        args: [script, '--rootfs', instance.rootfs, '--relative-links'],
+        file: HOST_SCRIPT_INTERPRETER,
+        args,
         cwd: instance.root,
-        env: cleanHostEnvironment(),
+        env: hostEnvironment,
         timeout: 120_000,
         signal,
       }),
     );
     if (result.exitCode !== 0) {
       throw new Error(`prepare-rootfs.sh failed with exit code ${result.exitCode}: ${result.stderr}`.trim());
+    }
+  }
+
+  async _prepareAndroidRootfs(instance, signal) {
+    if (process.platform !== 'android') return;
+    await this._prepareHostPaths(instance.rootfs, [instance.rootfs]);
+    const hostEnvironment = cleanHostEnvironment();
+    if (process.env.LD_LIBRARY_PATH) hostEnvironment.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH;
+    const compatibilityScript = path.join(instance.backend, 'scripts', 'prepare-android-rootfs.sh');
+    if (!fileExists(compatibilityScript)) {
+      throw new Error('Android backend is missing prepare-android-rootfs.sh; install matching runtime assets');
+    }
+    const prepared = normaliseCommandResult(await this._runManaged({
+      file: HOST_SCRIPT_INTERPRETER,
+      args: [compatibilityScript, '--rootfs', instance.rootfs,
+        '--launcher', path.join(instance.backend, 'bin', 'bionilux'),
+        '--preload', path.join(instance.backend, 'lib', 'libbionilux_preload.so')],
+      cwd: instance.root,
+      env: hostEnvironment,
+      timeout: 120_000,
+      signal,
+    }));
+    if (prepared.exitCode !== 0) {
+      throw new Error(`Android rootfs preparation failed (${prepared.exitCode}): ${prepared.stderr}`.trim());
     }
   }
 
@@ -1130,6 +1203,22 @@ export class LinuxRuntimeManager {
     await fs.mkdir(path.dirname(node), { recursive: true });
     await fs.rename(nodeStage, node);
     return { node, created: true };
+  }
+
+  async _prepareHostPaths(rootfs, directories) {
+    // Node resolves a filename one ancestor at a time. Shared subtrees need
+    // directory mount points in the guest view for those ancestor probes;
+    // creating empty directories exposes no fallback host files.
+    const projections = new Set(directories);
+    for (const directory of directories) {
+      try { projections.add(await fs.realpath(directory)); } catch { /* Missing targets still fail in the launcher. */ }
+    }
+    for (const directory of projections) {
+      if (!path.isAbsolute(directory)) continue;
+      const parent = path.dirname(directory);
+      const relative = path.relative(path.parse(parent).root, parent);
+      await fs.mkdir(path.join(rootfs, relative), { recursive: true });
+    }
   }
 
   _nodeIsHealthy(node) {
@@ -1230,6 +1319,7 @@ export class LinuxRuntimeManager {
         'rootfs',
       );
       await this._prepareRootfs(instance);
+      await this._prepareHostPaths(instance.rootfs, [nodeResult.node]);
       const record = {
         schemaVersion: ACTIVE_SCHEMA_VERSION,
         instanceId,
@@ -1246,6 +1336,9 @@ export class LinuxRuntimeManager {
       );
       await fs.rename(stagedInstance, finalInstance);
       promoted = true;
+      // ldconfig records physical paths. Prepare its adapter only after the
+      // final directory exists, before the atomic active-record cutover.
+      await this._prepareAndroidRootfs(this._instancePaths(instanceId));
       const health = this._healthForRecord(record);
       if (!health.healthy) throw new Error(`staged runtime is unhealthy: ${health.reason}`);
       await this._stopChildren();
@@ -1324,7 +1417,10 @@ export class LinuxRuntimeManager {
   _executionEnvironment(paths, cwdInfo) {
     const environment = cleanHostEnvironment();
     const nodeBin = path.join(paths.node, 'bin');
-    const hostPaths = [nodeBin, ...cwdInfo.hostPaths];
+    const hostPaths = [paths.node, ...cwdInfo.hostPaths];
+    for (const directory of [...hostPaths]) {
+      try { hostPaths.push(realpathSync(directory)); } catch { /* Missing paths fail when executed. */ }
+    }
     environment.BIONILUX_ROOTFS = paths.rootfs;
     environment.BIONILUX_PRELOAD = paths.preload;
     environment.BIONILUX_GUEST_CWD = cwdInfo.guestCwd;
@@ -1333,6 +1429,9 @@ export class LinuxRuntimeManager {
     environment.BIONILUX_FAKE_ROOT = '1';
     environment.BIONILUX_LENIENT = '0';
     environment.BIONILUX_ANDROID_PATHS = '1';
+    // GNU make 4.4 (Debian 13) otherwise chooses a FIFO jobserver, which an
+    // unprivileged Android application cannot create under SELinux.
+    if (process.platform === 'android') environment.MAKEFLAGS = '--jobserver-style=pipe';
     environment.PATH = `${nodeBin}${path.delimiter}${environment.PATH ?? ''}`;
     return environment;
   }
@@ -1356,11 +1455,14 @@ export class LinuxRuntimeManager {
         throw new Error(`Linux runtime is unavailable: ${current.reason ?? 'unhealthy'}`);
       }
       const cwdInfo = this._resolveCwd(cwd, current.paths.rootfs);
+      await this._prepareHostPaths(current.paths.rootfs, cwdInfo.hostPaths);
       const environment = this._executionEnvironment(current.paths, cwdInfo);
       const result = normaliseCommandResult(
         await this._runManaged({
           file: current.paths.launcher,
-          args: ['/bin/bash', '-lc', command],
+          // Login profiles replace PATH and hide the shared glibc Node. The
+          // launcher has already constructed the complete guest environment.
+          args: ['/bin/bash', '-c', command],
           cwd: this.dataDir,
           env: environment,
           timeout,

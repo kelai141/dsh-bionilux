@@ -1020,9 +1020,37 @@ test('the guest environment is derived, not inherited from the host', async () =
   assert.equal(env.BIONILUX_LENIENT, '0');
   assert.match(env.BIONILUX_GUEST_PATH, /lib\/node_modules\/npm|bin:.*\/usr\/bin/);
   assert.equal(env.BIONILUX_GUEST_PATH.startsWith(path.join(manager.status().paths.node, 'bin')), true);
+  assert.equal(env.BIONILUX_HOST_PATHS.startsWith(manager.status().paths.node), true,
+    'npm needs the complete shared Node tree, including lib/node_modules');
+  const nodeParent = path.dirname(manager.status().paths.node);
+  const projectedParent = path.join(manager.status().paths.rootfs, path.relative(path.parse(nodeParent).root, nodeParent));
+  assert.equal(existsSync(projectedParent), true, 'shared host paths need traversable guest ancestor directories');
   assert.equal(spec.args[0], '/bin/bash');
-  assert.equal(spec.args[1], '-lc');
+  assert.equal(spec.args[1], '-c');
   assert.equal(spec.args[2], 'echo hi');
+});
+
+test('shared path projections include canonical ancestors without copying host files', { skip: process.platform === 'win32' }, async () => {
+  const dataDir = tempDir();
+  const rootfs = path.join(dataDir, 'projection-root');
+  const target = path.join(tempDir(), 'real', 'shared');
+  const alias = path.join(tempDir(), 'alias', 'shared');
+  await mkdir(target, { recursive: true });
+  await mkdir(path.dirname(alias), { recursive: true });
+  await writeFile(path.join(target, 'host-only'), 'unchanged');
+  await symlink(target, alias);
+  const manager = createManager({ dataDir, arch: 'arm64' });
+  try {
+    await manager._prepareHostPaths(rootfs, [alias]);
+    const environment = manager._executionEnvironment({ rootfs, node: alias }, { guestCwd: alias, hostPaths: [alias] });
+    assert.equal(environment.BIONILUX_HOST_PATHS.includes(target), true,
+      'canonical paths returned by child getcwd must preserve the same host passthrough');
+    for (const directory of [path.dirname(alias), path.dirname(target)]) {
+      assert.equal(existsSync(path.join(rootfs, path.relative(path.parse(directory).root, directory))), true);
+    }
+    assert.equal(await readFile(path.join(target, 'host-only'), 'utf8'), 'unchanged');
+    assert.equal(existsSync(path.join(rootfs, target.slice(1), 'host-only')), false);
+  } finally { await manager.dispose(); }
 });
 
 test('cwd inside the rootfs becomes a guest path, and relative cwd is rejected', async () => {
@@ -1036,14 +1064,14 @@ test('cwd inside the rootfs becomes a guest path, and relative cwd is rejected',
   runner.calls.length = 0;
   const inside = await manager.execute({ command: 'pwd', cwd: path.join(rootfs, 'work') });
   assert.equal(inside.cwd, '/work');
-  const nodeBin = path.join(manager.status().paths.node, 'bin');
+  const sharedNode = manager.status().paths.node;
   // The list is colon-separated for the POSIX guest; on a Windows host an
   // absolute path itself contains ':', so compare by position instead of by
   // splitting.
   assert.equal(
-    String(runner.calls.at(-1).spec.env.BIONILUX_HOST_PATHS).startsWith(nodeBin),
+    String(runner.calls.at(-1).spec.env.BIONILUX_HOST_PATHS).startsWith(sharedNode),
     true,
-    'the shared Linux Node bin directory must stay reachable from the guest',
+    'the complete shared Linux Node directory must stay reachable from the guest',
   );
 
   const guestPath = await manager.execute({ command: 'pwd', cwd: '/root' });

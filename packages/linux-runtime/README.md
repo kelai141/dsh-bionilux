@@ -55,7 +55,7 @@ shared copy for the whole app instead of one per rootfs:
 
 ## Execution contract
 
-`execute({ command, cwd, timeout, signal })` runs `/bin/bash -lc <command>` as a
+`execute({ command, cwd, timeout, signal })` runs `/bin/bash -c <command>` as a
 child of the Bionilux launcher and returns
 `{ stdout, stderr, exitCode, signal, timedOut, cwd, runtimeId, architecture }`.
 
@@ -140,6 +140,18 @@ const manager = ctx.plugin(linuxRuntime, {
 `apply(ctx, config)` creates the manager, publishes it as
 `ctx.linuxRuntimeManager`, and registers `linux_bash` whenever the runtime is
 healthy (re-evaluated on every state change).
+
+`linux_bash` accepts an optional `session` name to retain cwd and exported
+variables between calls. The accompanying `linux_session` tool supports
+`open`, `run`, `start`, `poll`, `close`, and `list`. Background builds retain a
+bounded log and expose its byte offset; exceeding the log cap does not stop
+the build. Session processes end on plugin disposal or host restart; guest
+files and external workspaces remain on disk.
+
+On Android, installation also prepares DNS and a locally diverted `ldconfig`
+adapter after the rootfs reaches its final path. The adapter invokes the
+original static program to generate a real guest cache, retains the diversion
+across package upgrades, and rejects unsupported arguments explicitly.
 
 ## The two shells, as the Agent sees them
 

@@ -148,6 +148,9 @@ jobs:
           BIONILUX_TEST_LAUNCHER="$PWD/target/debug/bionilux" bash tests/runtime.sh
           BIONILUX_TEST_BIN="$PWD/target/debug/bionilux" bash tests/sharedlib.sh
           bash tests/identity_compat.sh
+          bash tests/audit_compat.sh
+          bash tests/shadow_compat.sh
+          bash tests/android_prepare.sh
           bash tests/syscall_compat.sh
           bash tests/python_compat.sh
           bash tests/glob_compat.sh
@@ -266,6 +269,7 @@ jobs:
           install -m 755 "$stage/bionilux-$ARCH" "$backend/bin/bionilux"
           install -m 755 "$stage/libbionilux_preload-$ARCH.so" "$backend/lib/libbionilux_preload.so"
           install -m 755 scripts/prepare-rootfs.sh "$backend/scripts/prepare-rootfs.sh"
+          install -m 755 scripts/prepare-android-rootfs.sh scripts/ldconfig-android.sh "$backend/scripts/"
           tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
             -cJf "$stage/bionilux-backend-$ARCH.tar.xz" -C "$backend" bin lib scripts
           file "$stage/bionilux-$ARCH" "$stage/libbionilux_preload-$ARCH.so"
@@ -336,6 +340,7 @@ jobs:
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links --verify
           sudo tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
+            --hard-dereference --exclude='./dev/*' \
             --xattrs --xattrs-include='*' --acls -cJf "$stage/debian-minimal-$ARCH.tar.xz" \
             -C "$rootfs" .
           sudo chmod 644 "$stage/debian-minimal-$ARCH.tar.xz"

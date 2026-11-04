@@ -1123,6 +1123,8 @@ void *bn_dlsym_dispatch(void *handle, const char *name) {
     return result;
 }
 
+#include "compat_shadow.inc.c"
+
 // Older glibc binaries (including .NET's System.Native) call the versioned
 // __xstat ABI rather than stat. Its hidden libc implementation does not pass
 // through our public stat hook. Forward the version unchanged so unsupported
@@ -1133,8 +1135,9 @@ int name(int version, const char *path, type *st) { \
     static _Thread_local fn_t real; REAL(real, #name); \
     if (!real) { errno = ENOSYS; return -1; } \
     char buf[PATH_MAX]; \
-    int rc = real(version, bn_resolve(AT_FDCWD, path, buf, sizeof buf), st); \
-    if (rc == 0) BN_VIRT_STAT(*st); \
+    const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf); \
+    int rc = real(version, t, st); \
+    if (rc == 0) { BN_VIRT_STAT(*st); BN_SHADOW_NLINK(*st, AT_FDCWD, t); } \
     return rc; \
 }
 BN_XSTAT(__xstat, struct stat)
@@ -1162,8 +1165,9 @@ int name(int version, int fd, const char *path, type *st, int flags) { \
     static _Thread_local fn_t real; REAL(real, #name); \
     if (!real) { errno = ENOSYS; return -1; } \
     char buf[PATH_MAX]; \
-    int rc = real(version, fd, bn_resolve(fd, path, buf, sizeof buf), st, flags); \
-    if (rc == 0) BN_VIRT_STAT(*st); \
+    const char *t = bn_resolve(fd, path, buf, sizeof buf); \
+    int rc = real(version, fd, t, st, flags); \
+    if (rc == 0) { BN_VIRT_STAT(*st); BN_SHADOW_NLINK(*st, fd, t); } \
     return rc; \
 }
 BN_FXSTATAT(__fxstatat, struct stat)
@@ -1174,8 +1178,9 @@ int stat(const char *path, struct stat *st) {
     typedef int (*fn_t)(const char *, struct stat *);
     static _Thread_local fn_t real; REAL(real, "stat");
     char buf[PATH_MAX];
-    int rc = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
-    if (rc == 0) BN_VIRT_STAT(*st);
+    const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
+    int rc = real(t, st);
+    if (rc == 0) { BN_VIRT_STAT(*st); BN_SHADOW_NLINK(*st, AT_FDCWD, t); }
     return rc;
 }
 
@@ -1183,8 +1188,9 @@ int lstat(const char *path, struct stat *st) {
     typedef int (*fn_t)(const char *, struct stat *);
     static _Thread_local fn_t real; REAL(real, "lstat");
     char buf[PATH_MAX];
-    int rc = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
-    if (rc == 0) BN_VIRT_STAT(*st);
+    const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
+    int rc = real(t, st);
+    if (rc == 0) { BN_VIRT_STAT(*st); BN_SHADOW_NLINK(*st, AT_FDCWD, t); }
     return rc;
 }
 
@@ -1192,8 +1198,9 @@ int stat64(const char *path, struct stat64 *st) {
     typedef int (*fn_t)(const char *, struct stat64 *);
     static _Thread_local fn_t real; REAL(real, "stat64");
     char buf[PATH_MAX];
-    int rc = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
-    if (rc == 0) BN_VIRT_STAT(*st);
+    const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
+    int rc = real(t, st);
+    if (rc == 0) { BN_VIRT_STAT(*st); BN_SHADOW_NLINK(*st, AT_FDCWD, t); }
     return rc;
 }
 
@@ -1201,8 +1208,9 @@ int lstat64(const char *path, struct stat64 *st) {
     typedef int (*fn_t)(const char *, struct stat64 *);
     static _Thread_local fn_t real; REAL(real, "lstat64");
     char buf[PATH_MAX];
-    int rc = real(bn_resolve(AT_FDCWD, path, buf, sizeof buf), st);
-    if (rc == 0) BN_VIRT_STAT(*st);
+    const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
+    int rc = real(t, st);
+    if (rc == 0) { BN_VIRT_STAT(*st); BN_SHADOW_NLINK(*st, AT_FDCWD, t); }
     return rc;
 }
 
@@ -1212,7 +1220,7 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     int rc = real(dirfd, t, st, flags);
-    if (rc == 0) BN_VIRT_STAT(*st);
+    if (rc == 0) { BN_VIRT_STAT(*st); BN_SHADOW_NLINK(*st, dirfd, t); }
     return rc;
 }
 
@@ -1222,7 +1230,7 @@ int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
     int rc = real(dirfd, t, st, flags);
-    if (rc == 0) BN_VIRT_STAT(*st);
+    if (rc == 0) { BN_VIRT_STAT(*st); BN_SHADOW_NLINK(*st, dirfd, t); }
     return rc;
 }
 
@@ -1432,7 +1440,10 @@ int unlink(const char *path) {
     typedef int (*fn_t)(const char *);
     static _Thread_local fn_t real; REAL(real, "unlink");
     char buf[PATH_MAX];
-    return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf));
+    const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
+    int rc = real(t);
+    if (rc == 0) bn_shadow_forget_path(AT_FDCWD, t);
+    return rc;
 }
 
 int unlinkat(int dirfd, const char *path, int flags) {
@@ -1440,7 +1451,9 @@ int unlinkat(int dirfd, const char *path, int flags) {
     static _Thread_local fn_t real; REAL(real, "unlinkat");
     char buf[PATH_MAX];
     const char *t = bn_resolve(dirfd, path, buf, sizeof buf);
-    return real(dirfd, t, flags);
+    int rc = real(dirfd, t, flags);
+    if (rc == 0) bn_shadow_forget_path(dirfd, t);
+    return rc;
 }
 
 int rename(const char *from, const char *to) {
@@ -1535,7 +1548,10 @@ static int bn_link_or_copy(int fromfd, const char *from, int tofd, const char *t
     // Do not silently turn a hard link to a symlink into a copy of its target.
     if (real && real(fromfd, from, &st, stat_flags) == 0 && S_ISREG(st.st_mode)) {
         int copied = bn_copy_file(fromfd, from, tofd, to, &st);
-        if (!copied) DBG("link: copied after kernel refusal: %s -> %s\n", from, to);
+        if (!copied) {
+            (void)bn_shadow_record_link(fromfd, from, tofd, to);
+            DBG("link: copied after kernel refusal: %s -> %s\n", from, to);
+        }
         return copied;
     }
     errno = error;
@@ -1771,6 +1787,20 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
 // fail that check with "Could not switch group". Ownership changes become
 // no-ops, because every file already belongs to the app's own uid.
 // The variables themselves are declared next to bn_fake_root().
+
+// Android denies audit sockets to application UIDs. Shadow account tools
+// explicitly support a kernel without audit, but abort on EACCES/EPERM. Report
+// that unsupported facility only after the real audit call was refused, and
+// only for a virtual-root guest. Successful host auditing is left intact.
+int audit_open(void) {
+    typedef int (*fn_t)(void);
+    static _Thread_local fn_t real; REAL(real, "audit_open");
+    if (!real) { errno = ENOSYS; return -1; }
+    int result = real();
+    if (result < 0 && bn_rootfs() && bn_fake_root() &&
+        (errno == EACCES || errno == EPERM)) errno = EPROTONOSUPPORT;
+    return result;
+}
 
 uid_t getuid(void) {
     typedef uid_t (*fn_t)(void);
@@ -2063,7 +2093,10 @@ int remove(const char *path) {
     typedef int (*fn_t)(const char *);
     static _Thread_local fn_t real; REAL(real, "remove");
     char buf[PATH_MAX];
-    return real(bn_resolve(AT_FDCWD, path, buf, sizeof buf));
+    const char *t = bn_resolve(AT_FDCWD, path, buf, sizeof buf);
+    int rc = real(t);
+    if (rc == 0) bn_shadow_forget_path(AT_FDCWD, t);
+    return rc;
 }
 
 int lchmod(const char *path, mode_t mode) {
