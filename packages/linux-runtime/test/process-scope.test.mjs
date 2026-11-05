@@ -2,13 +2,13 @@
  * Process-scope acceptance on a real Linux host.
  *
  * These tests deliberately use the public manager lifecycle and the real
- * spawnCommand implementation. A launcher fixture based on /usr/bin/env turns
+ * spawnCommand implementation. A compiled exec launcher fixture turns
  * each manager command into a normal host shell command, so a manager-owned
  * setsid daemon can be observed through /proc after the command promise has
  * already settled.
  */
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
@@ -55,9 +55,14 @@ async function prepareFixture() {
   await mkdir(path.join(node, 'bin'), { recursive: true });
   await mkdir(path.join(node, 'lib', 'node_modules', 'npm'), { recursive: true });
 
-  // /usr/bin/env treats its first argument as the program: the manager's
-  // ["/bin/bash", "-lc", command] becomes a real host shell command.
-  await copyElf('/usr/bin/env', path.join(backend, 'bin', 'bionilux'));
+  // Do not rename /usr/bin/env: multicall coreutils dispatches by argv[0]
+  // and rejects the name "bionilux". Compile a real ELF that forwards argv,
+  // retaining real spawn/session/process ownership behavior on both layouts.
+  execFileSync('cc', ['-x', 'c', '-o', path.join(backend, 'bin', 'bionilux'), '-'], {
+    input: '#include <unistd.h>\n#include <stdio.h>\nint main(int argc, char **argv) {\n'
+      + '  if (argc < 2) return 2;\n  execvp(argv[1], argv + 1);\n'
+      + '  perror("fixture execvp");\n  return 127;\n}\n',
+  });
   await copyElf('/bin/true', path.join(backend, 'lib', 'libbionilux_preload.so'));
   await writeFile(
     path.join(backend, 'scripts', 'prepare-rootfs.sh'),

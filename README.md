@@ -31,6 +31,11 @@ x86_64 模拟器上验证。
 
 ## 快速开始
 
+需要独立模拟器和免手配的 Agent 入口时，见
+[独立 Linux 使用说明](docs/INDEPENDENT_LINUX.md)。本地启动命令为
+`pwsh -NoProfile -File scripts/start-independent-linux.ps1`，Agent 使用
+`node scripts/linux-agent.mjs exec '<command>'`。
+
 运行时安装在一个由应用持有的前缀下；`PREFIX/files/...` 布局是**推导**出来的，不是假定
 的。
 
@@ -129,10 +134,11 @@ Bionilux、rootfs 与一份共享的 glibc Node.js 包都以带校验和的 Rele
 * **硬链接被拒绝**，且是全设备范围的——包括应用自己的私有目录内。`dpkg` 的备份步骤需要
   `link()`，因此 preload 回退为复制。
 * **`mkfifo()` 对 shell UID 以 `EACCES` 失败**（SELinux），所以 GNU make 无法创建它默认的
-  FIFO jobserver。它也不需要：`make -jN --jobserver-style=pipe` 改用管道即可工作——已在
-  一次内核构建中用 `-j8` 验证。
+  FIFO jobserver。Android manager 为 Debian 13 的 GNU Make 自动设置管道 jobserver，
+  无需手工追加参数。
 * **`ldconfig` 是静态链接的**，任何 preload 都无法映射它；它会往 Android 只读的 `/etc` 写。
-  `prepare-rootfs.sh` **不会**安装替身；配置流程需要它的软件包必须由集成方显式处理。
+  Android 安装流程通过 `dpkg-divert` 保留原程序，并安装路径适配器，使用真实 `ldconfig`
+  在 guest 内生成和读取缓存；该适配会在 libc-bin 更新时保留。
 * **静态二进制**完全在 `LD_PRELOAD` 触及范围之外。
 
 全新 rootfs 在使用前还需要先跑 `scripts/prepare-rootfs.sh`：它重写 Debian rootfs 里那些

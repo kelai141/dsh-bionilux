@@ -878,8 +878,14 @@ pub fn loader_search_path(cfg: &Config, rootfs: &Rootfs, search: &LoaderSearch<'
     // list from BOX64_LD_LIBRARY_PATH, so x86 paths must not reach the host
     // loader.
     if search.target == search.execution {
-        let origin = search
-            .main_elf
+        // ld.so derives ORIGIN from the executable image, not the symlink
+        // used to invoke it (notably /usr/bin/java -> /etc/alternatives/java).
+        // Keep argv/script spelling unchanged; only library lookup uses this.
+        let image = std::fs::canonicalize(search.main_elf)
+            .ok()
+            .filter(|path| rootfs.passthrough(&path.to_string_lossy()))
+            .unwrap_or_else(|| search.main_elf.to_path_buf());
+        let origin = image
             .parent()
             .map(|dir| rootfs.unmap(&dir.to_string_lossy()))
             .unwrap_or_else(|| "/".to_string());
@@ -1352,6 +1358,72 @@ mod tests {
             .join(relative)
             .display()
             .to_string()
+    }
+
+    #[test]
+    fn origin_follows_alternatives_to_the_real_elf_directory() {
+        use std::os::unix::fs::symlink;
+        let (_tmp, cfg, rootfs) = rootfs_fixture(&[
+            "usr/bin",
+            "etc/alternatives",
+            "opt/sdk with spaces/bin",
+            "opt/sdk with spaces/lib",
+        ]);
+        let root = cfg.rootfs.as_ref().unwrap();
+        std::fs::write(root.join("opt/sdk with spaces/bin/java"), b"fixture").unwrap();
+        symlink(
+            "../../opt/sdk with spaces/bin/java",
+            root.join("etc/alternatives/java"),
+        )
+        .unwrap();
+        let alias = root.join("usr/bin/java");
+        symlink("../../etc/alternatives/java", &alias).unwrap();
+        for runpath in [false, true] {
+            let entries = ["$ORIGIN/../lib".to_string()];
+            let dirs = loader_search_path(
+                &cfg,
+                &rootfs,
+                &LoaderSearch {
+                    target: Arch::host(),
+                    execution: Arch::host(),
+                    main_elf: &alias,
+                    rpath: if runpath { &[] } else { &entries },
+                    runpath: if runpath { &entries } else { &[] },
+                    guest_library_path: None,
+                    guest_cwd: "/",
+                },
+            );
+            assert_eq!(dirs[0], physical(&cfg, "opt/sdk with spaces/lib"));
+        }
+    }
+
+    #[test]
+    fn origin_resolves_shared_sdk_links_only_in_explicit_host_paths() {
+        use std::os::unix::fs::symlink;
+        let (tmp, mut cfg, _) = rootfs_fixture(&["usr/bin"]);
+        let shared = tmp.path().join("shared SDK");
+        std::fs::create_dir_all(shared.join("bin")).unwrap();
+        std::fs::create_dir_all(shared.join("lib")).unwrap();
+        std::fs::write(shared.join("bin/java"), b"fixture").unwrap();
+        let alias = cfg.rootfs.as_ref().unwrap().join("usr/bin/java");
+        symlink(shared.join("bin/java"), &alias).unwrap();
+        let entries = ["$ORIGIN/../lib".to_string()];
+        let search = LoaderSearch {
+            target: Arch::host(),
+            execution: Arch::host(),
+            main_elf: &alias,
+            rpath: &entries,
+            runpath: &[],
+            guest_library_path: None,
+            guest_cwd: "/",
+        };
+        let outside = shared.join("lib").display().to_string();
+        assert!(!loader_search_path(&cfg, &Rootfs::from_config(&cfg), &search).contains(&outside));
+        cfg.host_paths.push(shared);
+        assert_eq!(
+            loader_search_path(&cfg, &Rootfs::from_config(&cfg), &search)[0],
+            outside
+        );
     }
 
     #[test]

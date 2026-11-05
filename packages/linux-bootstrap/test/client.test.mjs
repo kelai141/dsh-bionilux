@@ -1,16 +1,16 @@
 /**
  * Regression tests for the client half of the experimental Linux bootstrap.
  *
- * The client is loaded by the DSH Mobile UI host, so its registration contract
- * is a cross-package interface: the host supplies `react` and the `slots`
- * service, and reads the section back from the `settings.section` slot. The
- * DSH Mobile host's own client plugins (`dsh-client-ui-responsive`,
- * `dsh-android-vdisplay`) are the reference for that shape, and these tests pin
- * this package to it:
+ * The shipped Android shell mounts the Linux settings section from its own
+ * responsive client plugin (same-origin routes). This package's client entry is
+ * the upstream source of that surface, so its contract is pinned here:
  *
- *   - `slots` is declared in `inject` next to `linuxBootstrap`
- *   - registration uses `{ name, id, order, label }`
- *   - the disposer the slot registry returns is owned by the context
+ *   - the section needs only `slots`: a page-side plugin can never receive the
+ *     engine's `linuxBootstrap` service, so requiring it would make the entry
+ *     unloadable (and would leave the settings page with no Linux section);
+ *   - registration uses `{ name, id, order, label }` once, through
+ *     `settings.section`;
+ *   - the disposer the slot registry returns is owned by the context.
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -25,7 +25,6 @@ function fakeHost({ withEffect = true } = {}) {
   const injectedKeys = []
   let effectRuns = 0
   const ctx = {
-    linuxBootstrap: { subscribe: () => () => {}, status: async () => ({}) },
     slots: {
       inject(key, factory) {
         injectedKeys.push(key)
@@ -46,11 +45,11 @@ function fakeHost({ withEffect = true } = {}) {
   return { ctx, registered, injectedKeys, effectRuns: () => effectRuns }
 }
 
-test('the client declares the slots service alongside the bootstrap service', () => {
-  assert.deepEqual([...client.inject].sort(), ['linuxBootstrap', 'slots'])
+test('the client declares only the slots service (the engine service is not injectable in a page)', () => {
+  assert.deepEqual([...client.inject], ['slots'])
 })
 
-test('apply registers the Linux environment into the settings.section slot', () => {
+test('apply registers the Linux environment into the settings.section slot once', () => {
   const host = fakeHost()
   client.apply(host.ctx)
   assert.deepEqual(host.injectedKeys, ['settings.section'])
@@ -58,8 +57,8 @@ test('apply registers the Linux environment into the settings.section slot', () 
   const { options, component } = host.registered[0]
   assert.equal(options.name, 'settings.section')
   assert.equal(options.id, 'linux-environment')
-  assert.equal(options.order, 80)
-  assert.equal(options.label(), 'Linux环境')
+  assert.equal(options.order, 95)
+  assert.match(options.label(), /Linux/)
   assert.equal(typeof component, 'function')
 })
 
@@ -82,8 +81,9 @@ test('apply still registers when the context exposes no effect helper', () => {
   assert.equal(host.registered.length, 1)
 })
 
-test('apply refuses to run without the linuxBootstrap service', () => {
+test('apply does not require the engine service to be injected', () => {
   const host = fakeHost()
-  delete host.ctx.linuxBootstrap
-  assert.throws(() => client.apply(host.ctx), /linuxBootstrap service injection is required/)
+  assert.equal(host.ctx.linuxBootstrap, undefined)
+  assert.doesNotThrow(() => client.apply(host.ctx))
+  assert.equal(host.registered.length, 1)
 })

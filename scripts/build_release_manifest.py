@@ -52,6 +52,8 @@ def describe(name):
             member_path = pathlib.PurePosixPath(member.name)
             if member_path.is_absolute() or ".." in member_path.parts:
                 raise SystemExit(f"Unsafe archive member in {name}: {member.name}")
+            if not (member.isreg() or member.isdir() or member.issym()):
+                raise SystemExit(f"Android app cannot extract this archive member in {name}: {member.name}; distribute ordinary files, directories and symbolic links only")
             if member.isreg():
                 unpacked += member.size
     if unpacked <= 0:

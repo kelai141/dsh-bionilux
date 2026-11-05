@@ -110,7 +110,7 @@ sequenceDiagram
     M->>M: 读健康状态 无则显式失败
     M->>M: 只继承白名单宿主变量
     M->>B: launcher + rootfs + guest PATH + host-path
-    B->>D: 在 guest 内 /bin/bash -lc
+    B->>D: 在 guest 内 /bin/bash -c，保留运行时 PATH
     D-->>T: stdout / stderr / exitCode / timedOut
     T-->>Ag: 结果含 cwd 与 runtimeId
 ```

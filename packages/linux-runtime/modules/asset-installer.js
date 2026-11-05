@@ -94,12 +94,18 @@ async function fetchAsset(fetchImpl, asset, destination) {
     if (response.body && typeof response.body[Symbol.asyncIterator] === 'function') {
       for await (const chunk of response.body) {
         const buffer = Buffer.from(chunk);
+        if (size + buffer.length > asset.size) {
+          throw new Error(`asset exceeded declared size: expected ${asset.size}`);
+        }
         hash.update(buffer);
         size += buffer.length;
         await file.write(buffer);
       }
     } else {
       const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > asset.size) {
+        throw new Error(`asset exceeded declared size: expected ${asset.size}`);
+      }
       hash.update(buffer);
       size = buffer.length;
       await file.write(buffer);

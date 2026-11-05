@@ -55,7 +55,7 @@ shared copy for the whole app instead of one per rootfs:
 
 ## Execution contract
 
-`execute({ command, cwd, timeout, signal })` runs `/bin/bash -lc <command>` as a
+`execute({ command, cwd, timeout, signal })` runs `/bin/bash -c <command>` as a
 child of the Bionilux launcher and returns
 `{ stdout, stderr, exitCode, signal, timedOut, cwd, runtimeId, architecture }`.
 
@@ -141,6 +141,18 @@ const manager = ctx.plugin(linuxRuntime, {
 `ctx.linuxRuntimeManager`, and registers `linux_bash` whenever the runtime is
 healthy (re-evaluated on every state change).
 
+`linux_bash` accepts an optional `session` name to retain cwd and exported
+variables between calls. The accompanying `linux_session` tool supports
+`open`, `run`, `start`, `poll`, `close`, and `list`. Background builds retain a
+bounded log and expose its byte offset; exceeding the log cap does not stop
+the build. Session processes end on plugin disposal or host restart; guest
+files and external workspaces remain on disk.
+
+On Android, installation also prepares DNS and a locally diverted `ldconfig`
+adapter after the rootfs reaches its final path. The adapter invokes the
+original static program to generate a real guest cache, retains the diversion
+across package upgrades, and rejects unsupported arguments explicitly.
+
 ## The two shells, as the Agent sees them
 
 `LINUX_BASH_DESCRIPTION` is written for the model: the existing bash tool runs on
@@ -148,6 +160,21 @@ the phone host (Android/Termux, Bionic libc, Termux packages), while `linux_bash
 runs in the Debian/glibc guest with its own `apt`/`dpkg` and the shared glibc
 Node.js. This is an execution-environment choice, and the Debian environment is
 **not a sandbox**: guest root is a user-space identity, not Android root.
+
+Tool definitions use the registry's JSON Schema contract: object-level
+`required` arrays, and explicit nullable exit codes/PIDs while a session or
+background build is still running. Job identifiers and log offsets are also
+rendered as model-visible text. A rejected registration fails activation and
+rolls back partial registrations instead of advertising a healthy environment
+with missing tools. `npm ci && npm test` includes tests against the actual
+Harness tool registry pinned in the development lockfile.
+
+In the app, Linux tools use the conversation's `workingDirectory` service to
+share the same workspace as file editing tools. This requires no user mapping.
+An explicit guest cwd keeps that workspace visible; later persistent calls
+preserve the shell's cwd. Named sessions belong to their agent, so two agents
+can use the same session name without sharing shell state. A workspace change
+requires a new shell; guest system directories cannot be host projections.
 
 ## Known limitations
 

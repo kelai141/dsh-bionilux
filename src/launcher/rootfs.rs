@@ -153,8 +153,12 @@ impl Rootfs {
     }
 
     /// Search the guest `PATH` for `name`, mirroring `execvp` semantics:
-    /// an empty entry means the current directory.
+    /// an empty entry means the current directory. If no candidate is executable,
+    /// keep the first denied path so resolution can report permission denied.
     pub fn search(&self, name: &str, guest_cwd: &str, guest_path: &[String]) -> Option<PathBuf> {
+        if name.is_empty() {
+            return None;
+        }
         let dirs: Vec<String> = if guest_path.is_empty() {
             vec![guest_cwd.to_string()]
         } else {
@@ -171,14 +175,23 @@ impl Rootfs {
                 })
                 .collect()
         };
+        let mut denied = None;
         for dir in dirs {
             let candidate = normalize(&join_guest(&dir, name));
             let physical = self.physical(&candidate);
             if is_executable(&physical) {
                 return Some(physical);
             }
+            if denied.is_none()
+                && match physical.metadata() {
+                    Ok(_) => true,
+                    Err(error) => error.kind() == std::io::ErrorKind::PermissionDenied,
+                }
+            {
+                denied = Some(physical);
+            }
         }
-        None
+        denied
     }
 }
 

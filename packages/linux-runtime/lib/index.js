@@ -12,8 +12,10 @@
  * managed by the bootstrap plugin, not code in this package.
  */
 import { createManager, LinuxRuntimeManager, ExecutionGate } from '../modules/manager.js';
+import { SessionRegistry } from '../modules/session.js';
 
 export { createManager, LinuxRuntimeManager, ExecutionGate };
+export { PersistentSession, SessionRegistry, SessionProtocolParser, assertSessionId } from '../modules/session.js';
 export {
   selectRuntime,
   validateManifest,
@@ -42,12 +44,157 @@ export const inject = ['tools'];
 export const LINUX_BASH_DESCRIPTION = [
   'Run a shell command inside the DSH Mobile Linux environment (Debian/glibc user space, own apt/dpkg).',
   'Use it when a task needs Debian packages, glibc, or Linux-only build tooling.',
+  'For JDK, Android SDK, Gradle and APK compilation, run installation and every build step here or in linux_session, even when the output targets Android.',
   'The plain bash tool runs on the phone host (Android/Termux, Bionic libc, Termux packages): use that for phone-side work, Termux tooling and host paths.',
   'Inside Linux, npm/node resolve to the shared Linux glibc Node.js runtime, not the host Bionic Node.js.',
   'Paths follow guest semantics: /usr, /etc and /var are the Debian ones; the workspace and configured shared directories stay visible under their own absolute paths.',
+  'The current conversation workspace is shared automatically with file editing tools and is the default working directory. Use those same absolute workspace paths for builds; /root belongs to the private Debian filesystem.',
   'This is a Debian environment, not a sandbox: guest root is a user-space identity and is not Android root.',
+  'The Android kernel and /proc are shared. Android entries in /proc/1/root or lack of mount namespaces do not mean this command ran in Termux. Do not nest proot/chroot to enter Debian again.',
+  'Without session this is a fresh shell on every call: cd and export do not persist. Pass the same session name or use linux_session to retain build environment state.',
   'If the Linux runtime is not installed or unhealthy, the command fails with an explicit error. It never silently falls back to the Termux shell.',
 ].join(' ');
+
+export const LINUX_SESSION_DESCRIPTION = [
+  'Manage a persistent shell inside the DSH Mobile Linux environment. A session keeps exported variables and its working directory between tool calls.',
+  'Use this Debian/glibc shell for package installation, JDK/Android SDK/Gradle and APK builds. The plain bash tool is the separate Android/Termux host.',
+  'Use action=open to create it, action=run for a command that should finish, action=start for a long build, action=poll to read new job output by byte offset, and action=close to release it.',
+  'Sessions are non-interactive: full-screen programs, job control and terminal resizing are unsupported. Use the background job output instead of a PTY.',
+  'Sessions live in this plugin process only. A host or app restart ends them; open a new session after a restart.',
+].join(' ');
+
+const LINUX_BASH_OUTPUT_PROPERTIES = {
+  stdout: { type: 'string' },
+  stderr: { type: 'string' },
+  exitCode: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+  signal: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+  timedOut: { type: 'boolean' },
+  cwd: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+  runtimeId: { type: 'string' },
+  session: { type: 'string' },
+  sessionClosed: { type: 'boolean' },
+  stdoutTruncated: { type: 'boolean' },
+  stderrTruncated: { type: 'boolean' },
+  running: { type: 'boolean' },
+  pid: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+};
+
+const renderShellResult = (_args, value) => {
+  // The model receives rendered text. Job identifiers and byte offsets must be
+  // present there so it can poll a long build without guessing internal state.
+  const { stdout, stderr, ...metadata } = value ?? {};
+  return [
+    { type: 'text', text: 'Execution environment: Debian/glibc Linux (linux_bash/linux_session); Android kernel and /proc are shared.' },
+    { type: 'text', text: String(stdout ?? '') },
+    stderr ? { type: 'text', text: String(stderr) } : null,
+    Object.keys(metadata).length ? { type: 'text', text: JSON.stringify(metadata) } : null,
+  ].filter(Boolean);
+};
+
+/** Read the same per-conversation workspace service used by the file tools. */
+async function executionDirectories(ctx, args, exec) {
+  if (!exec?.agent || typeof ctx.get !== 'function') return { cwd: args.cwd };
+  const directories = ctx.get('workingDirectory');
+  if (typeof directories?.ensure !== 'function') throw new Error('Linux tools require the conversation working-directory service');
+  const workspace = await directories.ensure(exec.agent, exec.signal);
+  return { cwd: args.cwd, sharedPaths: [workspace] };
+}
+
+/**
+ * Register the persistent-session tool next to linux_bash.
+ *
+ * The registry is created here when the caller does not supply one, so a host
+ * adapter that mounts this plugin gets persistent shells without extra
+ * configuration.
+ */
+export function registerLinuxSession(ctx, manager, { registry = new SessionRegistry(manager), registryFor, ownsRegistry = false } = {}) {
+  const tools = ctx?.tools;
+  if (!tools || typeof tools.register !== 'function') {
+    if (ownsRegistry) void registry.dispose();
+    return () => {};
+  }
+  const tool = {
+    name: 'linux_session',
+    description: LINUX_SESSION_DESCRIPTION,
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['action'],
+      properties: {
+      action: {
+        type: 'string',
+        description: 'open, run, start, poll, close or list.',
+        enum: ['open', 'run', 'start', 'poll', 'close', 'list'],
+      },
+      session: {
+        type: 'string',
+        description: 'Session name. Defaults to session-1 for run/start/poll; open without a name allocates one.',
+      },
+      command: { type: 'string', description: 'Command for run or start. A run keeps the session shell state; start only launches a background job.' },
+      cwd: { type: 'string', description: 'Absolute guest working directory for open or the next run/start.' },
+      timeoutMs: { type: 'number', description: 'Timeout for run. A timed-out command closes its session.' },
+      job: { type: 'string', description: 'Job identifier returned by start, required by poll.' },
+      offset: { type: 'number', description: 'Byte offset returned by the previous poll.' },
+      limitBytes: { type: 'number', description: 'Maximum job output bytes to return in this poll.' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          ...LINUX_BASH_OUTPUT_PROPERTIES,
+          action: { type: 'string' },
+          job: { type: 'string' },
+          nextOffset: { type: 'number' },
+          eof: { type: 'boolean' },
+          finished: { type: 'boolean' },
+          sessions: { type: 'array' },
+        },
+      },
+      render: renderShellResult,
+    },
+    execute: async (args = {}, exec) => {
+      const sessions = registryFor?.(exec) ?? registry;
+      const action = String(args.action ?? '').trim();
+      const session = args.session == null || args.session === '' ? 'session-1' : String(args.session);
+      const directories = ['open', 'run', 'start'].includes(action) ? await executionDirectories(ctx, args, exec) : {};
+      if (action === 'open') {
+        return { ...(await sessions.open({ id: args.session, ...directories })), action };
+      }
+      if (action === 'list') {
+        return { action, sessions: sessions.list(), stdout: '', stderr: '' };
+      }
+      if (action === 'close') {
+        return { action, ...(await sessions.close(session)), stdout: '', stderr: '' };
+      }
+      if (action === 'start') {
+        const result = await sessions.start(session, { command: String(args.command ?? ''), ...directories });
+        return { ...result, action, stdout: '', stderr: result.launchStderr ?? '' };
+      }
+      if (action === 'poll') {
+        return { ...(await sessions.poll(session, { job: args.job, offset: args.offset, limitBytes: args.limitBytes })), action };
+      }
+      if (action === 'run') {
+        const result = await sessions.run(session, {
+          command: String(args.command ?? ''),
+          ...directories,
+          timeoutMs: Number.isFinite(args.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : undefined,
+        });
+        return { ...result, action, runtimeId: manager.status().runtimeId };
+      }
+      throw new Error('action must be one of open, run, start, poll, close or list');
+    },
+  };
+  const disposeTool = tools.register(tool);
+  return () => {
+    try {
+      disposeTool?.();
+    } finally {
+      if (ownsRegistry) void registry.dispose();
+    }
+  };
+}
 
 /**
  * Build the Agent tool face for a manager.
@@ -65,40 +212,66 @@ export function registerLinuxBash(ctx, manager, options = {}) {
   const tools = ctx?.tools;
   if (!tools || typeof tools.register !== 'function') return () => {};
 
+  const registry = options.registry ?? new SessionRegistry(manager);
+  const ownsRegistry = options.registry == null;
+  const scoped = new WeakMap();
+  const ownedRegistries = new Set(ownsRegistry ? [registry] : []);
+  const registryFor = exec => {
+    if (!ownsRegistry || !exec?.agent) return registry;
+    let sessions = scoped.get(exec.agent);
+    if (!sessions) {
+      sessions = new SessionRegistry(manager);
+      scoped.set(exec.agent, sessions);
+      ownedRegistries.add(sessions);
+    }
+    return sessions;
+  };
+  const releaseRegistries = () => {
+    for (const sessions of ownedRegistries) void sessions.dispose();
+    ownedRegistries.clear();
+  };
+
   const parameterSchema = {
-    command: { type: 'string', required: true, description: 'Shell command to run as /bin/bash -lc inside the Linux environment.' },
+    command: { type: 'string', description: 'Shell command. Runs as /bin/bash -c unless session is set; the configured guest PATH is preserved.' },
     cwd: { type: 'string', description: 'Absolute working directory. A guest path such as /root or a shared host directory.' },
     timeoutMs: { type: 'number', description: 'Command timeout in milliseconds.' },
+    session: { type: 'string', description: 'Persistent session name. When set, the command runs in that shell and keeps its cwd and exported variables.' },
   };
 
   const tool = {
     name: 'linux_bash',
     description: LINUX_BASH_DESCRIPTION,
-    parameters: parameterSchema,
+    parameters: { type: 'object', properties: parameterSchema, required: ['command'], additionalProperties: false },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
-        properties: {
-          stdout: { type: 'string', required: true },
-          stderr: { type: 'string', required: true },
-          exitCode: { type: 'number' },
-          timedOut: { type: 'boolean' },
-          cwd: { type: 'string' },
-          runtimeId: { type: 'string' },
-        },
+        required: ['stdout', 'stderr'],
+        properties: LINUX_BASH_OUTPUT_PROPERTIES,
       },
-      render: (_args, value) =>
-        [
-          { type: 'text', text: String(value?.stdout ?? '') },
-          value?.stderr ? { type: 'text', text: String(value.stderr) } : null,
-        ].filter(Boolean),
+      render: renderShellResult,
     },
-    execute: async (args = {}) => {
+    execute: async (args = {}, exec) => {
       const timeoutMs = Number.isFinite(args.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : 120_000;
+      const directories = await executionDirectories(ctx, args, exec);
+      if (args.session != null && args.session !== '') {
+        const result = await registryFor(exec).run(String(args.session), {
+          command: String(args.command ?? ''),
+          ...directories,
+          timeoutMs,
+        });
+        if (result.timedOut) {
+          throw new Error(`Command timed out after ${timeoutMs} ms; session ${String(args.session)} was closed.`);
+        }
+        return {
+          ...result,
+          runtimeId: manager.status().runtimeId,
+          ...(options.metadata ?? {}),
+        };
+      }
       const result = await manager.execute({
         command: String(args.command ?? ''),
-        cwd: args.cwd,
+        ...directories,
         timeout: timeoutMs,
       });
       if (result.timedOut) {
@@ -116,7 +289,26 @@ export function registerLinuxBash(ctx, manager, options = {}) {
     },
   };
 
-  return tools.register(tool);
+  const disposeBash = tools.register(tool);
+  let disposeSession;
+  try {
+    disposeSession = registerLinuxSession(ctx, manager, { registry, registryFor });
+  } catch (error) {
+    disposeBash?.();
+    releaseRegistries();
+    throw error;
+  }
+  return () => {
+    try {
+      disposeBash?.();
+    } finally {
+      try {
+        disposeSession?.();
+      } finally {
+        releaseRegistries();
+      }
+    }
+  };
 }
 
 /**
@@ -145,6 +337,10 @@ export function apply(ctx, config = {}) {
       fetchImpl: config.fetchImpl,
       runCommand: config.runCommand,
       onStateChange: config.onStateChange,
+      dnsServers: config.dnsServers,
+      dnsServersProvider: config.dnsServersProvider,
+      dnsProbe: config.dnsProbe,
+      dnsProbeTimeoutMs: config.dnsProbeTimeoutMs,
     });
 
   let disposeTool = () => {};
@@ -156,11 +352,9 @@ export function apply(ctx, config = {}) {
     }
     disposeTool = () => {};
     if (manager.status().healthy) {
-      try {
-        disposeTool = registerLinuxBash(ctx, manager) ?? (() => {});
-      } catch {
-        disposeTool = () => {};
-      }
+      // Activation must fail if the real registry rejects a tool. Reporting a
+      // healthy environment while silently hiding its tools strands the agent.
+      disposeTool = registerLinuxBash(ctx, manager) ?? (() => {});
     }
   };
 

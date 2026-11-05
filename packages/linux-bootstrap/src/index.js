@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fetchLatestManifest } from './github.js'
 import {
@@ -204,6 +204,10 @@ export function createMobileBootstrap(options = {}) {
   let operation = 'idle'
   let manager = initialManager ?? null
   let installedPlugin = false
+  // Set when this load re-activated a persisted installation. A host that still
+  // reports `active: false` right after a successful install is lagging, not a
+  // user removal, so the opt-in must not be cleared on that basis.
+  let restoredThisLoad = false
   let lastStatus
   let ready
   let tail = Promise.resolve()
@@ -297,6 +301,7 @@ export function createMobileBootstrap(options = {}) {
     if (!state.installedLinuxVersion) return
     const host = await hostInjection()
     if (!host) return
+    if (restoredThisLoad && host.injected && !host.active) return
     state.enabled = host.injected && host.active
     state.injectionActivated = state.enabled
     await save()
@@ -310,6 +315,84 @@ export function createMobileBootstrap(options = {}) {
     manifest: publicManifest(manifest),
     runtimeId,
   })
+
+  /** A persisted activation is only restorable from a directory the host still owns. */
+  const isInsidePluginRoot = (directory) => {
+    if (typeof directory !== 'string' || directory === '') return false
+    const relative = path.relative(pluginRoot, path.resolve(directory))
+    return relative !== '' && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)
+  }
+
+  const entryIsPresent = async (directory) => {
+    try {
+      return (await stat(path.join(directory, RUNTIME_ENTRY))).isFile()
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Re-activate an installation the user already confirmed.
+   *
+   * This runs **before** `synchronizeInjectionState()`: that function derives
+   * `enabled/injectionActivated` from `host.isInjected(...).active`, and a host
+   * that has just started has not loaded the runtime plugin yet, so it reports
+   * `active: false` and the persisted opt-in would be cleared on every cold
+   * start (tools then never come back).
+   *
+   * Three rules keep the restore honest:
+   *   1. only when the user had persisted `enabled && injectionActivated`;
+   *   2. only when the host still reports the plugin as injected (a manual
+   *      removal is never resurrected, and nothing is downloaded here);
+   *   3. only from a directory inside our plugin root with its entry present;
+   *      a missing file disables the record instead of re-fetching it.
+   */
+  async function restoreActivation() {
+    if (!state.installedLinuxVersion || !state.enabled || !state.injectionActivated) return
+    if (!state.pluginDirectory) return
+    const host = await hostInjection()
+    if (!host || !host.injected) return
+    if (!isInsidePluginRoot(state.pluginDirectory) || !(await entryIsPresent(state.pluginDirectory))) {
+      // The user's own removal or an incomplete tree: fail closed, never re-download.
+      state.enabled = false
+      state.injectionActivated = false
+      state.lastError = 'The installed Linux runtime plugin files are missing; an explicit install is required'
+      await save()
+      return
+    }
+    const config = pluginConfig(state.pinnedManifest, state.runtimeId)
+    try {
+      const hostResult = await pluginHost.install({
+        directory: state.pluginDirectory,
+        entry: RUNTIME_ENTRY,
+        config,
+        enable: true,
+      })
+      installedPlugin = true
+      const restored = await resolveManager({ hostResult, directory: state.pluginDirectory, config })
+      state.runtime = typeof restored.status === 'function' ? await restored.status() : state.runtime
+      restoredThisLoad = true
+      // `status()` reads active.json; the runtime plugin registers its tools during
+      // activation only while that record is healthy, so surface an unhealthy
+      // restore instead of reporting a working environment.
+      if (state.runtime && state.runtime.healthy === false) {
+        state.lastError = 'Restored Linux runtime is unhealthy: ' + (state.runtime.reason ?? 'unknown reason')
+      } else {
+        state.lastError = null
+      }
+      await save()
+    } catch (error) {
+      // Activation failure leaves the record installed but inactive: no download,
+      // no silent revival, and the reason stays visible in status().
+      // An engine shutdown is cancellation, not a broken persisted install.
+      // Keep the user's activation choice so the next engine can restore it.
+      if (error?.code === 'LINUX_ENGINE_STOPPING') throw error
+      state.enabled = false
+      state.injectionActivated = false
+      state.lastError = safeError(error)
+      await save()
+    }
+  }
 
   async function installRuntime({ manifest, runtimeId, reinstall = false, automatic = false, activate = false }) {
     const runtime = selectRuntimeForArch(manifest, runtimeId, hostArch)
@@ -328,7 +411,13 @@ export function createMobileBootstrap(options = {}) {
     let result
     let hostResult
     let hostInstalled = false
+    // issue #1374：资产一旦发布就占住了 `<root>/<sha256>` 并把旧槽位改名成 `.backup-*`。
+    // host 安装与激活都发生在发布**之后**，任一步失败都必须能把旧包换回来，
+    // 否则就是「磁盘是新包、state 还是旧版本、旧目录已不存在」的半态。
+    let assetHandle = null
     let resolvedManager = manager
+    let managerBeforeActivation = manager
+    let stateBeforeActivation = null
     const config = pluginConfig(manifest, runtimeId)
     try {
       result = await installVerifiedPluginBundle({
@@ -342,7 +431,9 @@ export function createMobileBootstrap(options = {}) {
         kind: 'plugin',
         packageName: RUNTIME_PACKAGE_NAME,
         entry: RUNTIME_ENTRY,
+        deferCommit: true,
       })
+      assetHandle = result.assetHandle ?? null
       const enable = automatic ? state.enabled && state.injectionActivated : activate === true
       if (automatic) {
         // An automatic update may only replace the assets of a plugin the user
@@ -356,6 +447,12 @@ export function createMobileBootstrap(options = {}) {
         }
       }
       if (!enable) throw new Error('Runtime plugin activation requires explicit confirmation')
+      // Once the host has loaded the plugin, a later failure (manager
+      // provisioning, health status, or persistence) rolls the host back.
+      // Keep the in-memory view at the pre-activation value as well, so a
+      // rolled-back install is not reported as installed until the next load.
+      stateBeforeActivation = { ...state }
+      managerBeforeActivation = manager
       hostResult = await pluginHost.install({ directory: result.path, entry: RUNTIME_ENTRY, config, enable })
       hostInstalled = true
       installedPlugin = true
@@ -378,8 +475,22 @@ export function createMobileBootstrap(options = {}) {
       state.lastError = null
       state.runtime = typeof resolvedManager.status === 'function' ? await resolvedManager.status() : { id: runtime.id, label: runtime.label, architecture: runtime.architecture, backend: runtime.backend }
       await save()
+      // issue #1374：全部成功才丢弃旧包备份——提交点必须在激活/manifest 落库之后。
+      if (typeof assetHandle?.commit === 'function') await assetHandle.commit()
       return emit()
     } catch (error) {
+      // 顺序：**先回滚资产、再回滚 host scope**（issue #1374）。
+      // 反过来会出现「host 已回滚、磁盘仍是新包」——正是本 issue 的半态。
+      if (typeof assetHandle?.rollback === 'function') {
+        try {
+          await assetHandle.rollback()
+        } catch (assetRollbackError) {
+          // issue #1528：这里只记字段等于「没人知道回滚失败过」。warn 一行，落盘由
+          // asset-bundle 的 rollback 内部完成（那里才拿得到 assets root）。
+          console.warn('[dsh-linux-bootstrap] asset rollback failed: ' + String((assetRollbackError && assetRollbackError.message) || assetRollbackError))
+          error.assetRollbackError = safeError(assetRollbackError)
+        }
+      }
       if (hostInstalled) {
         try {
           if (typeof hostResult?.rollback === 'function') await hostResult.rollback()
@@ -387,6 +498,10 @@ export function createMobileBootstrap(options = {}) {
         } catch (rollbackError) {
           error.rollbackError = safeError(rollbackError)
         }
+      }
+      if (stateBeforeActivation) {
+        Object.assign(state, stateBeforeActivation)
+        manager = managerBeforeActivation
       }
       state.lastError = safeError(error)
       emit()
@@ -449,6 +564,8 @@ export function createMobileBootstrap(options = {}) {
       await save()
     }
     await updateMobileVersion()
+    // Restore before the host view is reconciled (see restoreActivation).
+    await restoreActivation()
     await synchronizeInjectionState()
   }
 
@@ -554,7 +671,7 @@ export const createBootstrap = createMobileBootstrap
 
 export function apply(ctx, config = {}) {
   const pluginHost = config.pluginHost ?? ctx.linuxPluginHost
-  const filesDir = config.filesDir ?? ctx.filesDir
+  const filesDir = config.filesDir ?? (typeof ctx.get === 'function' ? ctx.get('filesDir') : ctx.filesDir)
   const dataDir = config.dataDir ?? (filesDir ? path.join(filesDir, 'linux-environment') : null)
   if (!dataDir) throw new TypeError('dataDir or ctx.filesDir is required')
   const service = createMobileBootstrap({ ...config, dataDir, pluginHost })

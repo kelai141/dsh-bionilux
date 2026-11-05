@@ -73,6 +73,17 @@ build_app "$ROOT/opt/app/bin/abs-runpath-app" -L"$ROOT/opt/runlib" -lgreet \
 build_app "$ROOT/opt/app/bin/abs-rpath-app" -L"$ROOT/opt/rpathlib" -lgreet \
     -Wl,--disable-new-dtags,-rpath,/opt/rpathlib
 
+# Mirror Debian alternatives: both RPATH and RUNPATH must use the real ELF
+# directory, including SDK paths with spaces, rather than /usr/bin.
+mkdir -p "$ROOT/etc/alternatives" "$ROOT/opt/sdk with spaces/bin" "$ROOT/opt/sdk with spaces/lib"
+build_lib "$ROOT/opt/sdk with spaces/lib" from-alternatives-origin
+for tag in enable disable; do
+    build_app "$ROOT/opt/sdk with spaces/bin/$tag-app" -L"$ROOT/opt/sdk with spaces/lib" -lgreet \
+        -Wl,--$tag-new-dtags,-rpath,'$ORIGIN/../lib'
+    ln -s "../../opt/sdk with spaces/bin/$tag-app" "$ROOT/etc/alternatives/$tag-app"
+    ln -s "../../etc/alternatives/$tag-app" "$ROOT/usr/bin/$tag-app"
+done
+
 # A probe whose /proc/self/exe only reads correctly when the preload is active,
 # because the kernel would report the loader it was started with.
 "$CC" -O2 -o "$ROOT/usr/bin/selfexe" -xc - <<'EOF'
@@ -155,6 +166,10 @@ check "guest LD_LIBRARY_PATH is translated for the loader" from-ld-library-path 
 #    the launcher hands the loader the physical main object.
 check "DT_RUNPATH with ORIGIN resolves inside the rootfs" from-origin-runpath \
     run "$BIN" --rootfs "$ROOT" /opt/app/bin/origin-runpath-app
+for tag in enable disable; do
+    check "$tag-new-dtags ORIGIN follows alternatives symlinks" from-alternatives-origin \
+        run "$BIN" --rootfs "$ROOT" "/usr/bin/$tag-app"
+done
 
 # 3. An absolute guest path in DT_RUNPATH or DT_RPATH has to be mapped; the
 #    loader would otherwise read it as a host directory.
