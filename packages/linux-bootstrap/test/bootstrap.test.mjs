@@ -42,7 +42,7 @@ function response(value, url = '') {
   return { ok: true, status: 200, url, json: async () => value, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) }
 }
 
-function harness({ dataDir = path.join(root, `state-${Math.random().toString(16).slice(2)}`), currentVersion = { value: '0.14.0' }, latestVersion = '1.1.0', managerProvider, hostReturnsManager = true, isInjected } = {}) {
+function harness({ dataDir = path.join(root, `state-${Math.random().toString(16).slice(2)}`), currentVersion = { value: '0.14.0' }, latestVersion = '1.1.0', managerProvider, hostReturnsManager = true, isInjected, hostInstallError } = {}) {
   const calls = { manifestFetches: 0, downloads: 0, managerInstalls: [], managerUninstalls: 0, hostInstalls: [], hostUninstalls: 0, injectionQueries: 0 }
   const runtimeManager = {
     install: async (...args) => calls.managerInstalls.push(args),
@@ -58,7 +58,7 @@ function harness({ dataDir = path.join(root, `state-${Math.random().toString(16)
     appVersionProvider: () => currentVersion.value,
     managerProvider,
     pluginHost: {
-      install: async (input) => { calls.hostInstalls.push(input); return { ...(hostReturnsManager ? { manager: runtimeManager } : {}), rollback: async () => { calls.hostUninstalls += 1 } } },
+      install: async (input) => { calls.hostInstalls.push(input); if (hostInstallError) throw hostInstallError; return { ...(hostReturnsManager ? { manager: runtimeManager } : {}), rollback: async () => { calls.hostUninstalls += 1 } } },
       uninstall: async () => { calls.hostUninstalls += 1 },
       isInjected: async () => {
         calls.injectionQueries += 1
@@ -388,3 +388,23 @@ test('writes require confirmed true on route handler adapter', async () => {
 })
 
 after(async () => rm(root, { recursive: true, force: true }))
+
+test('shutdown during cold restore preserves persisted opt-in for the next engine', async () => {
+  const installed = harness()
+  await installed.service.ready
+  await installed.service.install({ confirmed: true, activate: true })
+  const statePath = path.join(installed.dataDir, 'linux-bootstrap-state.json')
+  const before = JSON.parse(await readFile(statePath, 'utf8'))
+  const stopped = harness({ dataDir: installed.dataDir, isInjected: { injected: true, active: false },
+    hostInstallError: Object.assign(new Error('engine stopping'), { code: 'LINUX_ENGINE_STOPPING' }) })
+  await stopped.service.ready
+  const after = JSON.parse(await readFile(statePath, 'utf8'))
+  assert.equal(after.enabled, true)
+  assert.equal(after.injectionActivated, true)
+  assert.equal(after.pluginDirectory, before.pluginDirectory)
+  assert.equal(stopped.calls.downloads, 0)
+  const restarted = harness({ dataDir: installed.dataDir })
+  await restarted.service.ready
+  assert.equal((await restarted.service.status()).enabled, true)
+  assert.equal(restarted.calls.hostInstalls.length, 1)
+})

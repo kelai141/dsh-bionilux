@@ -7,7 +7,7 @@
 - 执行：`node scripts/linux-agent.mjs exec '<Linux command>'`。默认复用 `agent` 会话，保留工作目录、环境变量和 shell 状态。
 - 工具说明：`node scripts/linux-agent.mjs tools`。
 - 长构建：调用 `linux_session` 的 `start` / `poll` 动作，按输出偏移续读；命令格式见工具说明。
-- 默认设备为专用的 `emulator-5580`，不要操作其它设备。认证由客户端自动读取，不需要手工配置令牌。
+- 默认设备为 `emulator-5580`；可按任务需要使用用户指定的 MuMu 实例。认证由客户端自动读取，不需要手工配置令牌。
 - guest 文件和已安装软件保存在应用私有目录，停止服务不删除它们。进程终止或模拟器重启会结束活 shell；重新启动服务会恢复已有文件系统并创建新会话。
 - Windows / Android 交叉构建仍在宿主执行。不要把 Debian 的成功结果冒充 Android 设备验证。
 

@@ -99,6 +99,9 @@ function dataDirOwnerError(dataDir) {
 }
 
 const HOST_ENV_ALLOWLIST = new Set([
+  // Non-secret ownership label for the app's force-stop cleanup. Keeping this
+  // exact generation marker lets the host release guest descendants as well.
+  'DSH_ENGINE_INSTANCE',
   'PATH',
   'ANDROID_ROOT',
   'ANDROID_DATA',

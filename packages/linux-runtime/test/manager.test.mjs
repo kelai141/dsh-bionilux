@@ -1050,6 +1050,22 @@ test('the guest environment is derived, not inherited from the host', async () =
   assert.equal(spec.args[2], 'echo hi');
 });
 
+test('guest commands retain only the engine ownership marker, not provider secrets', async () => {
+  const saved = { marker: process.env.DSH_ENGINE_INSTANCE, secret: process.env.DSH_PROVIDER_KEY };
+  const manager = createManager({ dataDir: tempDir(), arch: 'arm64' });
+  try {
+    process.env.DSH_ENGINE_INSTANCE = 'test-generation-123';
+    process.env.DSH_PROVIDER_KEY = 'test-secret-must-not-inherit';
+    const env = manager._executionEnvironment({ rootfs: '/guest-root', node: '/shared-node' }, { guestCwd: '/root', hostPaths: [] });
+    assert.equal(env.DSH_ENGINE_INSTANCE, 'test-generation-123');
+    assert.equal(env.DSH_PROVIDER_KEY, undefined);
+  } finally {
+    if (saved.marker === undefined) delete process.env.DSH_ENGINE_INSTANCE; else process.env.DSH_ENGINE_INSTANCE = saved.marker;
+    if (saved.secret === undefined) delete process.env.DSH_PROVIDER_KEY; else process.env.DSH_PROVIDER_KEY = saved.secret;
+    await manager.dispose();
+  }
+});
+
 test('shared path projections include canonical ancestors without copying host files', { skip: process.platform === 'win32' }, async () => {
   const dataDir = tempDir();
   const rootfs = path.join(dataDir, 'projection-root');
