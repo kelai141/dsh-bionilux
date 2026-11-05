@@ -161,6 +161,7 @@ jobs:
           bash tests/aarch64.sh
       - name: Plugin package tests
         run: |
+          npm ci --prefix packages/linux-runtime --ignore-scripts --no-audit --no-fund
           node --test packages/linux-bootstrap/test/*.test.mjs packages/linux-runtime/test/*.test.mjs
       - name: Release metadata and manifest contract tests
         run: python3 tests/test_release_workflows.py -v

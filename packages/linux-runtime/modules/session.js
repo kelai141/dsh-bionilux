@@ -365,6 +365,7 @@ export class PersistentSession {
     this._readyReject = undefined;
     this._paths = undefined;
     this._cwd = null;
+    this._sharedPaths = [];
     this._jobs = new Map();
     this._jobsInternal = new Set();
     this._jobSequence = 0;
@@ -429,6 +430,7 @@ export class PersistentSession {
 
   async _open(paths, cwdInfo) {
     this._paths = paths;
+    this._sharedPaths = [...(cwdInfo.sharedPaths ?? [])];
     if (typeof this.manager._prepareHostPaths === 'function') {
       await this.manager._prepareHostPaths(paths.rootfs, cwdInfo.hostPaths);
     }
@@ -1091,11 +1093,32 @@ export class SessionRegistry {
     return assertSessionId(id);
   }
 
-  async open({ id, cwd } = {}) {
+  /**
+   * A live session fixes its host pass-throughs for its whole lifetime. The
+   * sibling tool calls run in one conversation workspace, so a different set
+   * here would silently expose a second workspace to the same shell. Reject it
+   * instead, and let the caller open a new session after closing this one.
+   */
+  _assertSameSharedPaths(session, cwdInfo) {
+    if (!cwdInfo) return;
+    const opened = [...(session._sharedPaths ?? [])].sort();
+    const requested = [...(cwdInfo.sharedPaths ?? [])].sort();
+    if (opened.length === requested.length && opened.every((value, index) => value === requested[index])) return;
+    throw new Error(
+      'session ' + session.id + ' was opened with different sharedPaths; close it before changing the shared directories',
+    );
+  }
+
+  async open({ id, cwd, sharedPaths = [] } = {}) {
     const status = this._assertAvailable();
     const name = this._name(id);
     const existing = this.sessions.get(name);
-    if (existing && existing.running) return existing.info();
+    if (existing && existing.running) {
+      if (sharedPaths != null && sharedPaths.length > 0) {
+        this._assertSameSharedPaths(existing, this.manager._resolveCwd(cwd, status.paths.rootfs, sharedPaths));
+      }
+      return existing.info();
+    }
     if (this.sessions.size >= this.maxSessions && !existing) {
       throw new Error(`session limit reached (${this.maxSessions}); close a session before opening another`);
     }
@@ -1103,7 +1126,7 @@ export class SessionRegistry {
       this.sessions.delete(name);
       await existing.close().catch(() => undefined);
     }
-    const cwdInfo = this.manager._resolveCwd(cwd, status.paths.rootfs);
+    const cwdInfo = this.manager._resolveCwd(cwd, status.paths.rootfs, sharedPaths ?? []);
     const session = new PersistentSession(this.manager, {
       id: name,
       maxOutputBytes: this.maxOutputBytes,
@@ -1122,25 +1145,30 @@ export class SessionRegistry {
     return session.info();
   }
 
-  async _session(id, { cwd } = {}) {
+  async _session(id, { cwd, sharedPaths = [] } = {}) {
     const status = this._assertAvailable();
     const name = assertSessionId(id);
     let session = this.sessions.get(name);
     if (!session || !session.running) {
-      await this.open({ id: name, cwd });
+      await this.open({ id: name, cwd, sharedPaths });
       session = this.sessions.get(name);
     }
-    const cwdInfo = cwd == null ? undefined : this.manager._resolveCwd(cwd, status.paths.rootfs);
-    return { session, cwdInfo };
+    const cwdInfo = cwd == null && (sharedPaths == null || sharedPaths.length === 0)
+      ? undefined
+      : this.manager._resolveCwd(cwd, status.paths.rootfs, sharedPaths ?? []);
+    if (cwdInfo && sharedPaths?.length) this._assertSameSharedPaths(session, cwdInfo);
+    // Mapping validation must not become a cd on every call. Only an explicit
+    // cwd changes an existing persistent shell's working directory.
+    return { session, cwdInfo: cwd == null ? undefined : cwdInfo };
   }
 
-  async run(id, { command, cwd, timeoutMs } = {}) {
-    const { session, cwdInfo } = await this._session(id, { cwd });
+  async run(id, { command, cwd, timeoutMs, sharedPaths = [] } = {}) {
+    const { session, cwdInfo } = await this._session(id, { cwd, sharedPaths });
     return session.run({ command, cwd: cwdInfo?.guestCwd, timeoutMs });
   }
 
-  async start(id, { command, cwd } = {}) {
-    const { session, cwdInfo } = await this._session(id, { cwd });
+  async start(id, { command, cwd, sharedPaths = [] } = {}) {
+    const { session, cwdInfo } = await this._session(id, { cwd, sharedPaths });
     return session.startJob({ command, cwd: cwdInfo?.guestCwd });
   }
 

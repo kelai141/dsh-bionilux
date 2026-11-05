@@ -47,6 +47,7 @@ export const LINUX_BASH_DESCRIPTION = [
   'The plain bash tool runs on the phone host (Android/Termux, Bionic libc, Termux packages): use that for phone-side work, Termux tooling and host paths.',
   'Inside Linux, npm/node resolve to the shared Linux glibc Node.js runtime, not the host Bionic Node.js.',
   'Paths follow guest semantics: /usr, /etc and /var are the Debian ones; the workspace and configured shared directories stay visible under their own absolute paths.',
+  'The current conversation workspace is shared automatically with file editing tools and is the default working directory. Use those same absolute workspace paths for builds; /root belongs to the private Debian filesystem.',
   'This is a Debian environment, not a sandbox: guest root is a user-space identity and is not Android root.',
   'If the Linux runtime is not installed or unhealthy, the command fails with an explicit error. It never silently falls back to the Termux shell.',
 ].join(' ');
@@ -59,25 +60,40 @@ export const LINUX_SESSION_DESCRIPTION = [
 ].join(' ');
 
 const LINUX_BASH_OUTPUT_PROPERTIES = {
-  stdout: { type: 'string', required: true },
-  stderr: { type: 'string', required: true },
-  exitCode: { type: 'number' },
+  stdout: { type: 'string' },
+  stderr: { type: 'string' },
+  exitCode: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+  signal: { oneOf: [{ type: 'string' }, { type: 'null' }] },
   timedOut: { type: 'boolean' },
-  cwd: { type: 'string' },
+  cwd: { oneOf: [{ type: 'string' }, { type: 'null' }] },
   runtimeId: { type: 'string' },
   session: { type: 'string' },
   sessionClosed: { type: 'boolean' },
   stdoutTruncated: { type: 'boolean' },
   stderrTruncated: { type: 'boolean' },
   running: { type: 'boolean' },
-  pid: { type: 'number' },
+  pid: { oneOf: [{ type: 'number' }, { type: 'null' }] },
 };
 
-const renderShellResult = (_args, value) =>
-  [
-    { type: 'text', text: String(value?.stdout ?? '') },
-    value?.stderr ? { type: 'text', text: String(value.stderr) } : null,
+const renderShellResult = (_args, value) => {
+  // The model receives rendered text. Job identifiers and byte offsets must be
+  // present there so it can poll a long build without guessing internal state.
+  const { stdout, stderr, ...metadata } = value ?? {};
+  return [
+    { type: 'text', text: String(stdout ?? '') },
+    stderr ? { type: 'text', text: String(stderr) } : null,
+    Object.keys(metadata).length ? { type: 'text', text: JSON.stringify(metadata) } : null,
   ].filter(Boolean);
+};
+
+/** Read the same per-conversation workspace service used by the file tools. */
+async function executionDirectories(ctx, args, exec) {
+  if (!exec?.agent || typeof ctx.get !== 'function') return { cwd: args.cwd };
+  const directories = ctx.get('workingDirectory');
+  if (typeof directories?.ensure !== 'function') throw new Error('Linux tools require the conversation working-directory service');
+  const workspace = await directories.ensure(exec.agent, exec.signal);
+  return { cwd: args.cwd, sharedPaths: [workspace] };
+}
 
 /**
  * Register the persistent-session tool next to linux_bash.
@@ -86,7 +102,7 @@ const renderShellResult = (_args, value) =>
  * adapter that mounts this plugin gets persistent shells without extra
  * configuration.
  */
-export function registerLinuxSession(ctx, manager, { registry = new SessionRegistry(manager), ownsRegistry = false } = {}) {
+export function registerLinuxSession(ctx, manager, { registry = new SessionRegistry(manager), registryFor, ownsRegistry = false } = {}) {
   const tools = ctx?.tools;
   if (!tools || typeof tools.register !== 'function') {
     if (ownsRegistry) void registry.dispose();
@@ -96,9 +112,12 @@ export function registerLinuxSession(ctx, manager, { registry = new SessionRegis
     name: 'linux_session',
     description: LINUX_SESSION_DESCRIPTION,
     parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['action'],
+      properties: {
       action: {
         type: 'string',
-        required: true,
         description: 'open, run, start, poll, close or list.',
         enum: ['open', 'run', 'start', 'poll', 'close', 'list'],
       },
@@ -112,6 +131,7 @@ export function registerLinuxSession(ctx, manager, { registry = new SessionRegis
       job: { type: 'string', description: 'Job identifier returned by start, required by poll.' },
       offset: { type: 'number', description: 'Byte offset returned by the previous poll.' },
       limitBytes: { type: 'number', description: 'Maximum job output bytes to return in this poll.' },
+      },
     },
     output: {
       schema: {
@@ -129,29 +149,31 @@ export function registerLinuxSession(ctx, manager, { registry = new SessionRegis
       },
       render: renderShellResult,
     },
-    execute: async (args = {}) => {
+    execute: async (args = {}, exec) => {
+      const sessions = registryFor?.(exec) ?? registry;
       const action = String(args.action ?? '').trim();
       const session = args.session == null || args.session === '' ? 'session-1' : String(args.session);
+      const directories = ['open', 'run', 'start'].includes(action) ? await executionDirectories(ctx, args, exec) : {};
       if (action === 'open') {
-        return { ...(await registry.open({ id: args.session, cwd: args.cwd })), action };
+        return { ...(await sessions.open({ id: args.session, ...directories })), action };
       }
       if (action === 'list') {
-        return { action, sessions: registry.list(), stdout: '', stderr: '' };
+        return { action, sessions: sessions.list(), stdout: '', stderr: '' };
       }
       if (action === 'close') {
-        return { action, ...(await registry.close(session)), stdout: '', stderr: '' };
+        return { action, ...(await sessions.close(session)), stdout: '', stderr: '' };
       }
       if (action === 'start') {
-        const result = await registry.start(session, { command: String(args.command ?? ''), cwd: args.cwd });
+        const result = await sessions.start(session, { command: String(args.command ?? ''), ...directories });
         return { ...result, action, stdout: '', stderr: result.launchStderr ?? '' };
       }
       if (action === 'poll') {
-        return { ...(await registry.poll(session, { job: args.job, offset: args.offset, limitBytes: args.limitBytes })), action };
+        return { ...(await sessions.poll(session, { job: args.job, offset: args.offset, limitBytes: args.limitBytes })), action };
       }
       if (action === 'run') {
-        const result = await registry.run(session, {
+        const result = await sessions.run(session, {
           command: String(args.command ?? ''),
-          cwd: args.cwd,
+          ...directories,
           timeoutMs: Number.isFinite(args.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : undefined,
         });
         return { ...result, action, runtimeId: manager.status().runtimeId };
@@ -187,9 +209,25 @@ export function registerLinuxBash(ctx, manager, options = {}) {
 
   const registry = options.registry ?? new SessionRegistry(manager);
   const ownsRegistry = options.registry == null;
+  const scoped = new WeakMap();
+  const ownedRegistries = new Set(ownsRegistry ? [registry] : []);
+  const registryFor = exec => {
+    if (!ownsRegistry || !exec?.agent) return registry;
+    let sessions = scoped.get(exec.agent);
+    if (!sessions) {
+      sessions = new SessionRegistry(manager);
+      scoped.set(exec.agent, sessions);
+      ownedRegistries.add(sessions);
+    }
+    return sessions;
+  };
+  const releaseRegistries = () => {
+    for (const sessions of ownedRegistries) void sessions.dispose();
+    ownedRegistries.clear();
+  };
 
   const parameterSchema = {
-    command: { type: 'string', required: true, description: 'Shell command. Runs as /bin/bash -c unless session is set; the configured guest PATH is preserved.' },
+    command: { type: 'string', description: 'Shell command. Runs as /bin/bash -c unless session is set; the configured guest PATH is preserved.' },
     cwd: { type: 'string', description: 'Absolute working directory. A guest path such as /root or a shared host directory.' },
     timeoutMs: { type: 'number', description: 'Command timeout in milliseconds.' },
     session: { type: 'string', description: 'Persistent session name. When set, the command runs in that shell and keeps its cwd and exported variables.' },
@@ -198,21 +236,23 @@ export function registerLinuxBash(ctx, manager, options = {}) {
   const tool = {
     name: 'linux_bash',
     description: LINUX_BASH_DESCRIPTION,
-    parameters: parameterSchema,
+    parameters: { type: 'object', properties: parameterSchema, required: ['command'], additionalProperties: false },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
+        required: ['stdout', 'stderr'],
         properties: LINUX_BASH_OUTPUT_PROPERTIES,
       },
       render: renderShellResult,
     },
-    execute: async (args = {}) => {
+    execute: async (args = {}, exec) => {
       const timeoutMs = Number.isFinite(args.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : 120_000;
+      const directories = await executionDirectories(ctx, args, exec);
       if (args.session != null && args.session !== '') {
-        const result = await registry.run(String(args.session), {
+        const result = await registryFor(exec).run(String(args.session), {
           command: String(args.command ?? ''),
-          cwd: args.cwd,
+          ...directories,
           timeoutMs,
         });
         if (result.timedOut) {
@@ -226,7 +266,7 @@ export function registerLinuxBash(ctx, manager, options = {}) {
       }
       const result = await manager.execute({
         command: String(args.command ?? ''),
-        cwd: args.cwd,
+        ...directories,
         timeout: timeoutMs,
       });
       if (result.timedOut) {
@@ -245,7 +285,14 @@ export function registerLinuxBash(ctx, manager, options = {}) {
   };
 
   const disposeBash = tools.register(tool);
-  const disposeSession = registerLinuxSession(ctx, manager, { registry });
+  let disposeSession;
+  try {
+    disposeSession = registerLinuxSession(ctx, manager, { registry, registryFor });
+  } catch (error) {
+    disposeBash?.();
+    releaseRegistries();
+    throw error;
+  }
   return () => {
     try {
       disposeBash?.();
@@ -253,7 +300,7 @@ export function registerLinuxBash(ctx, manager, options = {}) {
       try {
         disposeSession?.();
       } finally {
-        if (ownsRegistry) void registry.dispose();
+        releaseRegistries();
       }
     }
   };
@@ -300,11 +347,9 @@ export function apply(ctx, config = {}) {
     }
     disposeTool = () => {};
     if (manager.status().healthy) {
-      try {
-        disposeTool = registerLinuxBash(ctx, manager) ?? (() => {});
-      } catch {
-        disposeTool = () => {};
-      }
+      // Activation must fail if the real registry rejects a tool. Reporting a
+      // healthy environment while silently hiding its tools strands the agent.
+      disposeTool = registerLinuxBash(ctx, manager) ?? (() => {});
     }
   };
 

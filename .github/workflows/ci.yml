@@ -74,6 +74,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.22.0
+      - name: Install pinned tool-registry test dependencies
+        run: npm ci --prefix packages/linux-runtime --ignore-scripts --no-audit --no-fund
       - name: plugin package tests
         run: node --test packages/linux-bootstrap/test/*.test.mjs packages/linux-runtime/test/*.test.mjs
       - name: the bootstrap and runtime manifest validators agree

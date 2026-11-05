@@ -1,13 +1,15 @@
 import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { createMobileBootstrap } from '../src/index.js'
 import { createRouteHandlers } from '../src/routes.js'
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.test-data')
+// A fresh root per test process. A package-relative root made concurrent
+// Windows and WSL runs delete each other's state during teardown.
+const root = await mkdtemp(path.join(os.tmpdir(), 'bionilux-bootstrap-tests-'))
 const archive = Buffer.from('verified runtime archive')
 const sha256 = createHash('sha256').update(archive).digest('hex')
 const tag = 'v1.1.0'
@@ -50,6 +52,7 @@ function harness({ dataDir = path.join(root, `state-${Math.random().toString(16)
   }
   const service = createMobileBootstrap({
     dataDir,
+    stagingDirectory: path.join(dataDir, 'plugins', 'runtime'),
     arch: 'arm64',
     releaseUrl: 'https://api.github.com/repos/acme/dsh-bionilux/releases/latest',
     appVersionProvider: () => currentVersion.value,
@@ -113,6 +116,30 @@ test('install uses plugin-first lazy manager provisioning and persists app versi
   const state = JSON.parse(await readFile(path.join(value.dataDir, 'linux-bootstrap-state.json'), 'utf8'))
   assert.equal(state.installedSystemMobileVersion, '0.14.0')
   assert.equal(state.installedLinuxVersion, '1.1.0')
+})
+
+test('a failed activation is rolled back without leaving the service reporting an install', async () => {
+  const value = harness({
+    hostReturnsManager: false,
+    managerProvider: async () => ({
+      install: async () => {},
+      uninstall: async () => {},
+      status: async () => { throw new Error('runtime status is unavailable') },
+    }),
+  })
+  await value.service.ready
+
+  await assert.rejects(
+    () => value.service.install({ confirmed: true, activate: true }),
+    /runtime status is unavailable/,
+  )
+  assert.equal(value.calls.hostUninstalls, 1, 'the activated plugin must be rolled back')
+
+  const status = await value.service.status()
+  assert.equal(status.installed, false, 'a rolled-back install must not be reported as installed')
+  assert.equal(status.version, null)
+  assert.equal(status.runtimeId, null)
+  assert.match(status.error, /runtime status is unavailable/)
 })
 
 test('mobile-version delta triggers automatic check/install once; enabling toggle does not check', async () => {
@@ -212,7 +239,87 @@ test('manual check never installs an available update on its own', async () => {
 
   assert.equal(status.updateAvailable, true)
   assert.equal(newer.calls.managerInstalls.length, 0, 'a manual check only reports, it does not install')
-  assert.equal(newer.calls.hostInstalls.length, 0)
+  // Reopening restores the persisted installation (that is not an install); the
+  // check itself must still not stage or download anything.
+  assert.equal(newer.calls.hostInstalls.length, 1, 'only the cold-start restore may touch the host')
+  assert.equal(newer.calls.downloads, 0, 'a manual check must not download')
+})
+
+test('cold start re-activates a persisted opt-in before the host view can clear it', async () => {
+  const installed = harness()
+  await installed.service.ready
+  await installed.service.install({ confirmed: true, activate: true })
+  const statePath = path.join(installed.dataDir, 'linux-bootstrap-state.json')
+  const stored = JSON.parse(await readFile(statePath, 'utf8'))
+  assert.equal(stored.enabled, true)
+
+  // A fresh process has not loaded the runtime plugin yet: the host reports
+  // injected-but-inactive. Restoring must happen before that view is reconciled,
+  // otherwise the persisted opt-in is cleared and the tools never come back.
+  const cold = harness({ dataDir: installed.dataDir, isInjected: { injected: true, active: false } })
+  await cold.service.ready
+  assert.equal(cold.calls.hostInstalls.length, 1, 'the persisted installation must be re-activated')
+  assert.equal(cold.calls.hostInstalls[0].directory, stored.pluginDirectory)
+  assert.equal(cold.calls.hostInstalls[0].entry, 'lib/index.js')
+  assert.equal(cold.calls.hostInstalls[0].enable, true)
+  assert.equal(cold.calls.hostInstalls[0].config.runtimeId, 'debian-minimal')
+  assert.equal(cold.calls.hostInstalls[0].config.arch, 'arm64')
+  assert.ok(cold.calls.hostInstalls[0].config.dataDir.endsWith('runtime'))
+  assert.deepEqual(cold.calls.hostInstalls[0].config.manifest.version, '1.1.0')
+  assert.equal(cold.calls.downloads, 0, 'a restore must never download')
+  assert.equal(cold.calls.manifestFetches, 0, 'a restore must never hit the network')
+
+  const after = JSON.parse(await readFile(statePath, 'utf8'))
+  assert.equal(after.enabled, true, 'the cold-start restore must not clear the opt-in')
+  assert.equal(after.injectionActivated, true)
+  const status = await cold.service.status()
+  assert.equal(status.installed, true)
+  assert.equal(status.injectionActivated, true)
+})
+
+test('cold start never resurrects a removed or incomplete installation', async () => {
+  const installed = harness()
+  await installed.service.ready
+  await installed.service.install({ confirmed: true, activate: true })
+  const statePath = path.join(installed.dataDir, 'linux-bootstrap-state.json')
+  const stored = JSON.parse(await readFile(statePath, 'utf8'))
+
+  // 1. The host says the plugin is no longer injected (the user removed it).
+  const removed = harness({ dataDir: installed.dataDir, isInjected: { injected: false, active: false } })
+  await removed.service.ready
+  assert.equal(removed.calls.hostInstalls.length, 0, 'nothing may be re-added')
+  assert.equal(removed.calls.downloads, 0)
+  assert.equal(JSON.parse(await readFile(statePath, 'utf8')).enabled, false)
+
+  // 2. The persisted directory is still reported as injected, but its entry is gone.
+  await writeFile(statePath, JSON.stringify(stored))
+  await rm(path.join(stored.pluginDirectory, 'lib', 'index.js'), { force: true })
+  const incomplete = harness({ dataDir: installed.dataDir, isInjected: { injected: true, active: false } })
+  await incomplete.service.ready
+  assert.equal(incomplete.calls.hostInstalls.length, 0, 'a missing entry must not be re-fetched')
+  assert.equal(incomplete.calls.downloads, 0)
+  const state = JSON.parse(await readFile(statePath, 'utf8'))
+  assert.equal(state.enabled, false)
+  assert.equal(state.injectionActivated, false)
+  assert.match(state.lastError, /files are missing/)
+})
+
+test('a persisted directory outside the plugin root is never activated', async () => {
+  const installed = harness()
+  await installed.service.ready
+  await installed.service.install({ confirmed: true, activate: true })
+  const statePath = path.join(installed.dataDir, 'linux-bootstrap-state.json')
+  const stored = JSON.parse(await readFile(statePath, 'utf8'))
+  // A tampered record pointing at a real entry outside our staging root.
+  const outside = path.join(root, `outside-${Math.random().toString(16).slice(2)}`)
+  await mkdir(path.join(outside, 'lib'), { recursive: true })
+  await writeFile(path.join(outside, 'lib', 'index.js'), entrySource)
+  await writeFile(statePath, JSON.stringify({ ...stored, pluginDirectory: outside }))
+
+  const tampered = harness({ dataDir: installed.dataDir, isInjected: { injected: true, active: false } })
+  await tampered.service.ready
+  assert.equal(tampered.calls.hostInstalls.length, 0)
+  assert.equal(JSON.parse(await readFile(statePath, 'utf8')).enabled, false)
 })
 
 test('install and reinstall require an explicit confirmed activation', async () => {

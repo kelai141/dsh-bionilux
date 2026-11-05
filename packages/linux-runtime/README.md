@@ -161,6 +161,21 @@ runs in the Debian/glibc guest with its own `apt`/`dpkg` and the shared glibc
 Node.js. This is an execution-environment choice, and the Debian environment is
 **not a sandbox**: guest root is a user-space identity, not Android root.
 
+Tool definitions use the registry's JSON Schema contract: object-level
+`required` arrays, and explicit nullable exit codes/PIDs while a session or
+background build is still running. Job identifiers and log offsets are also
+rendered as model-visible text. A rejected registration fails activation and
+rolls back partial registrations instead of advertising a healthy environment
+with missing tools. `npm ci && npm test` includes tests against the actual
+Harness tool registry pinned in the development lockfile.
+
+In the app, Linux tools use the conversation's `workingDirectory` service to
+share the same workspace as file editing tools. This requires no user mapping.
+An explicit guest cwd keeps that workspace visible; later persistent calls
+preserve the shell's cwd. Named sessions belong to their agent, so two agents
+can use the same session name without sharing shell state. A workspace change
+requires a new shell; guest system directories cannot be host projections.
+
 ## Known limitations
 
 * host-path passthrough of the shared Node directory relies on the launcher's

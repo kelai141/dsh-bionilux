@@ -1392,8 +1392,65 @@ export class LinuxRuntimeManager {
     });
   }
 
-  _resolveCwd(cwd, rootfs) {
-    if (cwd == null || cwd === '') return { guestCwd: '/', hostPaths: [] };
+  /**
+   * Validate the host directories the guest may pass through.
+   *
+   * A shared directory is promoted by its own absolute name, so a canonical
+   * path that points back into the guest namespace would shadow the rootfs.
+   * Validation therefore follows symlinks before deciding that a directory is
+   * safe, and it returns both the configured name and its canonical target so
+   * the launcher recognises a workspace reached through either one.
+   */
+  _resolveSharedPaths(sharedPaths = [], rootfs) {
+    if (!Array.isArray(sharedPaths)) {
+      throw new TypeError('sharedPaths must be an array of absolute directory paths');
+    }
+    const shared = [];
+    for (const entry of sharedPaths) {
+      if (typeof entry !== 'string' || entry === '' || !path.isAbsolute(entry)) {
+        throw new TypeError('sharedPaths entries must be absolute directory paths');
+      }
+      const directory = path.resolve(entry);
+      let canonical;
+      try {
+        canonical = realpathSync(directory);
+      } catch (error) {
+        throw new Error('shared path does not exist or is not accessible: ' + directory + ' (' + (error.code ?? error.message) + ')');
+      }
+      let stat;
+      try {
+        stat = statSync(canonical);
+      } catch (error) {
+        throw new Error('shared path cannot be inspected: ' + directory + ' (' + (error.code ?? error.message) + ')');
+      }
+      if (!stat.isDirectory()) throw new Error('shared path is not a directory: ' + directory);
+      for (const candidate of [directory, canonical]) {
+        if (isGuestPath(candidate)) {
+          throw new Error('shared path must stay outside the guest namespace: ' + candidate);
+        }
+        const covered = GUEST_PATH_PREFIXES.find((prefix) => pathIsWithin(candidate, prefix));
+        if (covered) {
+          throw new Error('shared path would cover the guest namespace (' + covered + '): ' + candidate);
+        }
+        if (rootfs && pathIsWithin(rootfs, candidate)) {
+          throw new Error('shared path is inside the guest rootfs: ' + candidate);
+        }
+      }
+      if (!shared.includes(directory)) shared.push(directory);
+      if (!shared.includes(canonical)) shared.push(canonical);
+    }
+    return shared;
+  }
+
+  _resolveCwd(cwd, rootfs, sharedPaths = []) {
+    const shared = this._resolveSharedPaths(sharedPaths, rootfs);
+    if (cwd == null || cwd === '') {
+      // The first shared directory doubles as the default workspace when the
+      // caller has not chosen a working directory yet.
+      return shared.length
+        ? { guestCwd: shared[0], hostPaths: [...shared], sharedPaths: [...shared] }
+        : { guestCwd: '/', hostPaths: [], sharedPaths: [] };
+    }
     // "Absolute" is platform-aware on purpose: on Android this is the POSIX
     // check, while host-side tests can pass a real Windows temp directory.
     if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) {
@@ -1402,16 +1459,18 @@ export class LinuxRuntimeManager {
     const resolved = path.resolve(cwd);
     if (pathIsWithin(rootfs, resolved)) {
       const relative = path.relative(rootfs, resolved).split(path.sep).filter(Boolean).join('/');
-      return { guestCwd: relative ? `/${relative}` : '/', hostPaths: [] };
+      return { guestCwd: relative ? `/${relative}` : '/', hostPaths: [...shared], sharedPaths: [...shared] };
     }
     if (isGuestPath(cwd) || !existsSync(cwd)) {
       // A guest-namespace directory is never promoted to a host pass-through:
       // the launcher resolves a configured host directory before the rootfs, so
       // promoting /tmp or /etc would shadow the guest's own subtree. A path that
       // does not exist on the host is likewise only meaningful inside the guest.
-      return { guestCwd: cwd, hostPaths: [] };
+      return { guestCwd: cwd, hostPaths: [...shared], sharedPaths: [...shared] };
     }
-    return { guestCwd: cwd, hostPaths: [cwd] };
+    const hostPaths = [...shared];
+    if (!hostPaths.includes(cwd)) hostPaths.push(cwd);
+    return { guestCwd: cwd, hostPaths, sharedPaths: [...shared] };
   }
 
   _executionEnvironment(paths, cwdInfo) {
@@ -1436,7 +1495,7 @@ export class LinuxRuntimeManager {
     return environment;
   }
 
-  async execute({ command, cwd, timeout, signal } = {}) {
+  async execute({ command, cwd, timeout, signal, sharedPaths = [] } = {}) {
     if (typeof command !== 'string' || command.trim() === '') {
       throw new TypeError('command must be a non-empty string');
     }
@@ -1454,7 +1513,7 @@ export class LinuxRuntimeManager {
       if (!current.healthy) {
         throw new Error(`Linux runtime is unavailable: ${current.reason ?? 'unhealthy'}`);
       }
-      const cwdInfo = this._resolveCwd(cwd, current.paths.rootfs);
+      const cwdInfo = this._resolveCwd(cwd, current.paths.rootfs, sharedPaths);
       await this._prepareHostPaths(current.paths.rootfs, cwdInfo.hostPaths);
       const environment = this._executionEnvironment(current.paths, cwdInfo);
       const result = normaliseCommandResult(

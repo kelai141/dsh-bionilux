@@ -47,8 +47,9 @@ SHA-256：`07e4e60e9df5e76510c6127b4d7b33288b08d2eee85a8e13434b8fe35b6be474`。
 ## 验证边界
 
 本次打通的是本项目的独立模拟器入口和真实 bootstrap/runtime 安装执行链。
-现有 DSH Mobile APK 的设置页、bootstrap 宿主加载和 Kotlin 下载桥仍未完成整合，
-独立验收服务不能用来证明这些应用入口已经接通。未发布 GitHub Release 或新版 APK。
+该轮独立验收服务不能用来证明 DSH Mobile 应用入口已经接通。
+后续应用内设置页、bootstrap 宿主与 Kotlin 下载桥的整合和 MuMu 实测，
+另见 [MuMu 应用内验收](MUMU_APP_ACCEPTANCE.md)。未发布 GitHub Release。
 
 活 shell、内存变量和运行任务在模拟器停止时结束；文件系统和已安装包保留，
 Agent 下一次调用自动打开新会话。此环境共享 Android 内核，不支持任意内核特权操作。
