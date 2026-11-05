@@ -857,8 +857,16 @@ export class LinuxRuntimeManager {
       }
     }
     for (const relative of ROOTFS_REQUIRED_FILES) {
-      const target = path.join(instance.rootfs, relative);
-      if (!fileExists(target)) {
+      // resolveRootfsTarget resolves guest absolute links inside the rootfs.
+      // A symlink is only acceptable when its target is a regular file there;
+      // lstat alone would also accept a dangling link or a link to a directory.
+      let inspected;
+      try {
+        inspected = inspectRootfsObject(instance.rootfs, relative);
+      } catch (error) {
+        return { healthy: false, reason: `rootfs file /${relative} ${error.message}` };
+      }
+      if (!inspected.exists || !inspected.regular) {
         return { healthy: false, reason: `rootfs file is missing: /${relative}` };
       }
     }

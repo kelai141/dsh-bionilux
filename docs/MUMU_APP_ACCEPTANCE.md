@@ -4,7 +4,8 @@
 
 ## 源码与产物
 
-- Bionilux 源码：本仓 `codex/standalone-linux`。
+- Bionilux 完整构建源码独立工作树：`C:/Users/17765/.codex/worktrees/linux-mumu-source/dsh-bionilux`，分支 `codex/linux-mumu-source`，基于本轮主修复提交 `6d4f54b`。另存原目录已有的资产体量、guest symlink 健康检查及启动器错误语义修复和对应测试，确保最终资产不依赖共享目录的未提交改动；原目录保留原状。
+- APK 源码已提交 `a1a10e8c`（保存适配器基线）及 `6e3a7461`（本轮安装、激活与 UI 修复）。
 - APK 独立工作树：`D:/coding/dsh-mobile-linux-mumu`，分支 `codex/linux-mumu`。共享原目录中的删除和其他任务改动保持原状。
 - 最终本地测试 APK：`target/independent-linux/mumu-ui/dsh-mobile-linux-source-final-x64.apk`，206099057 字节，SHA-256 `d055b06d95560b3b5a320c44534b3962381a58ccd8a851c18aeb10881712581f`。
 - 内嵌快照：200713148 字节，SHA-256 `96a07411f316fb81e3ef5f1b92d5d161581d59cfd1605de8c569857605bc316b`。
@@ -31,6 +32,8 @@
 ## 修复与回归证据
 
 源码修复覆盖：Cordis 可选服务读取及父子激活顺序、真实 fiber ACTIVE 检查、首次清单发现、四类资产与 guest symlink、冷启动恢复、标准 JSON Schema、运行中 nullable 字段、注册失败回滚、模型可见的 job/offset、按 agent 隔离的会话和自动工作区映射。回归测试使用真实 Harness rc3 ToolRuntime，而非仅记录注册名的桩。
+
+独立源码工作树重新安装锁定依赖后，runtime 82 项测试中 66 项通过、16 项按平台条件跳过、零失败；19 个实际源码输入与已测目录按 Git 换行规范化后完全一致。Rust Unix 专用错误语义测试在本 Windows 工作树未执行，不将其计作通过。
 
 代码层记录包括 Kotlin Linux 资产测试、host 路由/恢复测试、UI 全套 886 项及 Linux 页 12 项测试、runtime 全套和真实 registry/工作区测试。平台条件导致的跳过保留在日志中；自包含 APK 工作树缺少只读上游检出的门禁项仍为 SKIP，不把本地 debug APK 宣称为完成发布门禁的 release。
 
