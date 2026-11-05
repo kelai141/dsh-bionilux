@@ -44,16 +44,20 @@ export const inject = ['tools'];
 export const LINUX_BASH_DESCRIPTION = [
   'Run a shell command inside the DSH Mobile Linux environment (Debian/glibc user space, own apt/dpkg).',
   'Use it when a task needs Debian packages, glibc, or Linux-only build tooling.',
+  'For JDK, Android SDK, Gradle and APK compilation, run installation and every build step here or in linux_session, even when the output targets Android.',
   'The plain bash tool runs on the phone host (Android/Termux, Bionic libc, Termux packages): use that for phone-side work, Termux tooling and host paths.',
   'Inside Linux, npm/node resolve to the shared Linux glibc Node.js runtime, not the host Bionic Node.js.',
   'Paths follow guest semantics: /usr, /etc and /var are the Debian ones; the workspace and configured shared directories stay visible under their own absolute paths.',
   'The current conversation workspace is shared automatically with file editing tools and is the default working directory. Use those same absolute workspace paths for builds; /root belongs to the private Debian filesystem.',
   'This is a Debian environment, not a sandbox: guest root is a user-space identity and is not Android root.',
+  'The Android kernel and /proc are shared. Android entries in /proc/1/root or lack of mount namespaces do not mean this command ran in Termux. Do not nest proot/chroot to enter Debian again.',
+  'Without session this is a fresh shell on every call: cd and export do not persist. Pass the same session name or use linux_session to retain build environment state.',
   'If the Linux runtime is not installed or unhealthy, the command fails with an explicit error. It never silently falls back to the Termux shell.',
 ].join(' ');
 
 export const LINUX_SESSION_DESCRIPTION = [
   'Manage a persistent shell inside the DSH Mobile Linux environment. A session keeps exported variables and its working directory between tool calls.',
+  'Use this Debian/glibc shell for package installation, JDK/Android SDK/Gradle and APK builds. The plain bash tool is the separate Android/Termux host.',
   'Use action=open to create it, action=run for a command that should finish, action=start for a long build, action=poll to read new job output by byte offset, and action=close to release it.',
   'Sessions are non-interactive: full-screen programs, job control and terminal resizing are unsupported. Use the background job output instead of a PTY.',
   'Sessions live in this plugin process only. A host or app restart ends them; open a new session after a restart.',
@@ -80,6 +84,7 @@ const renderShellResult = (_args, value) => {
   // present there so it can poll a long build without guessing internal state.
   const { stdout, stderr, ...metadata } = value ?? {};
   return [
+    { type: 'text', text: 'Execution environment: Debian/glibc Linux (linux_bash/linux_session); Android kernel and /proc are shared.' },
     { type: 'text', text: String(stdout ?? '') },
     stderr ? { type: 'text', text: String(stderr) } : null,
     Object.keys(metadata).length ? { type: 'text', text: JSON.stringify(metadata) } : null,

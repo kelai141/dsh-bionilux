@@ -34,7 +34,7 @@ if ($state -ne 'device') {
         Start-Sleep -Seconds 2
         $boot = & adb -s $Serial shell getprop sys.boot_completed 2>$null
         if ((Get-Date) -gt $bootDeadline) { throw 'Emulator boot timed out.' }
-    } until (([string]$boot).Trim() -eq '1')
+    } until (("$boot").Trim() -eq '1')
 }
 if ((& adb -s $Serial emu avd name | Select-Object -First 1).Trim() -ne $Avd) {
     throw "The device at $Serial is not the expected AVD $Avd."

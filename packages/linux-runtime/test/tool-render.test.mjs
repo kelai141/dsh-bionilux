@@ -8,6 +8,7 @@ test('long build metadata reaches the model through the tool text renderer', asy
   const dispose = registerLinuxSession({ tools: { register: value => { tool = value; return () => {}; } } }, {}, { registry });
   const result = await tool.execute({ action: 'start', session: 'build', command: 'make -j8' });
   const text = tool.output.render({}, result).map(item => item.text).join('\n');
+  assert.match(text, /Execution environment: Debian\/glibc Linux/);
   assert.match(text, /"job":"build-1"/);
   assert.match(text, /"nextOffset":32/);
   assert.match(text, /"running":true/);
