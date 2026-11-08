@@ -858,6 +858,26 @@ test('health requires a rootfs entry point to be a file, not a directory', async
   assert.match(status.reason, /rootfs file is missing: \/bin\/bash/);
 });
 
+test('health rejects a rootfs entry point whose symlink does not resolve to a file', { skip: process.platform === 'win32' }, async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir });
+  await manager.install(fixture.manifest);
+  const bash = path.join(manager.status().paths.rootfs, 'bin', 'bash');
+
+  await rm(bash, { force: true });
+  await symlink('/bin/does-not-exist', bash);
+  const dangling = manager.status();
+  assert.equal(dangling.healthy, false);
+  assert.match(dangling.reason, /rootfs file is missing: \/bin\/bash/);
+
+  await rm(bash, { force: true });
+  await symlink('/etc', bash);
+  const directory = manager.status();
+  assert.equal(directory.healthy, false);
+  assert.match(directory.reason, /rootfs file is missing: \/bin\/bash/);
+});
+
 test('health rejects a non-ELF launcher instead of trusting its file name', async () => {
   const dataDir = tempDir();
   const fixture = makeManifest();
