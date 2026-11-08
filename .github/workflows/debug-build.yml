@@ -338,6 +338,11 @@ jobs:
           fi
           sudo rm -f "$rootfs/etc/resolv.conf" "$rootfs/etc/machine-id" "$rootfs/var/lib/dbus/machine-id"
           sudo rm -rf "$rootfs/var/lib/apt/lists/"* "$rootfs/var/cache/apt/archives/"*
+          # The APK ships this loader in jniLibs. An app process on targetSdk
+          # >= 29 cannot execve its own data directory, so the copy the guest
+          # runs has to live where SELinux labels it apk_data_file.
+          sudo install -m 755 "$rootfs$DEBIAN_LOADER" \
+            "$stage/bionilux-loader-$ARCH.so"
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links --verify
           sudo tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \

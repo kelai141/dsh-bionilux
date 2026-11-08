@@ -22,6 +22,7 @@ for asset_arch, _runtime_id, _runtime_arch, node_arch, _label in runtime_specs:
     required.extend((
         f"bionilux-{asset_arch}",
         f"libbionilux_preload-{asset_arch}.so",
+        f"bionilux-loader-{asset_arch}.so",
         f"bionilux-backend-{asset_arch}.tar.xz",
         f"debian-minimal-{asset_arch}.tar.xz",
         f"node-glibc-v{node_version}-linux-{node_arch}.tar.xz",
@@ -99,6 +100,7 @@ for asset_arch, node_arch in (("aarch64", "arm64"), ("x86_64", "x64")):
     expected.update({
         f"bionilux-{asset_arch}",
         f"libbionilux_preload-{asset_arch}.so",
+        f"bionilux-loader-{asset_arch}.so",
         f"bionilux-backend-{asset_arch}.tar.xz",
         f"debian-minimal-{asset_arch}.tar.xz",
         f"node-glibc-v{node_version}-linux-{node_arch}.tar.xz",

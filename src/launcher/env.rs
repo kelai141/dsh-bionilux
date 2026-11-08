@@ -170,6 +170,7 @@ fn build_from(cfg: &Config, spec: &GuestEnv<'_>, mut vars: HashMap<String, Strin
     for (key, path) in [
         (env_keys::PRELOAD, cfg.preload.as_ref()),
         (env_keys::LOADER, cfg.loader.as_ref()),
+        (env_keys::NATIVE_LIB_DIR, cfg.native_lib_dir.as_ref()),
     ] {
         match path {
             Some(path) => vars.insert(key.into(), path.to_string_lossy().into_owned()),
@@ -281,6 +282,15 @@ pub fn describe(cfg: &Config, rootfs: &Rootfs) -> Vec<String> {
     push(
         "ROOTFS_LOADER",
         if has_loader { "yes" } else { "no" }.into(),
+    );
+    // Where the loader came from decides whether the guest can start at all on
+    // a ROM that forbids executing the app data directory.
+    push(
+        "NATIVE_LIB_DIR",
+        cfg.native_lib_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
     );
     push("GUEST_PATH", cfg.guest_path.join(":"));
     push("GUEST_HOME", cfg.guest_home.clone());

@@ -110,6 +110,13 @@ pub struct Config {
     pub preload: Option<PathBuf>,
     /// Explicit loader path, overriding both rootfs and runtime-dir lookup.
     pub loader: Option<PathBuf>,
+    /// APK native library directory (ApplicationInfo.nativeLibraryDir).
+    ///
+    /// Files there carry the apk_data_file label, which an app process may
+    /// execve even when targetSdk >= 29 forbids executing its own data
+    /// directory. A loader installed here stays reachable when the rootfs
+    /// copy does not.
+    pub native_lib_dir: Option<PathBuf>,
     /// Guest `PATH`, used for program lookup and exported to the guest.
     pub guest_path: Vec<String>,
     pub guest_home: String,
@@ -186,6 +193,7 @@ impl Config {
             box64,
             preload: env_path(env_keys::PRELOAD).map(host_path),
             loader: env_path(env_keys::LOADER).map(host_path),
+            native_lib_dir: env_path(env_keys::NATIVE_LIB_DIR).map(host_path),
             guest_path,
             guest_home: env_str("BIONILUX_GUEST_HOME").unwrap_or_else(|| GUEST_HOME_DEFAULT.into()),
             guest_tmp: env_str("BIONILUX_GUEST_TMP").unwrap_or_else(|| GUEST_TMP_DEFAULT.into()),
@@ -328,6 +336,9 @@ pub mod env_keys {
     pub const BOX64: &str = "BIONILUX_BOX64";
     pub const PRELOAD: &str = "BIONILUX_PRELOAD";
     pub const LOADER: &str = "BIONILUX_LOADER";
+    /// APK native library directory. Set by the host app; it is where the
+    /// loader can live when the app data directory cannot be executed.
+    pub const NATIVE_LIB_DIR: &str = "BIONILUX_NATIVE_LIB_DIR";
     pub const GUEST_PATH: &str = "BIONILUX_GUEST_PATH";
     pub const GUEST_HOME: &str = "BIONILUX_GUEST_HOME";
     pub const GUEST_TMP: &str = "BIONILUX_GUEST_TMP";
