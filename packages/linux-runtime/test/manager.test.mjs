@@ -785,6 +785,31 @@ test('plugin teardown disposes the manager it created and stops guest sessions',
   assert.equal((await running).exitCode, 130);
 });
 
+test('the host native library directory reaches the plugin manager', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const io = makeIo(fixture);
+  const ctx = {
+    tools: { register: () => () => {} },
+    effect: (setup) => {
+      setup();
+    },
+  };
+  // The plugin forwards the host's ApplicationInfo.nativeLibraryDir, which is
+  // where the glibc loader is executable on targetSdk >= 29.
+  const manager = apply(ctx, {
+    dataDir,
+    arch: 'arm64',
+    downloadAsset: io.downloadAsset,
+    extractArchive: io.extractArchive,
+    runCommand: makeRunner().runCommand,
+    nativeLibDir: '/data/app/lib/arm64',
+  });
+  await manager.install(fixture.manifest);
+  assert.equal(manager.status().paths.nativeLibDir, '/data/app/lib/arm64');
+  await manager.dispose();
+});
+
 test('plugin teardown leaves a host-owned manager running', async () => {
   const dataDir = tempDir();
   const fixture = makeManifest();

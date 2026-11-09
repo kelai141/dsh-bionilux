@@ -316,6 +316,7 @@ export function registerLinuxBash(ctx, manager, options = {}) {
  * @param {'arm64'|'x64'} [config.arch] - Target architecture.
  * @param {Function} [config.downloadAsset] - Checksum-verifying downloader.
  * @param {Function} [config.extractArchive] - Safe archive extractor.
+ * @param {string} [config.nativeLibDir] - APK native library directory, the only place an app process may execute an ELF.
  * @returns {import('../modules/manager.js').LinuxRuntimeManager} the manager.
  */
 export function apply(ctx, config = {}) {
@@ -336,6 +337,7 @@ export function apply(ctx, config = {}) {
       dnsServersProvider: config.dnsServersProvider,
       dnsProbe: config.dnsProbe,
       dnsProbeTimeoutMs: config.dnsProbeTimeoutMs,
+      nativeLibDir: config.nativeLibDir,
     });
 
   let disposeTool = () => {};
