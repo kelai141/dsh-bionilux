@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createManager, GUEST_PATH_PREFIXES, isGuestPath, spawnCommand } from '../modules/manager.js';
+import { launchArgv } from '../modules/manager.js';
 import {
   DEFAULT_RUNTIME_IDS,
   defaultRuntimeIdForArch,
@@ -324,7 +325,7 @@ function makeUnkillableRunner() {
   };
 }
 
-function makeManager(fixture, { dataDir, ioOptions, runnerOptions, arch = 'arm64' } = {}) {
+function makeManager(fixture, { dataDir, ioOptions, runnerOptions, arch = 'arm64', ...extra } = {}) {
   const io = makeIo(fixture, ioOptions);
   const runner = makeRunner(runnerOptions);
   const manager = createManager({
@@ -333,6 +334,7 @@ function makeManager(fixture, { dataDir, ioOptions, runnerOptions, arch = 'arm64
     downloadAsset: io.downloadAsset,
     extractArchive: io.extractArchive,
     runCommand: runner.runCommand,
+    ...extra,
   });
   return { manager, io, runner };
 }
@@ -783,6 +785,31 @@ test('plugin teardown disposes the manager it created and stops guest sessions',
   assert.equal((await running).exitCode, 130);
 });
 
+test('the host native library directory reaches the plugin manager', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const io = makeIo(fixture);
+  const ctx = {
+    tools: { register: () => () => {} },
+    effect: (setup) => {
+      setup();
+    },
+  };
+  // The plugin forwards the host's ApplicationInfo.nativeLibraryDir, which is
+  // where the glibc loader is executable on targetSdk >= 29.
+  const manager = apply(ctx, {
+    dataDir,
+    arch: 'arm64',
+    downloadAsset: io.downloadAsset,
+    extractArchive: io.extractArchive,
+    runCommand: makeRunner().runCommand,
+    nativeLibDir: '/data/app/lib/arm64',
+  });
+  await manager.install(fixture.manifest);
+  assert.equal(manager.status().paths.nativeLibDir, '/data/app/lib/arm64');
+  await manager.dispose();
+});
+
 test('plugin teardown leaves a host-owned manager running', async () => {
   const dataDir = tempDir();
   const fixture = makeManifest();
@@ -985,6 +1012,39 @@ test('a rootfs directory symlink is resolved inside the rootfs', { skip: process
     /rootfs dynamic loader.*x64 ELF object; expected arm64/,
     'the absolute directory link must be resolved inside the rootfs, not on the host',
   );
+});
+
+test('an Android app starts the launcher through the system linker', () => {
+  // targetSdk >= 29 forbids execve of the app's own data directory, so the
+  // launcher must be mapped by a linker the app is allowed to execute.
+  const argv = launchArgv('/data/user/0/app/files/backend/bin/bionilux', ['/bin/bash'], 'android', '/system/bin/linker64');
+  assert.equal(argv.file, '/system/bin/linker64');
+  assert.deepEqual(argv.args, ['/data/user/0/app/files/backend/bin/bionilux', '/bin/bash']);
+});
+
+test('other platforms exec the launcher directly', () => {
+  const argv = launchArgv('/opt/bionilux/bin/bionilux', ['/bin/bash'], 'linux');
+  assert.equal(argv.file, '/opt/bionilux/bin/bionilux');
+  assert.deepEqual(argv.args, ['/bin/bash']);
+});
+
+test('a session uses the same launch path as one-shot commands', () => {
+  const manager = createManager({ dataDir: tempDir(), arch: 'x64', runCommand: () => ({ promise: Promise.resolve({ exitCode: 0 }) }) });
+  const launch = manager._sessionLaunch({ launcher: '/opt/bionilux/bin/bionilux' });
+  assert.deepEqual(launch, { file: '/opt/bionilux/bin/bionilux', args: ['/bin/bash', '--noprofile', '--norc', '-s'] });
+  return manager.dispose();
+});
+
+test('the native library directory reaches the launcher environment', () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir, nativeLibDir: '/data/app/lib/arm64' });
+  return manager.install(fixture.manifest).then(() => {
+    const status = manager.status();
+    assert.equal(status.paths.nativeLibDir, '/data/app/lib/arm64');
+    const environment = manager._executionEnvironment(status.paths, { guestCwd: '/', hostPaths: [] });
+    assert.equal(environment.BIONILUX_NATIVE_LIB_DIR, '/data/app/lib/arm64');
+  });
 });
 
 test('spawnCommand escalates a guest session that ignores SIGTERM', { skip: process.platform === 'win32' }, async () => {

@@ -128,6 +128,7 @@ class ManifestTests(unittest.TestCase):
                                   f"node-glibc-v24.22.0-linux-{node}.tar.xz"))
             (self.root / f"bionilux-{arch}").write_bytes(b"launcher fixture")
             (self.root / f"libbionilux_preload-{arch}.so").write_bytes(b"preload fixture")
+            (self.root / f"bionilux-loader-{arch}.so").write_bytes(b"loader fixture")
         for name in self.archives:
             self.archive(name)
         (self.root / "BUILD_INFO.json").write_text(json.dumps({"tag": "v0.5.0", "version": "0.5.0", "source_sha": SHA}))
@@ -149,7 +150,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((self.root / "linux-release.json").read_text())
         self.assertEqual([r["architecture"] for r in manifest["runtimes"]], ["arm64", "x64"])
-        self.assertEqual(len((self.root / "SHA256SUMS").read_text().splitlines()), 14)
+        self.assertEqual(len((self.root / "SHA256SUMS").read_text().splitlines()), 16)
 
     def test_missing_architecture_fails(self):
         (self.root / "debian-minimal-aarch64.tar.xz").unlink()

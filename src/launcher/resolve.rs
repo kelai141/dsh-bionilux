@@ -339,6 +339,10 @@ pub fn find_loader(interp: &str, arch: Arch) -> Option<PathBuf> {
     let cfg = config();
     let rootfs = Rootfs::current();
 
+    find_loader_with(cfg, rootfs, interp, arch)
+}
+
+fn find_loader_with(cfg: &Config, rootfs: &Rootfs, interp: &str, arch: Arch) -> Option<PathBuf> {
     if let Some(explicit) = &cfg.loader
         && explicit.exists()
     {
@@ -350,6 +354,23 @@ pub fn find_loader(interp: &str, arch: Arch) -> Option<PathBuf> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| arch.loader_name().to_string());
 
+    // An app process on targetSdk >= 29 may not execve anything it owns:
+    // SELinux grants execute_no_trans on apk_data_file but not on
+    // app_data_file or appdomain_tmpfs. When the host app ships the loader in
+    // its native library directory, that copy has to win over the rootfs one,
+    // which can only be mapped, never executed.
+    if let Some(dir) = &cfg.native_lib_dir {
+        for candidate in [
+            dir.join("libbionilux-loader.so"),
+            dir.join(format!("lib{name}.so")),
+            dir.join(name.as_str()),
+        ] {
+            if candidate.exists() {
+                debug!("loader from native library dir: {}", candidate.display());
+                return Some(candidate);
+            }
+        }
+    }
     if rootfs.enabled() {
         let mut candidates = vec![interp.to_string()];
         for dir in ["/lib", "/usr/lib", "/lib64"] {
@@ -1331,6 +1352,53 @@ mod tests {
     #[test]
     fn find_loader_missing_outside_any_rootfs() {
         assert!(find_loader("/nonexistent/foo/ld-fake.so", Arch::Aarch64).is_none());
+    }
+
+    // ── native library loader ──────────────────────────────────────
+
+    fn loader_fixture() -> (tempfile::TempDir, Config, Rootfs) {
+        let (tmp, mut cfg, rootfs) = rootfs_fixture(&["lib", "usr/lib"]);
+        let rootfs_loader = cfg
+            .rootfs
+            .as_ref()
+            .unwrap()
+            .join("lib/ld-linux-x86-64.so.2");
+        std::fs::write(&rootfs_loader, b"rootfs loader").unwrap();
+        cfg.loader = None;
+        cfg.native_lib_dir = None;
+        (tmp, cfg, rootfs)
+    }
+
+    #[test]
+    fn native_library_loader_wins_over_the_rootfs_copy() {
+        let (tmp, mut cfg, rootfs) = loader_fixture();
+        let native = tmp.path().join("native");
+        std::fs::create_dir_all(&native).unwrap();
+        let shipped = native.join("libbionilux-loader.so");
+        std::fs::write(&shipped, b"native loader").unwrap();
+        cfg.native_lib_dir = Some(native);
+        assert_eq!(
+            find_loader_with(&cfg, &rootfs, "/lib/ld-linux-x86-64.so.2", Arch::X86_64),
+            Some(shipped)
+        );
+    }
+
+    #[test]
+    fn loader_falls_back_to_the_rootfs_without_a_native_library() {
+        let (_tmp, cfg, rootfs) = loader_fixture();
+        let found = find_loader_with(&cfg, &rootfs, "/lib/ld-linux-x86-64.so.2", Arch::X86_64)
+            .expect("rootfs loader");
+        assert!(found.starts_with(cfg.rootfs.as_ref().unwrap()));
+        assert_eq!(found.file_name().unwrap(), "ld-linux-x86-64.so.2");
+    }
+
+    #[test]
+    fn an_empty_native_library_directory_keeps_the_rootfs_loader() {
+        let (tmp, mut cfg, rootfs) = loader_fixture();
+        cfg.native_lib_dir = Some(tmp.path().join("absent"));
+        let found = find_loader_with(&cfg, &rootfs, "/lib/ld-linux-x86-64.so.2", Arch::X86_64)
+            .expect("rootfs loader");
+        assert!(found.starts_with(cfg.rootfs.as_ref().unwrap()));
     }
 
     // ── loader search paths ────────────────────────────────────────

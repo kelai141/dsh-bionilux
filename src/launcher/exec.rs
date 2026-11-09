@@ -79,9 +79,23 @@ pub fn execute(spec: &ExecSpec<'_>) -> Result<(), String> {
         nix::errno::Errno::EACCES => 126,
         _ => 1,
     };
-    eprintln!("[ERROR] execve failed: {e}");
+    // EACCES covers a missing permission bit and a denied exec. On Android the
+    // second is what an app sees for an ELF it owns, so name the cause instead
+    // of letting it look like a chmod problem.
+    match e {
+        nix::errno::Errno::EACCES => eprintln!(
+            "[ERROR] execve failed: {e} ({}): {HINT}",
+            exec_path.to_string_lossy()
+        ),
+        _ => eprintln!("[ERROR] execve failed: {e}"),
+    }
     std::process::exit(code);
 }
+
+const HINT: &str = "the kernel refused this exec. An Android app may execute \
+    only apk_data_file (nativeLibraryDir); app data and memfd are readable and \
+    mappable but not executable. Install the loader in the APK native library \
+    directory, or start the launcher through /system/bin/linker64.";
 
 fn cstring_arg(s: &str, what: &str) -> Result<CString, String> {
     CString::new(s).map_err(|_| format!("{what} contains a NUL byte"))

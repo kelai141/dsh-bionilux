@@ -12,6 +12,7 @@ tests/helpers/*.bin
 # Plugin package test scratch data
 packages/*/.test-data/
 node_modules/
+__pycache__/
 
 # Editor
 .vscode/

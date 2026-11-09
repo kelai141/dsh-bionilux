@@ -19,6 +19,7 @@
 | `BIONILUX_PREFIX` | 宿主安装前缀（用于定位 glibc runtime 与 box64） | 空，回退读 `PREFIX`，再空 |
 | `BIONILUX_RUNTIME_DIR` | 宿主 glibc 目录（`lib/`、`etc/`） | `$BIONILUX_PREFIX/glibc` |
 | `BIONILUX_LOADER` | 显式指定 loader | 从 rootfs 内查找 |
+| `BIONILUX_NATIVE_LIB_DIR` | APK 的 `nativeLibraryDir`；其内的 loader 优先于 rootfs | 空 |
 | `BIONILUX_PRELOAD` | 显式指定 preload 库 | rootfs `/usr/lib/bionilux/` → 可执行文件同级 → runtime |
 | `BIONILUX_BOX64` | 跨架构时的 box64 | `$BIONILUX_PREFIX/bionilux/box64-glibc` |
 
@@ -100,6 +101,23 @@ FAKE_ROOT=1
 
 **只有 `ROOTFS_ENABLED=1` 且 `ROOTFS_LOADER=yes` 时才注册 `linux_bash`**，
 否则不注册、也不破坏已有环境（见 CONTEXT.md 架构不变量）。
+
+### 4.1 Android 上 loader 不能放在 app 数据目录
+
+targetSdk ≥ 29 的 app 进程处于 `u:r:untrusted_app`，SELinux 只允许它对
+`apk_data_file` 做 `execute_no_trans`。app 数据目录是 `app_data_file`、memfd 是
+`appdomain_tmpfs`，两者都只有 `execute`（供 mmap/dlopen），没有 `execute_no_trans`。
+因此 `execve(<rootfs>/lib/.../ld-linux-*.so)` 必然 `EACCES`，日志里也不会有 AVC
+（该拒绝被 dontaudit）。国产 ROM 在 AOSP 之上还会再收紧，所以模拟器能跑不代表真机
+能跑：本地验收服务由 `run-as` 启动，落在 `runas_app` 域，策略不同。
+
+两条执行路径因此都改走系统 linker：
+
+* launcher 自身：`/system/bin/linker64 <launcher> ...`（Node 侧 `launchArgv`，preload 的
+  reroute/spawn 同样加此前缀）。
+* glibc loader：APK 以 `jniLibs/arm64-v8a/libbionilux-loader.so` 打包（`useLegacyPackaging=true`，
+  文件名必须是 `lib*.so`），运行时复制进 `nativeLibraryDir`；`BIONILUX_NATIVE_LIB_DIR`
+  指向该目录时 `find_loader` 优先取这份副本，rootfs 内的 loader 退为兜底。
 
 ## 5. rootfs 安装流程（插件侧）
 

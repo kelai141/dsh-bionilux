@@ -165,6 +165,34 @@ fn configured_guest_cwd(
     inherited.filter(|cwd| !cwd.is_empty())
 }
 
+/// Path children should use to re-enter this launcher.
+///
+/// An Android app may not execve its own data directory, so the host starts the
+/// launcher through /system/bin/linker64. The kernel then records the linker in
+/// /proc/self/exe, and exporting that as BIONILUX_BINARY_PATH would make every
+/// child reroute to the linker itself. When the first argument after the linker
+/// names a bionilux binary, that path is the identity to export.
+fn launcher_identity(
+    current_exe: &std::path::Path,
+    exec_target: &std::path::Path,
+) -> std::path::PathBuf {
+    let linker = current_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "linker64" || name == "linker");
+    if !linker {
+        return current_exe.to_path_buf();
+    }
+    // The kernel replaced argv[0] with the linker, so argv[1] is the program
+    // the linker was asked to map.
+    let candidate = std::env::args_os()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute() && path.exists())
+        .filter(|path| path.file_name().is_some_and(|name| name == "bionilux"));
+    candidate.unwrap_or_else(|| exec_target.to_path_buf())
+}
+
 /// Guest path of the program, as /proc/self/exe should report it.
 ///
 /// The kernel reports the resolved file, not the name that was typed, so a
@@ -294,6 +322,10 @@ fn main() {
     };
 
     let current_exe = env::current_exe().expect("cannot resolve current executable");
+    // Under /system/bin/linker64, /proc/self/exe names the linker: the kernel
+    // records the ELF it executed. Children must reroute through the launcher,
+    // so the path the caller used wins when it still names this process.
+    let launcher_path = launcher_identity(&current_exe, &execution.exec_target);
     // A shebang script is an argument to its interpreter, not the process
     // executable. Perl's $^X, for example, must name perl rather than prove;
     // otherwise prove starts itself again when it tries to run a test.
@@ -307,7 +339,7 @@ fn main() {
         &launcher::env::GuestEnv {
             preload: execution.preload.as_deref().and_then(|p| p.to_str()),
             target_guest: &target_guest,
-            launcher: &current_exe.to_string_lossy(),
+            launcher: &launcher_path.to_string_lossy(),
             arch: execution.arch,
             guest_cwd: &guest_cwd,
             rootfs_enabled: rootfs.enabled(),
@@ -347,6 +379,23 @@ mod tests {
         .unwrap();
         assert_eq!(cli.argv0.as_deref(), Some("-original-name"));
         assert_eq!(cli.command, vec!["-target", "--argv0", "target-argument"]);
+    }
+
+    #[test]
+    fn a_linker_started_launcher_is_its_own_identity() {
+        // Under /system/bin/linker64 the kernel records the linker in
+        // /proc/self/exe. Exporting that would make children reroute to the
+        // linker itself, which fails with "linker cannot load itself".
+        let exe = std::path::Path::new("/apex/com.android.runtime/bin/linker64");
+        let target = std::path::Path::new("/data/user/0/app/files/backend/bin/bionilux");
+        assert_eq!(launcher_identity(exe, target), target);
+    }
+
+    #[test]
+    fn a_directly_started_launcher_keeps_its_own_path() {
+        let exe = std::path::Path::new("/data/user/0/app/files/backend/bin/bionilux");
+        let target = std::path::Path::new("/data/user/0/app/files/rootfs/bin/bash");
+        assert_eq!(launcher_identity(exe, target), exe);
     }
 
     #[test]

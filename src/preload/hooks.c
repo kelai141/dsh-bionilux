@@ -53,6 +53,7 @@
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <utime.h>
 
 extern char **environ;
@@ -436,6 +437,28 @@ static int is_launcher(const char *path, const char *launcher) {
     return launcher && path && strcmp(path, launcher) == 0;
 }
 
+// The Android system linker, which an app process may execve even though it
+// may not execve the launcher it owns: SELinux grants execute_no_trans on
+// apk_data_file only. The linker maps the launcher instead.
+static const char *system_linker(void) {
+    static _Thread_local char found[PATH_MAX];
+    static _Thread_local int resolved;
+    if (!resolved) {
+        const char *candidates[] = { "/system/bin/linker64", "/system/bin/linker" };
+        for (size_t i = 0; i < sizeof candidates / sizeof *candidates; i++) {
+            // The public access() is hooked and maps guest paths into the
+            // rootfs, where the host linker does not exist. The syscall sees
+            // the host path.
+            if (syscall(SYS_faccessat, AT_FDCWD, candidates[i], X_OK, 0) == 0) {
+                snprintf(found, sizeof found, "%s", candidates[i]);
+                break;
+            }
+        }
+        resolved = 1;
+    }
+    return found[0] ? found : NULL;
+}
+
 // A caller may supply a minimal child environment. Keep only the runtime's
 // own configuration when absent from envp; never inherit arbitrary host values.
 static char **strip_ld_preload(char *const envp[]) {
@@ -664,6 +687,28 @@ static int real_execve(const char *p, char *const a[], char *const e[]) {
 }
 
 static int run_rerouted(const char *launcher, char **av, char **ev) {
+    // On Android the launcher in app data cannot be execve'd; the system
+    // linker maps it instead. The kernel overwrites argv[0] with the program it
+    // executed, so the linker reads the first remaining argument as the program
+    // to load; that argument has to be the launcher itself.
+    const char *linker = system_linker();
+    if (linker) {
+        size_t n = 0;
+        while (av && av[n]) n++;
+        char **shifted = calloc(n + 2, sizeof *shifted);
+        if (!shifted) { free(av); free(ev); errno = ENOMEM; return -1; }
+        shifted[0] = (char *)linker;
+        // av[0] is not the launcher: the kernel already replaced it with the
+        // program it executed. `launcher` holds the path the caller wanted.
+        shifted[1] = (char *)launcher;
+        for (size_t i = 1; i < n; i++) shifted[i + 1] = av[i];
+        DBG("linker prefix: file=%s av1=%s av2=%s n=%zu\n", linker, shifted[1], shifted[2] ? shifted[2] : "(null)", n);
+        int r = real_execve(linker, shifted, ev);
+        int e = errno;
+        free(shifted); free(av); free(ev);
+        errno = e;
+        return r;
+    }
     int r = real_execve(launcher, av, ev);
     int e = errno;
     free(av); free(ev);
@@ -674,7 +719,21 @@ static int run_rerouted(const char *launcher, char **av, char **ev) {
 static int exec_launcher(const char *path, char *const argv[], char *const envp[]) {
     char **clean = strip_ld_preload(envp);
     if (!clean) { errno = ENOMEM; return -1; }
-    int r = real_execve(path, argv, clean);
+    const char *linker = system_linker();
+    int r;
+    if (linker) {
+        size_t n = 0;
+        while (argv && argv[n]) n++;
+        char **shifted = calloc(n + 2, sizeof *shifted);
+        if (!shifted) { free(clean); errno = ENOMEM; return -1; }
+        shifted[0] = (char *)linker;
+        shifted[1] = argv[0];
+        for (size_t i = 1; i < n; i++) shifted[i + 1] = argv[i];
+        r = real_execve(linker, shifted, clean);
+        free(shifted);
+    } else {
+        r = real_execve(path, argv, clean);
+    }
     int e = errno;
     free(clean);
     errno = e;
@@ -866,7 +925,21 @@ static int spawn_impl(int search_path, pid_t *pid, const char *path,
     if (is_launcher(path, bn_env("BIONILUX_BINARY_PATH"))) {
         char **clean = strip_ld_preload(envp);
         if (!clean) return ENOMEM;
-        int r = plain(pid, path, fa, attr, argv, clean);
+        const char *linker = system_linker();
+        int r;
+        if (linker) {
+            size_t n = 0;
+            while (argv && argv[n]) n++;
+            char **shifted = calloc(n + 2, sizeof *shifted);
+            if (!shifted) { free(clean); return ENOMEM; }
+            shifted[0] = (char *)linker;
+            shifted[1] = argv[0];
+            for (size_t i = 1; i < n; i++) shifted[i + 1] = argv[i];
+            r = plain(pid, linker, fa, attr, shifted, clean);
+            free(shifted);
+        } else {
+            r = plain(pid, path, fa, attr, argv, clean);
+        }
         int e = errno; free(clean); errno = e;
         return r;
     }

@@ -671,6 +671,23 @@ function executableFileExists(file) {
   }
 }
 
+const SYSTEM_LINKER_CANDIDATES = ['/system/bin/linker64', '/system/bin/linker'];
+
+/**
+ * The argv that starts `file` on Android.
+ *
+ * An app process on targetSdk >= 29 cannot execve a file it owns: SELinux
+ * grants execute_no_trans on apk_data_file, not on app_data_file. The system
+ * linker is executable, and it maps the launcher from app data instead of
+ * execing it. Other platforms exec directly.
+ */
+export function launchArgv(file, args, platform = process.platform, linker = undefined) {
+  if (platform !== 'android') return { file, args };
+  const chosen = linker ?? SYSTEM_LINKER_CANDIDATES.find((candidate) => existsSync(candidate));
+  if (!chosen) return { file, args };
+  return { file: chosen, args: [file, ...args] };
+}
+
 async function measureUnpackedBytes(directory) {
   let total = 0;
   const seen = new Set();
@@ -708,6 +725,13 @@ export class LinuxRuntimeManager {
     this.extractArchive = options.extractArchive;
     this.runCommand = options.runCommand ?? spawnCommand;
     if (typeof this.runCommand !== 'function') throw new TypeError('runCommand must be a function');
+    // The host app passes ApplicationInfo.nativeLibraryDir here. It is the only
+    // directory an app process may execute on targetSdk >= 29, so the launcher
+    // and its glibc loader can be started from it when app data cannot.
+    if (options.nativeLibDir !== undefined && typeof options.nativeLibDir !== 'string') {
+      throw new TypeError('nativeLibDir must be a string');
+    }
+    this.nativeLibDir = options.nativeLibDir ?? '';
     if (options.dnsServers !== undefined && !Array.isArray(options.dnsServers)) {
       throw new TypeError('dnsServers must be an array of IP addresses');
     }
@@ -921,6 +945,9 @@ export class LinuxRuntimeManager {
         node,
         launcher: path.join(instance.backend, 'bin', 'bionilux'),
         preload: path.join(instance.backend, 'lib', 'libbionilux_preload.so'),
+        // Empty unless the host app provides its APK library directory. It is
+        // the only place an app process may execute an ELF it owns.
+        nativeLibDir: this.nativeLibDir ?? '',
       },
     };
   }
@@ -1493,6 +1520,9 @@ export class LinuxRuntimeManager {
     }
     environment.BIONILUX_ROOTFS = paths.rootfs;
     environment.BIONILUX_PRELOAD = paths.preload;
+    // Lets the launcher prefer an executable loader over the rootfs copy,
+    // which SELinux only allows it to map.
+    if (paths.nativeLibDir) environment.BIONILUX_NATIVE_LIB_DIR = paths.nativeLibDir;
     environment.BIONILUX_GUEST_CWD = cwdInfo.guestCwd;
     environment.BIONILUX_GUEST_PATH = `${nodeBin}:${DEFAULT_GUEST_PATH}`;
     environment.BIONILUX_HOST_PATHS = [...new Set(hostPaths)].join(':');
@@ -1504,6 +1534,16 @@ export class LinuxRuntimeManager {
     if (process.platform === 'android') environment.MAKEFLAGS = '--jobserver-style=pipe';
     environment.PATH = `${nodeBin}${path.delimiter}${environment.PATH ?? ''}`;
     return environment;
+  }
+
+  /**
+   * How a persistent session starts the launcher.
+   *
+   * Same launch path as execute(): an app process cannot execve its own data
+   * directory, so the system linker maps the launcher instead.
+   */
+  _sessionLaunch(paths) {
+    return launchArgv(paths.launcher, ['/bin/bash', '--noprofile', '--norc', '-s']);
   }
 
   async execute({ command, cwd, timeout, signal, sharedPaths = [] } = {}) {
@@ -1527,12 +1567,13 @@ export class LinuxRuntimeManager {
       const cwdInfo = this._resolveCwd(cwd, current.paths.rootfs, sharedPaths);
       await this._prepareHostPaths(current.paths.rootfs, cwdInfo.hostPaths);
       const environment = this._executionEnvironment(current.paths, cwdInfo);
+      const start = launchArgv(current.paths.launcher, ['/bin/bash', '-c', command]);
       const result = normaliseCommandResult(
         await this._runManaged({
-          file: current.paths.launcher,
+          file: start.file,
           // Login profiles replace PATH and hide the shared glibc Node. The
           // launcher has already constructed the complete guest environment.
-          args: ['/bin/bash', '-c', command],
+          args: start.args,
           cwd: this.dataDir,
           env: environment,
           timeout,
