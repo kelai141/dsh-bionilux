@@ -339,7 +339,7 @@ pub fn find_loader(interp: &str, arch: Arch) -> Option<PathBuf> {
     let cfg = config();
     let rootfs = Rootfs::current();
 
-    find_loader_with(cfg, &rootfs, interp, arch)
+    find_loader_with(cfg, rootfs, interp, arch)
 }
 
 fn find_loader_with(cfg: &Config, rootfs: &Rootfs, interp: &str, arch: Arch) -> Option<PathBuf> {
