@@ -132,10 +132,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - name: Install AArch64 glibc test tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
       - name: Rust format, lint, and unit tests
         run: |
           cargo fmt --check
@@ -158,7 +154,6 @@ jobs:
           bash tests/preload_paths.sh
           bash tests/ubsan.sh
           bash tests/prepare_rootfs.sh
-          bash tests/aarch64.sh
       - name: Plugin package tests
         run: |
           npm ci --prefix packages/linux-runtime --ignore-scripts --no-audit --no-fund
@@ -167,6 +162,20 @@ jobs:
         run: |
           python3 tests/test_release_workflows.py -v
           python3 tests/test_elf_alignment.py -v
+
+      - name: Install AArch64 glibc test tools
+        timeout-minutes: 14
+        run: |
+          # Diagnostics only; APT below remains the authoritative required failure gate.
+          for host in archive.ubuntu.com security.ubuntu.com ports.ubuntu.com; do
+            if ! timeout --signal=TERM --kill-after=2s 10s getent ahostsv4 "$host"; then
+              echo "::warning::DNS lookup failed for $host"
+            fi
+          done
+          sudo timeout --signal=TERM --kill-after=15s 180s apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
+          sudo timeout --signal=TERM --kill-after=15s 600s apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 install --no-install-recommends -y gcc-aarch64-linux-gnu qemu-user
+      - name: Required AArch64 glibc QEMU regressions (not Android)
+        run: bash tests/aarch64.sh
 
   build-runtime-assets:
     name: build ${{ matrix.architecture }} runtime assets
@@ -223,17 +232,24 @@ jobs:
         with:
           platforms: arm64
       - name: Install compiler and Debian bootstrap tools
+        timeout-minutes: 14
         env:
           CROSS_ARCH: ${{ matrix.cross_arch }}
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
+          # Diagnostics only; APT below remains the authoritative required failure gate.
+          for host in archive.ubuntu.com security.ubuntu.com ports.ubuntu.com; do
+            if ! timeout --signal=TERM --kill-after=2s 10s getent ahostsv4 "$host"; then
+              echo "::warning::DNS lookup failed for $host"
+            fi
+          done
+          sudo timeout --signal=TERM --kill-after=15s 180s apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
           packages="binutils build-essential debootstrap debian-archive-keyring gnupg xz-utils"
           if [[ "$CROSS_ARCH" == "true" ]]; then
             packages="$packages gcc-aarch64-linux-gnu qemu-user-static binfmt-support"
           fi
-          sudo apt-get install -y $packages
+          sudo timeout --signal=TERM --kill-after=15s 600s apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 install --no-install-recommends -y $packages
           bash scripts/prepare-debian-keyring.sh "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg"
           if [[ "$CROSS_ARCH" == "true" ]]; then
             sudo update-binfmts --enable qemu-aarch64
@@ -297,11 +313,11 @@ jobs:
           sudo rm -rf "$rootfs"
           sudo mkdir -p "$rootfs"
           snapshot_release="$GITHUB_WORKSPACE/target/debian-trixie-InRelease"
-          curl --fail --location --retry 4 --retry-all-errors \
+          timeout --signal=TERM --kill-after=15s 600s curl --fail --location --connect-timeout 15 --max-time 240 --retry 2 --retry-max-time 540 --retry-all-errors \
             "$DEBIAN_SNAPSHOT/dists/$DEBIAN_SUITE/InRelease" -o "$snapshot_release"
           echo "$DEBIAN_INRELEASE_SHA256  $snapshot_release" | sha256sum --check --strict
           gpgv --keyring "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" "$snapshot_release"
-          sudo debootstrap --arch="$DEBIAN_ARCHITECTURE" --foreign --variant=minbase \
+          sudo timeout --signal=TERM --kill-after=30s 1500s debootstrap --arch="$DEBIAN_ARCHITECTURE" --foreign --variant=minbase \
             --keyring="$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" \
             --include=apt,bash,ca-certificates,debian-archive-keyring,libstdc++6 \
             --components=main "$DEBIAN_SUITE" "$rootfs" "$DEBIAN_SNAPSHOT"
@@ -316,7 +332,7 @@ jobs:
             sudo umount "$rootfs/dev" 2>/dev/null || true
           }
           trap cleanup_mounts EXIT
-          sudo chroot "$rootfs" /debootstrap/debootstrap --second-stage
+          sudo timeout --signal=TERM --kill-after=30s 1500s chroot "$rootfs" /debootstrap/debootstrap --second-stage
           test "$(sudo chroot "$rootfs" dpkg --print-architecture)" = "$DEBIAN_ARCHITECTURE"
           grep -q '^VERSION_CODENAME=trixie$' "$rootfs/etc/os-release"
           test -x "$rootfs/usr/bin/apt-get"
@@ -337,7 +353,7 @@ jobs:
           SOURCES
           sudo rm -f "$rootfs/etc/resolv.conf"
           sudo cp /etc/resolv.conf "$rootfs/etc/resolv.conf"
-          if ! sudo chroot "$rootfs" /usr/bin/apt-get -o Acquire::Languages=none update \
+          if ! sudo timeout --signal=TERM --kill-after=15s 300s chroot "$rootfs" /usr/bin/apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 -o Acquire::Languages=none -o APT::Update::Error-Mode=any update \
             > "$GITHUB_WORKSPACE/target/apt-update.log" 2>&1; then
             cat "$GITHUB_WORKSPACE/target/apt-update.log"
             exit 1
@@ -379,7 +395,7 @@ jobs:
           asset="node-glibc-v${NODE_VERSION}-linux-${NODE_ARCHITECTURE}.tar.xz"
           source_date_epoch="$(git show -s --format=%ct HEAD)"
           mkdir -p "$stage" "$node_stage" "$node_source"
-          curl --fail --location --retry 4 --retry-all-errors \
+          timeout --signal=TERM --kill-after=15s 600s curl --fail --location --connect-timeout 15 --max-time 240 --retry 2 --retry-max-time 540 --retry-all-errors \
             "https://nodejs.org/dist/v${NODE_VERSION}/$upstream" -o "$node_source/$upstream"
           echo "$expected_sha256  $node_source/$upstream" | sha256sum --check --strict
           python3 - "$node_source/$upstream" "$node_source" <<'PY'

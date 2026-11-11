@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      build_legacy_artifacts:
+        description: Build legacy setup artifacts (not used by the modern release)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -23,7 +28,7 @@ jobs:
       - name: Validate Actions syntax with pinned actionlint
         run: |
           set -euo pipefail
-          curl --fail --location --retry 3 \
+          timeout --signal=TERM --kill-after=15s 300s curl --fail --location --connect-timeout 15 --max-time 120 --retry 2 --retry-max-time 240 --retry-all-errors \
             https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
             -o "$RUNNER_TEMP/actionlint.tar.gz"
           echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --strict
@@ -32,7 +37,7 @@ jobs:
 
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -70,7 +75,7 @@ jobs:
     # pure Node.js; they are gated on every PR so the install/update contract
     # (checksums, opt-in activation, shared Node reuse) cannot regress.
     name: linux environment plugins
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -150,7 +155,7 @@ jobs:
 
   preload-paths:
     name: preload path semantics
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: run hook path tests
@@ -169,14 +174,21 @@ jobs:
 
   preload:
     name: preload (aarch64-glibc)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
       - name: install cross toolchain
+        timeout-minutes: 14
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+          # Diagnostics only; APT below remains the authoritative required failure gate.
+          for host in archive.ubuntu.com security.ubuntu.com ports.ubuntu.com; do
+            if ! timeout --signal=TERM --kill-after=2s 10s getent ahostsv4 "$host"; then
+              echo "::warning::DNS lookup failed for $host"
+            fi
+          done
+          sudo timeout --signal=TERM --kill-after=15s 180s apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
+          sudo timeout --signal=TERM --kill-after=15s 600s apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 install --no-install-recommends -y gcc-aarch64-linux-gnu qemu-user
 
       - name: build
         run: |
@@ -197,7 +209,7 @@ jobs:
 
   bionilux:
     name: bionilux (aarch64-bionic)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -233,17 +245,26 @@ jobs:
           path: bionilux
 
   box64:
+    # Legacy setup artifacts are opt-in, never substitutes for modern release gates.
+    if: github.event_name == 'workflow_dispatch' && inputs.build_legacy_artifacts
     name: box64-glibc
     runs-on: ubuntu-24.04-arm
     steps:
       - name: install build deps
+        timeout-minutes: 14
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git cmake build-essential python3
+          # Diagnostics only; APT below remains the authoritative required failure gate.
+          for host in archive.ubuntu.com security.ubuntu.com ports.ubuntu.com; do
+            if ! timeout --signal=TERM --kill-after=2s 10s getent ahostsv4 "$host"; then
+              echo "::warning::DNS lookup failed for $host"
+            fi
+          done
+          sudo timeout --signal=TERM --kill-after=15s 180s apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
+          sudo timeout --signal=TERM --kill-after=15s 600s apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 install --no-install-recommends -y git cmake build-essential python3
 
       - name: clone and build
         run: |
-          git clone --depth 1 https://github.com/ptitSeb/box64 /tmp/box64
+          timeout --signal=TERM --kill-after=15s 300s git -c http.connectTimeout=15 -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 clone --depth 1 https://github.com/ptitSeb/box64 /tmp/box64
           cd /tmp/box64
           mkdir build && cd build
           cmake .. -DARM64=1 -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -257,13 +278,15 @@ jobs:
           path: box64-glibc
 
   x86-libs:
+    # Legacy setup artifacts are opt-in, never substitutes for modern release gates.
+    if: github.event_name == 'workflow_dispatch' && inputs.build_legacy_artifacts
     name: x86_64 runtime libs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: fetch ubuntu 26.04 base rootfs (amd64)
         run: |
           set -eux
-          curl -fLO https://cdimage.ubuntu.com/ubuntu-base/resolute/daily/current/resolute-base-amd64.tar.gz
+          timeout --signal=TERM --kill-after=15s 300s curl --fail --location --remote-name --connect-timeout 15 --max-time 120 --retry 2 --retry-max-time 240 --retry-all-errors https://cdimage.ubuntu.com/ubuntu-base/resolute/daily/current/resolute-base-amd64.tar.gz
           mkdir rootfs
           tar -xzf resolute-base-amd64.tar.gz -C rootfs
 
