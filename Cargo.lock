@@ -58,6 +58,7 @@ version = "0.10.0"
 dependencies = [
  "clap",
  "goblin",
+ "libc",
  "memmap2",
  "nix",
  "tempfile",
