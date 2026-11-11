@@ -1429,6 +1429,43 @@ mod tests {
     }
 
     #[test]
+    fn bash_dependencies_search_physical_guest_multiarch_directories() {
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let multiarch = format!("usr/lib/{}", arch.triplet());
+            let (_tmp, cfg, rootfs) = rootfs_fixture(&["bin", &multiarch]);
+            let main_elf = cfg.rootfs.as_ref().unwrap().join("bin/bash");
+            let library = cfg
+                .rootfs
+                .as_ref()
+                .unwrap()
+                .join(&multiarch)
+                .join("libtinfo.so.6");
+            std::fs::write(&library, b"dependency").unwrap();
+            let dirs = loader_search_path(
+                &cfg,
+                &rootfs,
+                &LoaderSearch {
+                    target: arch,
+                    execution: arch,
+                    main_elf: &main_elf,
+                    rpath: &[],
+                    runpath: &[],
+                    guest_library_path: None,
+                    guest_cwd: "/",
+                },
+            );
+            assert!(
+                dirs.iter()
+                    .any(|dir| Path::new(dir).join("libtinfo.so.6") == library)
+            );
+            assert!(
+                dirs.iter()
+                    .all(|dir| Path::new(dir).starts_with(cfg.rootfs.as_ref().unwrap()))
+            );
+        }
+    }
+
+    #[test]
     fn origin_follows_alternatives_to_the_real_elf_directory() {
         use std::os::unix::fs::symlink;
         let (_tmp, cfg, rootfs) = rootfs_fixture(&[

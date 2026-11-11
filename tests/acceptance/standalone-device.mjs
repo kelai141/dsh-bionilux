@@ -50,11 +50,12 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const isMain = process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
 // path.resolve() would interpret an Android guest absolute path as a host path
 // when the harness itself runs in a different namespace.
 const guestPaths = process.platform === 'android' || process.env.BN_GUEST_PATHS === '1';
 const pathApi = guestPaths ? path.posix : path;
-const fixtureRoot = pathApi.resolve(required(process.env.BN_FIXTURE, 'BN_FIXTURE'));
+const fixtureRoot = pathApi.resolve(required(process.env.BN_FIXTURE ?? (!isMain ? here : undefined), 'BN_FIXTURE'));
 const dataDir = pathApi.join(fixtureRoot, 'data');
 const logsRoot = pathApi.join(fixtureRoot, 'logs');
 const installReportPath = pathApi.join(logsRoot, 'standalone-device-install.json');
@@ -396,6 +397,7 @@ async function verifyExtractedTree(directory, asset, label) {
  */
 function createPluginHost({ runtimeDir, arch, fetchImpl, assetsBySha }) {
   const loaded = [];
+  let persistedDirectory = null;
   const downloadLog = [];
   const extractLog = [];
   // One host adapter may apply the same runtime twice (restore, then bootstrap
@@ -546,7 +548,7 @@ function createPluginHost({ runtimeDir, arch, fetchImpl, assetsBySha }) {
     }
     let manager;
     try {
-      manager = module.apply(ctx, runtimeConfig);
+      manager = await module.apply(ctx, runtimeConfig);
     } catch (error) {
       // A module copy loaded from a content-addressed directory has its own
       // manager registry. If another copy already claimed this data directory,
@@ -554,7 +556,7 @@ function createPluginHost({ runtimeDir, arch, fetchImpl, assetsBySha }) {
       const owner = managedByDirectory.get(runtimeConfig.dataDir);
       if (error?.code !== 'ERR_RUNTIME_MANAGER_IN_USE' || !owner) throw error;
       runtimeConfig.manager = owner;
-      manager = module.apply(ctx, runtimeConfig);
+      manager = await module.apply(ctx, runtimeConfig);
     }
     managedByDirectory.set(runtimeConfig.dataDir, manager);
     if (!manager || typeof manager.install !== 'function') {
@@ -608,19 +610,16 @@ function createPluginHost({ runtimeDir, arch, fetchImpl, assetsBySha }) {
     } catch {
       return false;
     }
-    if (!state?.installedLinuxVersion || typeof state.pluginDirectory !== 'string') return false;
+    if (!state?.installedLinuxVersion || !state.enabled || !state.injectionActivated || typeof state.pluginDirectory !== 'string') return false;
+    const pluginRoot = path.join(path.dirname(statePath), 'staging', 'runtime-plugin');
+    const relative = path.relative(pluginRoot, state.pluginDirectory);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return false;
     if (!existsSync(state.pluginDirectory)) {
       throw new Error('persisted runtime plugin directory is missing: ' + state.pluginDirectory);
     }
-    await install({
-      directory: state.pluginDirectory,
-      entry: 'lib/index.js',
-      config: {
-        runtimeId: state.runtimeId ?? null,
-        manifest: state.pinnedManifest ?? state.availableManifest ?? null,
-      },
-      enable: true,
-    });
+    // Membership is not activation. Bootstrap checks compatibility and usability
+    // before loading this recorded plugin; do not bypass that boundary here.
+    persistedDirectory = state.pluginDirectory;
     return true;
   }
 
@@ -646,7 +645,7 @@ function createPluginHost({ runtimeDir, arch, fetchImpl, assetsBySha }) {
     restorePersisted,
     uninstall,
     async isInjected() {
-      return { injected: loaded.length > 0, active: loaded.length > 0 };
+      return { injected: loaded.length > 0 || persistedDirectory !== null, active: loaded.length > 0 };
     },
   };
 }
@@ -750,8 +749,12 @@ async function createRuntime({ fixture, server, arch, withSessions }) {
   let installed = before;
   // A persisted install is resumed, never reinstalled: reinstall() would
   // replace the active instance and destroy the work directory under test.
-  if (forceInstall || !before.installed || !before.enabled) {
+  if (forceInstall && before.installed) {
+    installed = await handlers.reinstall({ body: { confirmed: true } });
+  } else if (!before.installed) {
     installed = await handlers.install({ body: { confirmed: true } });
+  } else if (!before.enabled) {
+    throw new Error('Installed runtime is inactive: ' + (before.error ?? 'explicit --install is required'));
   }
   const plugin = pluginHost.loaded.at(-1);
   if (!plugin) {
@@ -762,38 +765,61 @@ async function createRuntime({ fixture, server, arch, withSessions }) {
       'delete BN_FIXTURE/data to install fresh',
     );
   }
-  const managerStatus = plugin.manager.status();
+  const managerStatus = await plugin.manager.verify();
   assert.equal(managerStatus.healthy, true, managerStatus.reason);
   const registry = withSessions ? new SessionRegistry(plugin.manager) : null;
+  return { bootstrap, handlers, pluginHost, plugin, manager: plugin.manager, tools: plugin.tools, registry, rewrites, routes: LINUX_ENVIRONMENT_ROUTES };
+}
+
+function commandContext(result) {
+  return JSON.stringify({ exitCode: result?.exitCode, timedOut: result?.timedOut, stdout: String(result?.stdout ?? '').slice(-4096), stderr: String(result?.stderr ?? '').slice(-4096) });
+}
+
+export async function verifyPersistentSession(registry) {
   if (registry) {
     await registry.open({ id: 'default' });
     const first = await registry.run('default', {
       command: 'export BN_ACCEPTANCE_VALUE=persisted; printf "opened:%s\\n" "$PWD"',
       timeoutMs: 60_000,
     });
-    assert.equal(first.exitCode, 0, first.stderr);
+    assert.equal(first.exitCode, 0, 'persistent session first command: ' + commandContext(first));
     const second = await registry.run('default', {
       command: 'printf "reused:%s\\n" "$BN_ACCEPTANCE_VALUE"',
       timeoutMs: 60_000,
     });
-    assert.equal(second.exitCode, 0, second.stderr);
-    assert.match(second.stdout, /reused:persisted/);
+    assert.equal(second.exitCode, 0, 'persistent session reuse command: ' + commandContext(second));
+    assert.match(second.stdout, /reused:persisted/, 'persistent session context: first=' + commandContext(first) + ' second=' + commandContext(second));
     record('persistent-session-reuse', second.stdout.trim(), {
       source: 'real packages/linux-runtime/modules/session.js SessionRegistry',
       session: 'default',
     });
   }
-  return {
-    bootstrap,
-    handlers,
-    pluginHost,
-    plugin,
-    manager: plugin.manager,
-    tools: plugin.tools,
-    registry,
-    rewrites,
-    routes: LINUX_ENVIRONMENT_ROUTES,
-  };
+}
+
+export async function verifyToolUsability(runtime, arch) {
+  const bash = runtime.tools.get('linux_bash');
+  assert.ok(bash, 'linux_bash was not registered by the real runtime plugin');
+  const execute = await bash.execute({
+    command: 'set -e; architecture=$(/usr/bin/uname -m); guest_uid=$(/usr/bin/id -u); /bin/ls / >/dev/null; printf "standalone-%s\\n" "$architecture"; printf "guest-uid=%s\\n" "$guest_uid"',
+    timeoutMs: 60_000,
+  });
+  const context = 'linux_bash usability: ' + commandContext(execute);
+  assert.equal(execute.exitCode, 0, context);
+  assert.equal(execute.timedOut === true, false, context);
+  assert.match(execute.stdout, arch === 'arm64' ? /standalone-aarch64/ : /standalone-x86_64/, context);
+  assert.match(execute.stdout, /guest-uid=0(?:\n|$)/, context);
+  record('linux_bash-execute', execute.stdout.trim(), { source: 'real runtime plugin registration', runtimeId: execute.runtimeId });
+  return execute;
+}
+
+export async function runOptionalAcceptance(check, { serveMode, explicitInstall }) {
+  try {
+    await check();
+    return { passed: true, failure: null };
+  } catch (error) {
+    if (!serveMode || explicitInstall) throw error;
+    return { passed: false, failure: { name: error?.name ?? 'Error', message: errorText(error), stack: error?.stack ?? null } };
+  }
 }
 
 /**
@@ -957,10 +983,12 @@ async function serve(runtime, auth) {
       const pathname = url.pathname;
       if (pathname === '/health') {
         const value = await snapshot();
-        const ready = value.installed && value.manager.healthy;
+        const ready = value.installed && value.enabled && value.manager.healthy === true && value.tools.includes('linux_bash');
         sendJson(response, ready ? 200 : 503, {
           ok: ready,
           ready,
+          installation: runtime.installation,
+          acceptance: runtime.acceptance,
           version: value.version,
           runtimeId: value.runtimeId,
           manager: value.manager,
@@ -1151,6 +1179,8 @@ async function main() {
   });
   let runtime = null;
   let serveHandle = null;
+  let installation = { passed: false, ready: false };
+  let acceptance = { passed: null, failure: null };
   try {
     record('fixture', {
       directory: server.fixture.directory,
@@ -1202,40 +1232,36 @@ async function main() {
       withSessions: shouldServe,
     });
     const plugin = runtime.plugin;
-    const bash = runtime.tools.get('linux_bash');
-    assert.ok(bash, 'linux_bash was not registered by the real runtime plugin');
-
-    const pluginPackage = JSON.parse(await fs.readFile(path.join(plugin.directory, 'package.json'), 'utf8'));
-    assert.equal(pluginPackage.name, '@dsh-android/linux-runtime');
-    record('installed-plugin-package', pluginPackage.name + '@' + pluginPackage.version, {
-      directory: plugin.directory,
-    });
-
-    for (const download of runtime.pluginHost.downloadLog) {
-      assert.equal(download.receivedBytes, download.declaredBytes, 'HTTP bytes differ from manifest for ' + download.name);
-      assert.equal(download.receivedSha256, download.declaredSha256, 'HTTP digest differs from manifest for ' + download.name);
-      const request = server.requests.find((value) => value.kind === 'asset' && value.name === download.name);
-      assert.ok(request, 'no local HTTP request observed for ' + download.name);
-      assert.equal(request.bytes, download.declaredBytes);
-      record('download-real-http-bytes', download.name, {
-        httpBytes: request.bytes,
-        receivedBytes: download.receivedBytes,
-        declaredBytes: download.declaredBytes,
-        declaredSha256: download.declaredSha256,
-        receivedSha256: download.receivedSha256,
+    await verifyToolUsability(runtime, arch);
+    installation = { passed: true, ready: true };
+    let pluginPackage = null;
+    acceptance = await runOptionalAcceptance(async () => {
+      await verifyPersistentSession(runtime.registry);
+      pluginPackage = JSON.parse(await fs.readFile(path.join(plugin.directory, 'package.json'), 'utf8'));
+      assert.equal(pluginPackage.name, '@dsh-android/linux-runtime');
+      record('installed-plugin-package', pluginPackage.name + '@' + pluginPackage.version, {
+        directory: plugin.directory,
       });
-    }
 
-    const execute = await bash.execute({
-      command: 'printf "standalone-%s\\n" "$(uname -m)"; printf "guest-uid=%s\\n" "$(id -u)"',
-      timeoutMs: 60_000,
-    });
-    assert.equal(execute.exitCode, 0, execute.stderr);
-    assert.match(execute.stdout, /standalone-/);
-    record('linux_bash-execute', execute.stdout.trim(), {
-      source: 'real runtime plugin registration',
-      runtimeId: execute.runtimeId,
-    });
+      for (const download of runtime.pluginHost.downloadLog) {
+        assert.equal(download.receivedBytes, download.declaredBytes, 'HTTP bytes differ from manifest for ' + download.name);
+        assert.equal(download.receivedSha256, download.declaredSha256, 'HTTP digest differs from manifest for ' + download.name);
+        const request = server.requests.find((value) => value.kind === 'asset' && value.name === download.name);
+        assert.ok(request, 'no local HTTP request observed for ' + download.name);
+        assert.equal(request.bytes, download.declaredBytes);
+        record('download-real-http-bytes', download.name, {
+          httpBytes: request.bytes,
+          receivedBytes: download.receivedBytes,
+          declaredBytes: download.declaredBytes,
+          declaredSha256: download.declaredSha256,
+          receivedSha256: download.receivedSha256,
+        });
+      }
+
+    }, { serveMode: shouldServe, explicitInstall: forceInstall });
+    runtime.installation = installation;
+    runtime.acceptance = acceptance;
+    if (!acceptance.passed) record('acceptance-warning', acceptance.failure.message, { passed: false });
 
     if (shouldServe) serveHandle = await serve(runtime, auth);
 
@@ -1244,7 +1270,9 @@ async function main() {
       startedAt,
       finishedAt: new Date().toISOString(),
       mode: shouldServe ? 'serve' : 'install',
-      passed: true,
+      passed: acceptance.passed,
+      installation,
+      acceptance,
       adapter,
       environment: environmentReport(),
       fixture: {
@@ -1281,6 +1309,8 @@ async function main() {
       finishedAt: new Date().toISOString(),
       mode: shouldServe ? 'serve' : 'install',
       passed: false,
+      installation: { ...installation, ready: false },
+      acceptance: { passed: false, failure: { name: error?.name ?? 'Error', message: errorText(error) } },
       adapter,
       environment: environmentReport(),
       observations,
@@ -1308,4 +1338,4 @@ async function main() {
   }
 }
 
-await main();
+if (isMain) await main();

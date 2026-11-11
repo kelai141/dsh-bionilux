@@ -93,6 +93,7 @@ function harness({
     },
     uninstall: async () => {},
     status: async () => ({ healthy: true }),
+    verify: async () => ({ healthy: true }),
   }
   const service = createMobileBootstrap({
     dataDir,

@@ -69,7 +69,9 @@ test('the caller rolls the assets back BEFORE rolling the host scope back (issue
 test('publishBundle never swallows cleanup/rollback errors (issue #1374 regression of #1375)', async () => {
   // 回归判据：加 deferCommit 时我把 `#1375` 刚堵掉的 `.catch(() => {})` 又写了回来，
   // 当时只有 `#1375` 那条源码契约守着。这里再钉一次，让 `#1374` 这套用例也能独立打红。
-  const src = await readFile(new URL('../src/asset-bundle.js', import.meta.url), 'utf8')
+  // Git may check this source out as CRLF on Windows. Normalize only line
+  // endings; keep every cleanup/rollback source assertion unchanged.
+  const src = (await readFile(new URL('../src/asset-bundle.js', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
   const start = src.indexOf('export async function publishBundle(')
   assert.ok(start >= 0, 'publishBundle must exist')
   const end = src.indexOf('\n}\n', start)

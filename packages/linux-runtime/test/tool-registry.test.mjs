@@ -54,7 +54,7 @@ test('real registry accepts live session and asynchronous job lifecycle outputs'
   }
 });
 
-test('tool rejection fails activation and partial registration is rolled back', () => {
+test('tool rejection fails activation and partial registration is rolled back', async () => {
   const manager = new EventEmitter();
   manager.status = () => ({ healthy: true });
   let count = 0;
@@ -63,7 +63,7 @@ test('tool rejection fails activation and partial registration is rolled back', 
     if (++count === 2) throw new Error('registry rejected session');
     return () => { removed = true; };
   } }, effect() {} };
-  assert.throws(() => apply(ctx, { manager }), /registry rejected session/);
+  await assert.rejects(apply(ctx, { manager }), /registry rejected session/);
   assert.equal(removed, true);
   assert.equal(manager.listenerCount('change'), 0);
 });
@@ -117,4 +117,142 @@ test('the two Linux tools share one registry per agent and isolate other agents'
     SessionRegistry.prototype.run = original;
     dispose();
   }
+});
+function delayedActivation() {
+  const manager = new EventEmitter();
+  let state = { healthy: false, runtimeId: 'verified-test', reason: 'execution not verified' };
+  let resolveProof;
+  let rejectProof;
+  manager.status = () => state;
+  manager.verify = () => new Promise((resolve, reject) => { resolveProof = resolve; rejectProof = reject; });
+  const registered = new Map();
+  const registrations = [];
+  const removals = [];
+  const published = [];
+  let cleanup;
+  const ctx = {
+    tools: { register(tool) {
+      assert.equal(registered.has(tool.name), false, 'a tool must not be registered twice');
+      registered.set(tool.name, tool);
+      registrations.push(tool);
+      return () => { removals.push(tool); registered.delete(tool.name); };
+    } },
+    effect(setup) { cleanup = setup(); },
+    provide(name, service) { published.push({ name, service }); },
+  };
+  const pending = apply(ctx, { manager });
+  return {
+    manager, pending, registered, registrations, removals, published,
+    cleanup: () => cleanup(),
+    setHealth(healthy, reason = healthy ? 'verified' : 'probe failed') {
+      state = { ...state, healthy, reason };
+      manager.emit('change', state);
+    },
+    finishProof(healthy) {
+      state = { ...state, healthy, reason: healthy ? 'verified' : 'probe failed' };
+      // The production manager publishes its verdict before verify() resolves.
+      manager.emit('change', state);
+      resolveProof(state);
+    },
+    rejectProof(error) { rejectProof(error); },
+  };
+}
+
+test('async apply publishes neither tools nor its service before delayed execution proof', async () => {
+  const fixture = delayedActivation();
+  try {
+    await Promise.resolve();
+    assert.equal(fixture.registrations.length, 0);
+    assert.equal(fixture.registered.size, 0);
+    assert.deepEqual(fixture.published, []);
+    fixture.finishProof(true);
+    assert.equal(await fixture.pending, fixture.manager);
+    assert.deepEqual([...fixture.registered.keys()], ['linux_bash', 'linux_session']);
+    assert.equal(fixture.registrations.length, 2, 'the proof event and apply continuation register only once');
+    assert.equal(fixture.removals.length, 0);
+    assert.deepEqual(fixture.published, [{ name: 'linuxRuntimeManager', service: fixture.manager }]);
+  } finally { fixture.cleanup(); }
+});
+
+test('healthy proof refreshes retain tool identities and their persistent session registry', async () => {
+  const fixture = delayedActivation();
+  const originalRun = SessionRegistry.prototype.run;
+  let registry;
+  let closed = 0;
+  SessionRegistry.prototype.run = async function () {
+    registry = this;
+    return { stdout: 'persisted', stderr: '', exitCode: 0 };
+  };
+  try {
+    fixture.finishProof(true);
+    await fixture.pending;
+    const bash = fixture.registered.get('linux_bash');
+    const session = fixture.registered.get('linux_session');
+    await bash.execute({ command: 'pwd', session: 'retained' });
+    const persistent = {
+      info: () => ({ session: 'retained', running: true }),
+      close: async () => { closed += 1; },
+    };
+    registry.sessions.set('retained', persistent);
+    fixture.setHealth(true);
+    fixture.setHealth(true);
+    assert.equal(fixture.registered.get('linux_bash'), bash);
+    assert.equal(fixture.registered.get('linux_session'), session);
+    assert.equal(fixture.registrations.length, 2);
+    assert.equal(fixture.removals.length, 0);
+    assert.equal(registry.disposed, false);
+    assert.equal(registry.sessions.get('retained'), persistent);
+    assert.equal(closed, 0, 'a successful refresh must not close a live shell');
+    const listed = await session.execute({ action: 'list' });
+    assert.deepEqual(listed.sessions, [{ session: 'retained', running: true }]);
+    fixture.setHealth(false);
+    assert.equal(fixture.registered.size, 0, 'failed health must withdraw both tools');
+    assert.equal(registry.disposed, true);
+    assert.equal(closed, 1);
+    fixture.setHealth(true);
+    assert.equal(fixture.registrations.length, 4, 'recovery creates one fresh tool pair');
+    assert.notEqual(fixture.registered.get('linux_bash'), bash);
+    assert.notEqual(fixture.registered.get('linux_session'), session);
+  } finally {
+    SessionRegistry.prototype.run = originalRun;
+    fixture.cleanup();
+  }
+});
+
+test('unloading during delayed proof cannot publish late tools or a service', async () => {
+  const fixture = delayedActivation();
+  fixture.cleanup();
+  fixture.cleanup();
+  assert.equal(fixture.manager.listenerCount('change'), 0);
+  fixture.finishProof(true);
+  await fixture.pending;
+  fixture.setHealth(true);
+  assert.equal(fixture.registrations.length, 0);
+  assert.equal(fixture.registered.size, 0);
+  assert.deepEqual(fixture.published, []);
+});
+
+test('a failed execution verdict remains inspectable without exposing Linux tools', async () => {
+  const fixture = delayedActivation();
+  try {
+    fixture.finishProof(false);
+    await fixture.pending;
+    assert.equal(fixture.registrations.length, 0);
+    assert.equal(fixture.registered.size, 0);
+    assert.equal(fixture.manager.status().healthy, false);
+    assert.deepEqual(fixture.published, [{ name: 'linuxRuntimeManager', service: fixture.manager }]);
+  } finally { fixture.cleanup(); }
+});
+
+test('a rejected execution proof rolls back activation without publishing tools or service', async () => {
+  const fixture = delayedActivation();
+  const failure = new Error('injected verification rejection');
+  fixture.rejectProof(failure);
+  await assert.rejects(fixture.pending, error => error === failure);
+  assert.equal(fixture.registrations.length, 0);
+  assert.equal(fixture.registered.size, 0);
+  assert.deepEqual(fixture.published, []);
+  assert.equal(fixture.manager.listenerCount('change'), 0);
+  fixture.setHealth(true);
+  assert.equal(fixture.registrations.length, 0, 'a failed apply must not retain its change listener');
 });

@@ -16,8 +16,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Release metadata and manifest positive/negative tests
-        run: python3 tests/test_release_workflows.py -v
+      - name: Release metadata, manifest and ELF positive/negative tests
+        run: |
+          python3 tests/test_release_workflows.py -v
+          python3 tests/test_elf_alignment.py -v
       - name: Validate Actions syntax with pinned actionlint
         run: |
           set -euo pipefail
@@ -182,7 +184,8 @@ jobs:
             -o libbionilux_preload.so \
             src/preload/hooks.c -pthread -ldl \
             -Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1 \
-            -Wl,-rpath,/usr/lib/aarch64-linux-gnu
+            -Wl,-rpath,/usr/lib/aarch64-linux-gnu -Wl,-z,max-page-size=16384
+          python3 scripts/check_elf_alignment.py --policy android --machine aarch64 libbionilux_preload.so
 
       - name: AArch64 glibc QEMU regressions (not Android)
         run: bash tests/aarch64.sh
@@ -219,7 +222,9 @@ jobs:
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC/bin/aarch64-linux-android24-clang"
           export CC_aarch64_linux_android="$TC/bin/aarch64-linux-android24-clang"
           export AR_aarch64_linux_android="$TC/bin/llvm-ar"
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-z,max-page-size=16384"
           cargo build --release --locked --target aarch64-linux-android
+          python3 scripts/check_elf_alignment.py --policy android --machine aarch64 target/aarch64-linux-android/release/bionilux
           cp target/aarch64-linux-android/release/bionilux .
 
       - uses: actions/upload-artifact@v4

@@ -165,32 +165,35 @@ fn configured_guest_cwd(
     inherited.filter(|cwd| !cwd.is_empty())
 }
 
-/// Path children should use to re-enter this launcher.
-///
-/// An Android app may not execve its own data directory, so the host starts the
-/// launcher through /system/bin/linker64. The kernel then records the linker in
-/// /proc/self/exe, and exporting that as BIONILUX_BINARY_PATH would make every
-/// child reroute to the linker itself. When the first argument after the linker
-/// names a bionilux binary, that path is the identity to export.
-fn launcher_identity(
+/// Path children should use to re-enter this launcher. Under the Android
+/// system linker /proc/self/exe names the linker but argv[0] names bionilux.
+fn launcher_identity(current_exe: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    launcher_identity_from(
+        current_exe,
+        std::env::args_os().map(std::path::PathBuf::from),
+    )
+    .ok_or_else(|| "cannot identify bionilux under the system linker; use its absolute path".into())
+}
+
+fn launcher_identity_from(
     current_exe: &std::path::Path,
-    exec_target: &std::path::Path,
-) -> std::path::PathBuf {
+    args: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
     let linker = current_exe
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == "linker64" || name == "linker");
     if !linker {
-        return current_exe.to_path_buf();
+        return Some(current_exe.to_path_buf());
     }
-    // The kernel replaced argv[0] with the linker, so argv[1] is the program
-    // the linker was asked to map.
-    let candidate = std::env::args_os()
-        .nth(1)
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_absolute() && path.exists())
-        .filter(|path| path.file_name().is_some_and(|name| name == "bionilux"));
-    candidate.unwrap_or_else(|| exec_target.to_path_buf())
+    // argv[0] wins on Android 15. Accept argv[1] only if it also really names
+    // a launcher, for linkers which retain their own name in argv[0]. Never
+    // fall back to the guest target: that would make every child re-enter it.
+    args.into_iter().take(2).find(|path| is_launcher_path(path))
+}
+
+fn is_launcher_path(path: &std::path::Path) -> bool {
+    path.is_absolute() && path.is_file() && path.file_name().is_some_and(|name| name == "bionilux")
 }
 
 /// Guest path of the program, as /proc/self/exe should report it.
@@ -325,7 +328,13 @@ fn main() {
     // Under /system/bin/linker64, /proc/self/exe names the linker: the kernel
     // records the ELF it executed. Children must reroute through the launcher,
     // so the path the caller used wins when it still names this process.
-    let launcher_path = launcher_identity(&current_exe, &execution.exec_target);
+    let launcher_path = match launcher_identity(&current_exe) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            exit(1);
+        }
+    };
     // A shebang script is an argument to its interpreter, not the process
     // executable. Perl's $^X, for example, must name perl rather than prove;
     // otherwise prove starts itself again when it tries to run a test.
@@ -383,19 +392,30 @@ mod tests {
 
     #[test]
     fn a_linker_started_launcher_is_its_own_identity() {
-        // Under /system/bin/linker64 the kernel records the linker in
-        // /proc/self/exe. Exporting that would make children reroute to the
-        // linker itself, which fails with "linker cannot load itself".
+        let tmp = tempfile::tempdir().unwrap();
+        let launcher = tmp.path().join("bionilux");
+        std::fs::write(&launcher, b"launcher").unwrap();
         let exe = std::path::Path::new("/apex/com.android.runtime/bin/linker64");
-        let target = std::path::Path::new("/data/user/0/app/files/backend/bin/bionilux");
-        assert_eq!(launcher_identity(exe, target), target);
+        let guest = std::path::PathBuf::from("/bin/bash");
+        assert_eq!(
+            launcher_identity_from(exe, [launcher.clone(), guest.clone()]),
+            Some(launcher.clone())
+        );
+        assert_eq!(
+            launcher_identity_from(exe, [exe.to_path_buf(), launcher.clone()]),
+            Some(launcher.clone())
+        );
+        assert_eq!(launcher_identity_from(exe, [guest]), None);
+        assert!(!is_launcher_path(std::path::Path::new("bionilux")));
+        std::fs::remove_file(&launcher).unwrap();
+        std::fs::create_dir(&launcher).unwrap();
+        assert!(!is_launcher_path(&launcher));
     }
 
     #[test]
     fn a_directly_started_launcher_keeps_its_own_path() {
         let exe = std::path::Path::new("/data/user/0/app/files/backend/bin/bionilux");
-        let target = std::path::Path::new("/data/user/0/app/files/rootfs/bin/bash");
-        assert_eq!(launcher_identity(exe, target), exe);
+        assert_eq!(launcher_identity_from(exe, []), Some(exe.to_path_buf()));
     }
 
     #[test]

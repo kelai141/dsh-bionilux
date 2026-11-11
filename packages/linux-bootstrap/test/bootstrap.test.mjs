@@ -42,13 +42,14 @@ function response(value, url = '') {
   return { ok: true, status: 200, url, json: async () => value, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) }
 }
 
-function harness({ dataDir = path.join(root, `state-${Math.random().toString(16).slice(2)}`), currentVersion = { value: '0.14.0' }, latestVersion = '1.1.0', managerProvider, hostReturnsManager = true, isInjected, hostInstallError } = {}) {
+function harness({ dataDir = path.join(root, `state-${Math.random().toString(16).slice(2)}`), currentVersion = { value: '0.14.0' }, latestVersion = '1.1.0', managerProvider, hostReturnsManager = true, isInjected, hostInstallError, managerVerify = async () => ({ healthy: true }) } = {}) {
   const calls = { manifestFetches: 0, downloads: 0, managerInstalls: [], managerUninstalls: 0, hostInstalls: [], hostUninstalls: 0, injectionQueries: 0 }
   const runtimeManager = {
     install: async (...args) => calls.managerInstalls.push(args),
     reinstall: async (...args) => calls.managerInstalls.push(args),
     uninstall: async () => { calls.managerUninstalls += 1 },
-    status: async () => ({ running: false }),
+    status: async () => ({ healthy: true }),
+    verify: managerVerify,
   }
   const service = createMobileBootstrap({
     dataDir,
@@ -124,7 +125,7 @@ test('a failed activation is rolled back without leaving the service reporting a
     managerProvider: async () => ({
       install: async () => {},
       uninstall: async () => {},
-      status: async () => { throw new Error('runtime status is unavailable') },
+      verify: async () => { throw new Error('runtime status is unavailable') },
     }),
   })
   await value.service.ready
@@ -385,6 +386,63 @@ test('writes require confirmed true on route handler adapter', async () => {
   await assert.rejects(handlers.check({ body: {} }), /confirmed:true is required/)
   const checked = await handlers.check({ body: { confirmed: true } })
   assert.equal(checked.availableVersion, '1.1.0')
+})
+
+test('install rejects unavailable or failed executable verification before persisting activation', async () => {
+  for (const managerVerify of [undefined, async () => ({ healthy: false, reason: 'bash cannot load libtinfo' }), async () => ({})]) {
+    const value = harness({ managerVerify: managerVerify ?? null })
+    await value.service.ready
+    await assert.rejects(value.service.install({ confirmed: true, activate: true }), /cannot prove usability|not usable/)
+    assert.equal(value.calls.hostUninstalls, 1)
+    const status = await value.service.status()
+    assert.equal(status.installed, false)
+    assert.equal(status.enabled, false)
+    const stored = JSON.parse(await readFile(path.join(value.dataDir, 'linux-bootstrap-state.json'), 'utf8'))
+    assert.equal(stored.installedLinuxVersion, null)
+  }
+})
+
+test('cold restore awaits verification and keeps failed health inactive despite host membership', async () => {
+  const installed = harness()
+  await installed.service.install({ confirmed: true, activate: true })
+  let release
+  const proof = new Promise(resolve => { release = resolve })
+  let verifying
+  const started = new Promise(resolve => { verifying = resolve })
+  const cold = harness({ dataDir: installed.dataDir, managerVerify: async () => { verifying(); return proof } })
+  await started
+  let settled = false
+  cold.service.ready.then(() => { settled = true })
+  await Promise.resolve()
+  assert.equal(settled, false, 'startup must wait for the executable probe')
+  release({ healthy: false, reason: 'external id cannot execute' })
+  await cold.service.ready
+  assert.equal(cold.calls.hostUninstalls, 1, 'failed restore releases the activated host scope')
+  await cold.service.syncInjectionState()
+  const status = await cold.service.status()
+  assert.equal(status.installed, true, 'failed restore retains installed data')
+  assert.equal(status.enabled, false)
+  assert.equal(status.injectionActivated, false)
+  assert.equal(status.runtime.healthy, false)
+  assert.match(status.error, /external id cannot execute/)
+})
+
+test('cold restore rechecks minimum app version and architecture before loading a plugin', async () => {
+  for (const mismatch of ['version', 'architecture']) {
+    const installed = harness()
+    await installed.service.install({ confirmed: true, activate: true })
+    const statePath = path.join(installed.dataDir, 'linux-bootstrap-state.json')
+    const stored = JSON.parse(await readFile(statePath, 'utf8'))
+    if (mismatch === 'architecture') stored.pinnedManifest.runtimes[0].architecture = 'x64'
+    await writeFile(statePath, JSON.stringify(stored))
+    const cold = harness({ dataDir: installed.dataDir, currentVersion: { value: mismatch === 'version' ? '0.13.0' : '0.14.0' } })
+    await cold.service.ready
+    assert.equal(cold.calls.hostInstalls.length, 0)
+    assert.equal(cold.calls.downloads, 0)
+    const status = await cold.service.status()
+    assert.equal(status.enabled, false)
+    assert.match(status.error, /requires DSH Mobile|architecture|arm64/)
+  }
 })
 
 after(async () => rm(root, { recursive: true, force: true }))

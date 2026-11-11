@@ -18,6 +18,17 @@ if (!(Test-Path -LiteralPath (Join-Path $AssetDirectory 'linux-release.json'))) 
 }
 if ($Serial -notmatch '^emulator-(\d+)$') { throw 'This launcher is scoped to an independent Android emulator.' }
 $emulatorPort = $Matches[1]
+function Test-LinuxReady($Health) {
+    return $Health.ready -eq $true -and $Health.installation.passed -eq $true -and
+        $Health.installation.ready -eq $true -and $Health.manager.healthy -eq $true -and
+        $Health.tools -contains 'linux_bash'
+}
+function Write-LinuxReady($Health) {
+    if ($Health.acceptance.passed -eq $false) {
+        Write-Warning "Linux is usable, but acceptance failed: $($Health.acceptance.failure.message). See files/independent-linux/logs/standalone-device-install.json on the device."
+    }
+    Write-Output 'Linux is ready. Use node scripts/linux-agent.mjs exec <command>.'
+}
 function InvokeDeviceAdb([string[]]$Arguments) {
     & adb.exe -s $Serial @Arguments
     if ($LASTEXITCODE -ne 0) { throw "adb failed: $($Arguments -join ' ')" }
@@ -47,7 +58,7 @@ while ((& adb -s $Serial shell getprop sys.boot_completed 2>$null) -ne '1') {
 InvokeDeviceAdb @('forward','tcp:19790','tcp:18790')
 try {
     $health = Invoke-RestMethod 'http://127.0.0.1:19790/health' -TimeoutSec 3
-    if ($health.ready) { Write-Output 'Linux is ready. Use node scripts/linux-agent.mjs exec <command>.'; exit 0 }
+    if (Test-LinuxReady $health) { Write-LinuxReady $health; exit 0 }
 } catch { }
 
 $sourceArchive = Join-Path $evidence 'source.tar'
@@ -95,12 +106,16 @@ do {
     Start-Sleep -Seconds 2
     try {
         $health = Invoke-RestMethod 'http://127.0.0.1:19790/health' -TimeoutSec 3
-        if ($health.ready) { Write-Output 'Linux is ready. Use node scripts/linux-agent.mjs exec <command>.'; exit 0 }
+        if (Test-LinuxReady $health) { Write-LinuxReady $health; exit 0 }
     } catch { }
     $installResult = (& adb -s $Serial shell "run-as com.dsharnessmobile.shell /system/bin/sh -c 'if [ -f files/independent-linux/logs/standalone-device-install.json ]; then cat files/independent-linux/logs/standalone-device-install.json; fi'" 2>$null) -join "`n"
     if ($installResult) {
         $report = $installResult | ConvertFrom-Json
-        if ($report.passed -eq $false) { throw "Linux installation failed: $($report.failure.message)" }
+        if ($report.installation.passed -eq $false -or ($report.passed -eq $false -and $report.installation.passed -ne $true)) {
+            throw "Linux installation failed: $($report.failure.message)"
+        }
+        # A completed acceptance report is not a readiness proof. Only /health
+        # with a verified manager and registered linux_bash may finish startup.
     }
     if ((Get-Date) -gt $readyDeadline) {
         InvokeDeviceAdb @('shell','run-as','com.dsharnessmobile.shell','tail','-n','15','files/independent-linux/logs/service.log')

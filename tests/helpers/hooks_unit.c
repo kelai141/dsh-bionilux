@@ -101,6 +101,175 @@ static void check_tcp_deadline(void) {
     puts("DNS TCP fragmented prefix and stalled-peer deadline: OK");
 }
 
+// Mapping failures must stay failures even for creating or AT_EMPTY_PATH calls.
+static void check_path_overflow(void) {
+    const char *root = bn_rootfs();
+    assert(root && *root);
+    char buf[PATH_MAX], deep[PATH_MAX + 1];
+    deep[0] = '/';
+    memset(deep + 1, 'a', PATH_MAX - 1);
+    deep[PATH_MAX] = '\0';
+    const char *mapped = bn_map(deep, buf, sizeof buf);
+    assert(mapped == bn_invalid_path && strlen(mapped) == PATH_MAX);
+    assert(access(mapped, F_OK) == -1 && errno == ENAMETOOLONG);
+    assert(open(mapped, O_CREAT | O_RDWR, 0600) == -1 && errno == ENAMETOOLONG);
+    assert(mkdir(mapped, 0700) == -1 && errno == ENAMETOOLONG);
+    struct stat st;
+    assert(fstatat(AT_FDCWD, mapped, &st, AT_EMPTY_PATH) == -1 && errno == ENAMETOOLONG);
+    // Even a short valid guest name cannot be returned unmodified when the
+    // rootfs prefix does not fit the caller's output buffer.
+    char tiny[2];
+    assert(bn_map("/etc/group", tiny, sizeof tiny) == bn_invalid_path);
+    assert(bn_map("/etc/group", tiny, 0) == bn_invalid_path);
+    char *physical = malloc(strlen(root) + sizeof deep);
+    assert(physical);
+    strcpy(physical, root); strcat(physical, deep);
+    assert(bn_unmap(physical, tiny, sizeof tiny) == bn_invalid_path);
+    free(physical);
+    assert(bn_resolve(AT_FDCWD, deep, buf, sizeof buf) == bn_invalid_path);
+    char relative[PATH_MAX];
+    memset(relative, 'a', sizeof relative - 1);
+    memcpy(relative, "../", 3); relative[sizeof relative - 1] = '\0';
+    char cwd[PATH_MAX];
+    assert(bn_physical_cwd(cwd, sizeof cwd));
+    assert(!chdir("/tmp"));
+    assert(bn_resolve(AT_FDCWD, relative, buf, sizeof buf) == bn_invalid_path);
+    assert(bn_map_symlink_target(relative, AT_FDCWD, "link", buf, sizeof buf) == bn_invalid_path);
+    int (*real_chdir)(const char *) = dlsym(RTLD_NEXT, "chdir");
+    assert(real_chdir && !real_chdir(cwd));
+    puts("mapping overflow rejects lookup, creation and empty-path operations: OK");
+}
+
+// P1-5: the total budget, not resolv.conf's timeout, bounds a lookup.
+static void check_dns_budget(void) {
+    unsetenv("BIONILUX_DNS_BUDGET_MS");
+    assert(bn_dns_budget_ms() == BN_DNS_BUDGET_DEFAULT_MS);
+    assert(setenv("BIONILUX_DNS_BUDGET_MS", "250", 1) == 0);
+    assert(bn_dns_budget_ms() == 250);
+    // Hard ceiling, whatever the environment asks for.
+    assert(setenv("BIONILUX_DNS_BUDGET_MS", "600000", 1) == 0);
+    assert(bn_dns_budget_ms() == BN_DNS_BUDGET_MAX_MS);
+    // Garbage keeps the default rather than disabling the budget.
+    assert(setenv("BIONILUX_DNS_BUDGET_MS", "soon", 1) == 0);
+    assert(bn_dns_budget_ms() == BN_DNS_BUDGET_DEFAULT_MS);
+    assert(setenv("BIONILUX_DNS_BUDGET_MS", "0", 1) == 0);
+    assert(bn_dns_budget_ms() == BN_DNS_BUDGET_DEFAULT_MS);
+    assert(setenv("BIONILUX_DNS_BUDGET_MS", "250junk", 1) == 0);
+    assert(bn_dns_budget_ms() == BN_DNS_BUDGET_DEFAULT_MS);
+    assert(setenv("BIONILUX_DNS_BUDGET_MS", "99999999999999999999999999", 1) == 0);
+    assert(bn_dns_budget_ms() == BN_DNS_BUDGET_MAX_MS);
+    unsetenv("BIONILUX_DNS_BUDGET_MS");
+
+    // A server that never answers: with a 5 s per-attempt timeout and 2
+    // attempts, only the shared deadline keeps this quick.
+    int server = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    assert(server >= 0);
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    assert(!bind(server, (struct sockaddr *)&addr, sizeof addr));
+    socklen_t size = sizeof addr;
+    assert(!getsockname(server, (struct sockaddr *)&addr, &size));
+
+    memset(&bn_dns, 0, sizeof bn_dns);
+    bn_dns.server[0] = addr; bn_dns.server_count = 1;
+    bn_dns.attempts = 2; bn_dns.timeout_ms = 5000; bn_dns.ndots = 1;
+    bn_dns.search_count = 2;
+    strcpy(bn_dns.search[0], "one.invalid");
+    strcpy(bn_dns.search[1], "two.invalid");
+
+    bn_answer answer;
+    int64_t start = bn_dns_now();
+    assert(bn_dns_query("tool", AF_INET, &answer, start + 200) == -2);
+    assert(bn_dns_now() - start < 1000);
+    close(server);
+    puts("one total DNS budget bounds every attempt, server and search domain: OK");
+}
+
+// No nameserver must not fall through to unbounded host NSS resolution.
+static void check_no_nameserver(void) {
+    memset(&bn_dns, 0, sizeof bn_dns);
+    bn_dns.check_countdown = 1 << 20;
+    char nums[BN_DNS_MAXV4 + BN_DNS_MAXV6][INET6_ADDRSTRLEN];
+    assert(bn_resolve_to_numeric("no-such-host.invalid", AF_INET, nums,
+                               BN_DNS_MAXV4 + BN_DNS_MAXV6) == 0);
+    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
+    struct addrinfo *ours = NULL;
+    assert(getaddrinfo("no-such-host.invalid", NULL, &hints, &ours) == EAI_NONAME);
+    assert(!ours);
+    assert(bn_resolve_to_numeric("bn-v6", AF_INET6, nums,
+                               BN_DNS_MAXV4 + BN_DNS_MAXV6) == 1);
+    assert(!strcmp(nums[0], "::1"));
+    puts("no nameserver uses guest hosts or EAI_NONAME without host DNS: OK");
+}
+
+// P3-12: the minimal-environment context list must cover every variable the
+// launcher exports as runtime configuration, or env -i style children lose it.
+static void check_context_variables(void) {
+    static const char *required[] = {
+        "BIONILUX_ROOTFS=", "BIONILUX_PRELOAD=", "BIONILUX_LOADER=",
+        "BIONILUX_NATIVE_LIB_DIR=", "BIONILUX_DNS_BUDGET_MS="
+    };
+    size_t count = sizeof bn_context / sizeof bn_context[0];
+    for (size_t i = 0; i < sizeof required / sizeof required[0]; i++) {
+        int found = 0;
+        for (size_t k = 0; k < count; k++)
+            if (!strcmp(bn_context[k].key, required[i])) found = 1;
+        assert(found);
+    }
+    puts("minimal-environment context list covers the launcher's variables: OK");
+}
+
+// NULL envp and { NULL } both request an empty application environment, not
+// loss of the private rootfs/loader transport which makes the child executable.
+static void check_null_environment(void) {
+    assert(!setenv("BIONILUX_DNS_BUDGET_MS", "123", 1));
+    assert(!setenv("BN_SHOULD_NOT_LEAK", "host-value", 1));
+    char *empty[] = {NULL};
+    char **ev = strip_ld_preload(NULL), **explicit = strip_ld_preload(empty);
+    assert(ev && explicit);
+    size_t i = 0;
+    for (; ev[i] && explicit[i]; i++) assert(!strcmp(ev[i], explicit[i]));
+    assert(!ev[i] && !explicit[i]);
+    assert(bn_env_has(ev, "BIONILUX_ROOTFS="));
+    assert(bn_env_has(ev, "BIONILUX_DNS_BUDGET_MS="));
+    assert(bn_env_has(ev, BN_ENV_KEEP));
+    assert(!bn_env_has(ev, "BN_SHOULD_NOT_LEAK="));
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (!pid) {
+        environ = ev;
+        on_init(); // Simulate caching transport before application startup.
+        assert(!environ[0]);
+        assert(bn_rootfs() && bn_dns_budget_ms() == 123);
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    free(ev); free(explicit);
+    unsetenv("BIONILUX_DNS_BUDGET_MS"); unsetenv("BN_SHOULD_NOT_LEAK");
+    char *given[] = {"PATH=/usr/bin:/bin", "BIONILUX_TARGET_EXE=/usr/bin/bn-probe", NULL};
+    ev = strip_ld_preload(given);
+    assert(ev);
+    int target_exe = 0;
+    for (size_t k = 0; ev[k]; k++)
+        if (!strncmp(ev[k], "BIONILUX_TARGET_EXE=", sizeof "BIONILUX_TARGET_EXE=" - 1)) target_exe++;
+    assert(target_exe == 1);
+    free(ev);
+    puts("NULL environment keeps private context but restores empty application env: OK");
+}
+
+static void check_linker_arguments(void) {
+    const char *path = "/data/app/backend/bin/bionilux";
+    char *args[] = {"custom-or-empty-argv0", "/bin/bash", "-c", "id", NULL};
+    char **av = bn_linker_argv("/system/bin/linker64", path, args);
+    assert(av && !strcmp(av[0], "/system/bin/linker64") && av[1] == path);
+    assert(!strcmp(av[2], "/bin/bash") && !strcmp(av[3], "-c") && !strcmp(av[4], "id") && !av[5]);
+    free(av);
+    av = bn_linker_argv("/system/bin/linker64", path, NULL);
+    assert(av && av[1] == path && !av[2]);
+    free(av);
+    puts("system linker always loads the executable path, not arbitrary argv0: OK");
+}
+
 static void check_search(void) {
     int server = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     assert(server >= 0);
@@ -132,7 +301,8 @@ static void check_search(void) {
     bn_dns.attempts = 1; bn_dns.timeout_ms = 500; bn_dns.ndots = 1;
     bn_dns.search_count = 1; strcpy(bn_dns.search[0], "invalid");
     bn_answer answer;
-    assert(!bn_dns_query("tool", AF_INET, &answer));
+    // The search list shares one deadline with the queries (P1-5).
+    assert(!bn_dns_query("tool", AF_INET, &answer, bn_dns_now() + 5000));
     assert(answer.v4_count == 1 && ntohl(answer.v4[0].s_addr) == 0x7f000007);
     int status;
     assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -140,7 +310,9 @@ static void check_search(void) {
     FILE *fp = fopen("/etc/resolv.conf", "w");
     assert(fp); fputs("nameserver 127.0.0.2\noptions timeout:999999999999 attempts:999999 ndots:999999\n", fp); fclose(fp);
     bn_dns_load(1);
-    assert(bn_dns.server_count == 1 && bn_dns.timeout_ms == 30000 && bn_dns.attempts == 5 && bn_dns.ndots == 15);
+    // attempts is capped at 2, not at glibc's 5: one name is retried per server
+    // and per search domain, so the old ceiling allowed a minutes-long stall.
+    assert(bn_dns.server_count == 1 && bn_dns.timeout_ms == 30000 && bn_dns.attempts == 2 && bn_dns.ndots == 15);
     fp = fopen("/etc/resolv.conf", "w");
     assert(fp); fputs("nameserver 127.0.0.3\n", fp); fclose(fp);
     struct timespec times[] = {{2,0},{2,0}};
@@ -152,7 +324,14 @@ static void check_search(void) {
 
 int main(void) {
     check_tcp_deadline();
+    check_path_overflow();
+    check_dns_budget();
+    check_context_variables();
+    check_null_environment();
+    check_linker_arguments();
     check_search();
+    // Runs after check_search() so it needs no /etc/resolv.conf of its own.
+    check_no_nameserver();
     check_link_fallback();
     check_fortified();
     unsigned char buf[520];

@@ -2,7 +2,7 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -94,6 +94,16 @@ function realSession(manager) {
   return new PersistentSession(manager, { id: 'real', maxOutputBytes: 64 * 1024 });
 }
 
+async function waitFor(predicate, message, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const value = await predicate();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } while (Date.now() < deadline);
+  assert.fail(message);
+}
+
 function runBash(command) {
   return new Promise((resolve, reject) => {
     const child = spawn(bash, ['--noprofile', '--norc', '-c', command], {
@@ -160,11 +170,52 @@ test('the parser accepts an exit status and cwd split across chunks', () => {
   assert.equal(result.stdout.value, 'payload');
 });
 
-test('a background job that exits immediately is not reported as running', { skip }, async () => {
+test('parser snapshots are non-destructive and hide only matching protocol tails', () => {
+  const marker = String.fromCharCode(30) + 'BIONILUX';
+  const end = String.fromCharCode(31);
+  const parser = new SessionProtocolParser(1024, 'snap');
+  parser.begin();
+  parser.push(marker + 'snap:BEGIN' + end);
+  const output = 'prefix' + marker + 'different:END:literal';
+  parser.push(output);
+  assert.equal(parser.snapshot().stdout, output);
+  assert.equal(parser.snapshot().stdout, output, 'a second snapshot must not append the tail again');
+  parser.push(marker + 'snap:EN');
+  assert.equal(parser.snapshot().stdout, output, 'a split matching frame must not leak into output');
+  parser.push('D:0' + end + marker + 'snap:CWD:/' + end);
+  assert.equal(parser.take().stdout.value, output, 'snapshot must not change normal completion');
+});
+
+test('snapshot output bounds preserve UTF-8 and distinguish a full prefix from truncation', () => {
+  const marker = String.fromCharCode(30) + 'BIONILUX';
+  const end = String.fromCharCode(31);
+  const parser = new SessionProtocolParser(5, 'utf8');
+  parser.begin();
+  parser.push(marker + 'utf8:BEGIN' + end);
+  parser.push('a😀');
+  assert.equal(parser.snapshot().stdout, 'a😀');
+  assert.equal(parser.snapshot().stdoutTruncated, false);
+  parser.push('z');
+  assert.equal(parser.snapshot().stdout, 'a😀');
+  assert.equal(parser.snapshot().stdoutTruncated, true);
+
+  const cut = new SessionProtocolParser(4, 'cut');
+  cut.begin();
+  cut.push(marker + 'cut:BEGIN' + end);
+  cut.push('a😀');
+  assert.equal(cut.snapshot().stdout, 'a');
+  assert.ok(Buffer.byteLength(cut.snapshot().stdout) <= 4);
+  assert.equal(cut.snapshot().stdoutTruncated, true);
+});
+
+test('a background job that exits immediately is not reported as running', { skip, timeout: 60_000 }, async (t) => {
   const { manager } = await makeManager();
+  t.after(() => manager.dispose());
   const registry = new SessionRegistry(manager);
   const started = await registry.start('early', { command: 'printf early' });
-  const deadline = Date.now() + 5_000;
+  // Cold emulator launches under a concurrent analyzer took over five seconds.
+  // Keep a bounded completion budget without weakening the finished/exit checks.
+  const deadline = Date.now() + 30_000;
   let poll = await registry.poll('early', { job: started.job });
   while (!poll.finished && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -177,21 +228,22 @@ test('a background job that exits immediately is not reported as running', { ski
   await manager.dispose();
 });
 
-test('closing a session kills the job supervisor and its untagged descendants', { skip }, async () => {
+test('closing a session kills the job supervisor and its untagged descendants', { skip }, async (t) => {
   const { manager, rootfs } = await makeManager();
   const registry = new SessionRegistry(manager);
+  t.after(async () => { await registry.dispose(); await manager.dispose(); });
   const pidFile = path.join(rootfs, 'tmp', 'orphan-check.pid');
+  const shellPidFile = manager._sessionPathForShell(pidFile);
   const started = await registry.start('orphans', {
     // The producer starts a background child and then waits. That child is not
     // the job leader, so it must be found by the job's own process group.
-    command: 'bash -c \'env -i /bin/bash -c "sleep 120" & echo $! > "$0"; wait\' ' + shellQuote(pidFile),
-    // A small Windows shutdown window makes the cleanup path deterministic.
-    ...(windows ? { timeoutMs: 20_000 } : {}),
+    command: 'bash -c \'env -i /bin/bash -c "sleep 120" & echo $! > "$0"; wait\' ' + shellQuote(shellPidFile),
   });
-  await new Promise((resolve) => setTimeout(resolve, 700));
   assert.notEqual(started.pid, null, 'the job supervisor pid is recorded');
-  const descendant = Number.parseInt(await readFile(pidFile, 'utf8').catch(() => ''), 10);
-  assert.ok(Number.isInteger(descendant), 'the descendant pid must be observable');
+  const descendant = await waitFor(async () => {
+    const pid = Number.parseInt(await readFile(pidFile, 'utf8').catch(() => ''), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  }, 'the descendant pid must be observable');
   // `kill(pid, 0)` succeeds for a zombie. On Linux, read the state field so a
   // reaped-but-not-yet-collected process counts as stopped; a live process with
   // its original PID still counts as a failure.
@@ -215,9 +267,10 @@ test('closing a session kills the job supervisor and its untagged descendants', 
   assert.equal(await alive(), false, 'closing the session must kill every job descendant');
 });
 
-test('session ids are restricted and the real shell is used', { skip }, async () => {
+test('session ids are restricted and the real shell is used', { skip }, async (t) => {
   assert.throws(() => assertSessionId('../escape'), /session must be/);
   const { manager } = await makeManager();
+  t.after(() => manager.dispose());
   const registry = new SessionRegistry(manager);
   const opened = await registry.open({ id: 'build' });
   assert.equal(opened.session, 'build');
@@ -228,8 +281,9 @@ test('session ids are restricted and the real shell is used', { skip }, async ()
   await manager.dispose();
 });
 
-test('a real bash session keeps cwd and exported variables and preserves streams', { skip }, async () => {
+test('a real bash session keeps cwd and exported variables and preserves streams', { skip }, async (t) => {
   const { manager, rootfs } = await makeManager();
+  t.after(() => manager.dispose());
   const registry = new SessionRegistry(manager);
   const work = path.join(rootfs, 'tmp', 'work');
   await mkdir(work, { recursive: true });
@@ -254,8 +308,9 @@ test('a real bash session keeps cwd and exported variables and preserves streams
   await manager.dispose();
 });
 
-test('a background job can be polled by byte offset without replaying output', { skip }, async () => {
+test('a background job can be polled by byte offset without replaying output', { skip }, async (t) => {
   const { manager } = await makeManager();
+  t.after(() => manager.dispose());
   const registry = new SessionRegistry(manager);
   const started = await registry.start('jobs', {
     // Each write is followed by a stop so the poll below can prove incremental
@@ -293,8 +348,9 @@ test('a background job can be polled by byte offset without replaying output', {
   await manager.dispose();
 });
 
-test('explicit shell exit returns the final output and actual status', { skip }, async () => {
+test('explicit shell exit returns the final output and actual status', { skip }, async (t) => {
   const { manager } = await makeManager();
+  t.after(() => manager.dispose());
   const registry = new SessionRegistry(manager);
   const result = await registry.run('exit', { command: 'printf final-tail; exit 7' });
   assert.equal(result.stdout, 'final-tail');
@@ -305,8 +361,9 @@ test('explicit shell exit returns the final output and actual status', { skip },
   await manager.dispose();
 });
 
-test('timeout closes the session and leaves no tracked child', { skip }, async () => {
+test('timeout closes the session and leaves no tracked child', { skip }, async (t) => {
   const { manager } = await makeManager();
+  t.after(() => manager.dispose());
   const registry = new SessionRegistry(manager);
   await registry.open({ id: 'slow' });
   const started = Date.now();
@@ -320,8 +377,309 @@ test('timeout closes the session and leaves no tracked child', { skip }, async (
   await manager.dispose();
 });
 
-test('dispose closes every live session, and tool registration owns its registry', { skip }, async () => {
+test('a timed out command returns the output it already produced', { skip }, async (t) => {
   const { manager } = await makeManager();
+  t.after(() => manager.dispose());
+  const registry = new SessionRegistry(manager);
+  const result = await registry.run('partial', {
+    command: 'printf "half-built"; printf "compiler-stalled" >&2; sleep 30',
+    timeoutMs: 1_500,
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.sessionClosed, true);
+  // The partial log is the only diagnostic a stuck command leaves behind; an
+  // empty stdout here discarded the entire prefix the parser had retained.
+  assert.equal(result.stdout, 'half-built');
+  assert.equal(result.stdoutTruncated, false);
+  assert.match(result.stderr, /compiler-stalled/);
+  assert.match(result.stderr, /timed out after 1500 ms/);
+  assert.equal(result.stderrTruncated, false);
+  await registry.dispose();
+  await manager.dispose();
+});
+
+test('a timeout keeps a truncated prefix and reports the truncation flag', { skip }, async (t) => {
+  const { manager } = await makeManager();
+  t.after(() => manager.dispose());
+  const session = new PersistentSession(manager, { id: 'trunc', maxOutputBytes: 16 });
+  await session.open(manager.status().paths, { guestCwd: '/', hostPaths: [] });
+  const result = await session.run({
+    command: 'printf "%s" "' + 'x'.repeat(4096) + '"; sleep 30',
+    timeoutMs: 1_500,
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.stdout.length, 16);
+  assert.equal(result.stdoutTruncated, true, 'the cut prefix must be flagged as truncated');
+  await session.close();
+  await manager.dispose();
+});
+
+test('closing a session rejects every queued run with an AbortError', { skip }, async (t) => {
+  const { manager } = await makeManager();
+  t.after(() => manager.dispose());
+  const session = new PersistentSession(manager, { id: 'abort' });
+  await session.open(manager.status().paths, { guestCwd: '/', hostPaths: [] });
+  const running = session.run({ command: 'sleep 30' });
+  const firstQueued = session.run({ command: 'printf queued-one' });
+  const secondQueued = session.run({ command: 'printf queued-two' });
+  // Observe every rejection before close so no rejection is ever unhandled.
+  const outcome = (promise) => promise.then((value) => value, (error) => error);
+  const runningOutcome = outcome(running);
+  const firstOutcome = outcome(firstQueued);
+  const secondOutcome = outcome(secondQueued);
+  await waitFor(() => session._pending, 'the first command must be running before close');
+  await session.close();
+
+  const first = await firstOutcome;
+  const second = await secondOutcome;
+  for (const error of [first, second]) {
+    assert.ok(error instanceof Error, 'a queued run must reject, not resolve');
+    assert.equal(error.name, 'AbortError');
+    assert.equal(error.code, 'ERR_SESSION_CLOSED');
+    assert.match(error.message, /closed/);
+    assert.doesNotMatch(error.message, /is not running/, 'the abort must not look like a shell symptom');
+  }
+  // The command that was already running still reports the closed session.
+  const settled = await runningOutcome;
+  assert.equal(settled.sessionClosed, true);
+  assert.equal(session._queueAborts.size, 0, 'aborting must clear the queue hooks');
+  assert.equal(session._queued, 0, 'aborting must not leak queue accounting');
+  await manager.dispose();
+});
+
+test('the run queue is bounded and rejects the overflow', { skip }, async (t) => {
+  const { manager } = await makeManager();
+  t.after(() => manager.dispose());
+  const session = new PersistentSession(manager, { id: 'cap', maxQueuedRuns: 2 });
+  await session.open(manager.status().paths, { guestCwd: '/', hostPaths: [] });
+  const outcome = (promise) => promise.then((value) => value, (error) => error);
+  const running = outcome(session.run({ command: 'sleep 30' }));
+  await waitFor(() => session._pending, 'the first run must leave the queue');
+  const first = outcome(session.run({ command: 'printf one' }));
+  const second = outcome(session.run({ command: 'printf two' }));
+  const rejected = await outcome(session.run({ command: 'printf overflow' }));
+  assert.ok(rejected instanceof Error);
+  assert.match(rejected.message, /already has 2 queued commands/);
+  assert.notEqual(rejected.name, 'AbortError', 'a queue overflow is not a session close');
+  assert.equal(session._queued, 2, 'the limit counts waiting commands, not the active one');
+  await session.close();
+  assert.equal((await running).sessionClosed, true);
+  for (const queued of [await first, await second]) assert.equal(queued.code, 'ERR_SESSION_CLOSED');
+  assert.equal(session._queued, 0);
+  assert.equal(session._queueAborts.size, 0);
+});
+
+test('a run on an already closed session is rejected as an abort', { skip }, async (t) => {
+  const { manager } = await makeManager();
+  t.after(() => manager.dispose());
+  const session = new PersistentSession(manager, { id: 'gone' });
+  await session.open(manager.status().paths, { guestCwd: '/', hostPaths: [] });
+  await session.close();
+  await assert.rejects(
+    session.run({ command: 'printf late' }),
+    (error) => error.name === 'AbortError' && error.code === 'ERR_SESSION_CLOSED',
+  );
+  await manager.dispose();
+});
+
+test('a failed job launch removes its internal tracking entry', { skip }, async (t) => {
+  const { manager } = await makeManager();
+  const registry = new SessionRegistry(manager);
+  t.after(async () => { await registry.dispose(); await manager.dispose(); });
+  await registry.open({ id: 'leak' });
+  const session = registry.sessions.get('leak');
+  const initialCwd = (await session.run({ command: 'printf "%s" "$PWD"' })).stdout;
+  await assert.rejects(
+    // A missing directory makes the launch frame exit 125 before the job starts.
+    registry.start('leak', { command: 'printf never', cwd: '/nonexistent-bionilux-launch' }),
+  );
+  assert.equal(session._jobsInternal.size, 0, 'a failed launch must not leak a tracked job');
+  assert.equal(session._jobs.size, 0);
+  assert.deepEqual(await readdir(session.jobRoot()), [], 'failed launch files must be removed');
+  assert.equal(session.running, true, 'a bad launch cwd must not close the session shell');
+  assert.equal((await session.run({ command: 'printf "%s" "$PWD"' })).stdout, initialCwd);
+  const started = await registry.start('leak', { command: 'printf ok' });
+  assert.equal(session._jobsInternal.size, 1);
+  assert.ok(session._jobs.has(started.job));
+  await registry.dispose();
+  await manager.dispose();
+});
+
+test('concurrent job starts cannot overbook the limit and a completed slot is reusable', { skip, timeout: 60_000 }, async (t) => {
+  const { manager } = await makeManager();
+  t.after(() => manager.dispose());
+  const session = new PersistentSession(manager, { id: 'capacity', maxJobs: 1 });
+  await session.open(manager.status().paths, { guestCwd: '/', hostPaths: [] });
+  const starts = await Promise.allSettled([
+    session.startJob({ command: 'sleep 1; printf first' }),
+    session.startJob({ command: 'printf overbooked' }),
+  ]);
+  assert.equal(starts[0].status, 'fulfilled');
+  assert.equal(starts[1].status, 'rejected');
+  assert.match(starts[1].reason.message, /unfinished jobs/);
+  assert.equal(session._jobs.size, 1);
+  const firstJob = starts[0].value.job;
+  await waitFor(async () => (await session.pollJob({ job: firstJob })).finished,
+    'the first job must complete while its log remains pollable at the limit', 30_000);
+  const second = await session.startJob({ command: 'printf second' });
+  assert.equal(session._jobs.size, 1);
+  assert.equal(session._jobsInternal.size, 1);
+  assert.equal(session._jobs.has(firstJob), false);
+  assert.equal(session._jobs.has(second.job), true);
+  await session.close();
+});
+
+test('pruning completed jobs trims to the limit without deleting an extra one', async () => {
+  const { manager } = await makeManager();
+  const session = new PersistentSession(manager, { id: 'prune', maxJobs: 2 });
+  const directories = [];
+  for (let index = 0; index < 3; index += 1) {
+    const directory = await tempDir();
+    directories.push(directory);
+    const job = {
+      job: 'job' + index,
+      pid: null,
+      start: null,
+      winpid: null,
+      scope: null,
+      offset: 0,
+      size: 0,
+      directory,
+      logLimit: 1024,
+      exitCode: 0,
+      // The oldest job is pruned first; the newest is the one a client polls.
+      finishedAt: Date.now() - (10 - index) * 1_000,
+    };
+    session._jobs.set(job.job, job);
+    session._jobsInternal.add(job);
+  }
+  await session._pruneJobs();
+  assert.equal(session._jobs.size, 2, 'trimming must stop exactly at maxJobs');
+  assert.deepEqual([...session._jobs.keys()], ['job1', 'job2'], 'the oldest finished job goes first');
+  assert.equal(session._jobsInternal.size, 2, 'the internal set must not keep pruned jobs');
+  assert.deepEqual(
+    [...session._jobsInternal].map((job) => job.job).sort(),
+    ['job1', 'job2'],
+    'the internal set must hold the same jobs as the public map',
+  );
+  assert.equal(existsSync(directories[0]), false, 'the pruned job directory must be removed');
+  assert.equal(existsSync(directories[2]), true, 'a job inside the limit must be kept');
+  await manager.dispose();
+});
+
+test('queue admission is bounded and closure never executes rejected waiters', async () => {
+  const { manager } = await makeManager();
+  const session = new PersistentSession(manager, { id: 'queue-unit', maxQueuedRuns: 2 });
+  const executed = [];
+  let release;
+  session._run = (command) => {
+    executed.push(command);
+    return new Promise((resolve) => { release = resolve; });
+  };
+  const outcome = (promise) => promise.then((value) => value, (error) => error);
+  const active = outcome(session.run({ command: 'active' }));
+  await Promise.resolve();
+  assert.deepEqual(executed, ['active']);
+  const first = outcome(session.run({ command: 'queued-one' }));
+  const second = outcome(session.run({ command: 'queued-two' }));
+  await assert.rejects(session.run({ command: 'overflow' }), /already has 2 queued commands/);
+  await session.close();
+  for (const waiting of [await first, await second]) {
+    assert.equal(waiting.name, 'AbortError');
+    assert.equal(waiting.code, 'ERR_SESSION_CLOSED');
+  }
+  release({ sessionClosed: true });
+  await active;
+  await session._queue;
+  assert.deepEqual(executed, ['active'], 'aborted frames must never reach the shell later');
+  assert.equal(session._queued, 0);
+  assert.equal(session._queueAborts.size, 0);
+  await manager.dispose();
+});
+
+test('a slow close rejects late work before its job drain completes', async () => {
+  const { manager } = await makeManager();
+  const session = new PersistentSession(manager, { id: 'draining' });
+  let release;
+  const drain = new Promise((resolve) => { release = resolve; });
+  session._stopJobs = () => drain;
+  const closing = session.close();
+  assert.equal(session.running, false);
+  for (const request of [session.run({ command: 'printf late' }), session.startJob({ command: 'printf late' })]) {
+    await assert.rejects(request, (error) => error.name === 'AbortError' && error.code === 'ERR_SESSION_CLOSED');
+  }
+  assert.equal(session._queued, 0);
+  assert.equal(session._queueAborts.size, 0);
+  release();
+  await closing;
+  await manager.dispose();
+});
+
+test('a rejected job launch removes its reserved bookkeeping and files', async () => {
+  const { manager } = await makeManager();
+  const session = new PersistentSession(manager, { id: 'rejected' });
+  session._paths = manager.status().paths;
+  const failure = new Error('injected launch rejection');
+  session.run = async () => { throw failure; };
+  await assert.rejects(session.startJob({ command: 'printf never' }), (error) => error === failure);
+  assert.equal(session._jobsInternal.size, 0);
+  assert.equal(session._jobs.size, 0);
+  assert.deepEqual(await readdir(session.jobRoot()), []);
+  await session.close();
+  await manager.dispose();
+});
+
+test('polling at the job limit succeeds and only admission reserves a slot', async () => {
+  const { manager } = await makeManager();
+  const session = new PersistentSession(manager, { id: 'limit', maxJobs: 2 });
+  const now = Date.now();
+  const jobs = [];
+  for (let index = 0; index < 2; index += 1) {
+    const directory = await tempDir();
+    await writeFile(path.join(directory, 'output.log'), 'done' + index);
+    await writeFile(path.join(directory, 'status'), '0');
+    const info = { job: String(index + 1).repeat(24), directory, logLimit: 1024, offset: 0, size: 0,
+      finishedAt: now - (2 - index) * 100, exitCode: 0 };
+    session._jobs.set(info.job, info);
+    session._jobsInternal.add(info);
+    jobs.push(info);
+  }
+  const poll = await session.pollJob({ job: jobs[1].job });
+  assert.equal(poll.stdout, 'done1');
+  assert.equal(poll.finished, true);
+  assert.equal(session._jobs.size, 2, 'a poll must not reserve a new launch slot');
+  await session._pruneJobs({ reserve: 1 });
+  assert.deepEqual([...session._jobs.keys()], [jobs[1].job]);
+  assert.equal(session._jobsInternal.size, 1);
+  assert.equal(existsSync(jobs[0].directory), false);
+  jobs[1].finishedAt = null;
+  const unfinished = { job: '3'.repeat(24), directory: await tempDir(), finishedAt: null };
+  session._jobs.set(unfinished.job, unfinished);
+  session._jobsInternal.add(unfinished);
+  await assert.rejects(session._pruneJobs({ reserve: 1 }), /unfinished jobs/);
+  await session._pruneJobs();
+  assert.equal(session._jobs.size, 2, 'poll pruning must not reject a full live-job map');
+  await manager.dispose();
+});
+
+test('registry availability awaits real runtime verification and fails closed', async () => {
+  const { manager } = await makeManager();
+  const registry = new SessionRegistry(manager);
+  let release;
+  manager.verify = () => new Promise((resolve) => { release = resolve; });
+  let settled = false;
+  const pending = registry._assertAvailable().finally(() => { settled = true; });
+  await Promise.resolve();
+  assert.equal(settled, false, 'cached structural status must not bypass verification');
+  release({ ...manager.status(), healthy: false, reason: 'external commands failed' });
+  await assert.rejects(pending, /external commands failed/);
+  await registry.dispose();
+  await manager.dispose();
+});
+
+test('dispose closes every live session, and tool registration owns its registry', { skip }, async (t) => {
+  const { manager } = await makeManager();
+  t.after(() => manager.dispose());
   const registry = new SessionRegistry(manager);
   await registry.open({ id: 'a' });
   await registry.open({ id: 'b' });

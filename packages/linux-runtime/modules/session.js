@@ -9,6 +9,7 @@ const DEFAULT_MAX_SESSIONS = 8;
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 const DEFAULT_MAX_JOB_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_JOBS = 16;
+const DEFAULT_MAX_QUEUED_RUNS = 64;
 const DEFAULT_JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 600_000;
 const CLOSE_SETTLE_MS = 2_000;
@@ -142,8 +143,21 @@ function assertJobId(value) {
   return value;
 }
 
+/**
+ * A queued command that never ran because the session closed must not look like
+ * a command failure: the caller needs to know the install aborted its work.
+ */
+function sessionClosedError(id) {
+  const error = new Error(
+    'session ' + id + ' was closed; the queued command was aborted before it ran',
+  );
+  error.name = 'AbortError';
+  error.code = 'ERR_SESSION_CLOSED';
+  return error;
+}
+
 function appendBounded(buffer, text, limit) {
-  if (buffer.truncated) return;
+  if (buffer.truncated || text.length === 0) return;
   const remaining = limit - Buffer.byteLength(buffer.value);
   if (remaining <= 0) {
     buffer.truncated = true;
@@ -154,7 +168,11 @@ function appendBounded(buffer, text, limit) {
     buffer.value += text;
     return;
   }
-  buffer.value += bytes.subarray(0, remaining).toString('utf8');
+  // Do not turn a partial UTF-8 character into a replacement character whose
+  // encoded size can exceed the byte budget.
+  let end = remaining;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  buffer.value += bytes.subarray(0, end).toString('utf8');
   buffer.truncated = true;
 }
 
@@ -295,6 +313,44 @@ export class SessionProtocolParser {
     this.current = null;
     return current;
   }
+
+  /**
+   * Everything the parser has interpreted so far, without ending the command.
+   * A timeout closes the session mid-body, and the already parsed prefix is the
+   * only diagnostic the caller has left. The body tail still buffered for
+   * marker detection is appended for the same reason.
+   */
+  snapshot() {
+    const current = {
+      stdout: { ...(this.current?.stdout ?? { value: '', truncated: false }) },
+      stderr: { ...(this.current?.stderr ?? { value: '', truncated: false }) },
+      exitCode: this.current?.exitCode ?? null,
+      cwd: this.current?.cwd ?? null,
+    };
+    if (this.phase === 'body' && this.buffer.length > 0) {
+      // Only this command's END frame is protocol data. Marker-like text from
+      // the command is still output; a snapshot must not consume or duplicate it.
+      let end = this.buffer.indexOf(this.endPrefix);
+      if (end < 0) {
+        end = this.buffer.length;
+        for (let size = Math.min(this.buffer.length, this.endPrefix.length - 1); size > 0; size -= 1) {
+          if (this.buffer.endsWith(this.endPrefix.slice(0, size))) {
+            end -= size;
+            break;
+          }
+        }
+      }
+      appendBounded(current.stdout, this.buffer.slice(0, end), this.limit);
+    }
+    return {
+      stdout: current.stdout.value,
+      stderr: current.stderr.value,
+      exitCode: Number.isInteger(current.exitCode) ? current.exitCode : null,
+      cwd: current.cwd ?? null,
+      stdoutTruncated: current.stdout.truncated,
+      stderrTruncated: current.stderr.truncated,
+    };
+  }
 }
 
 function readyFrame(nonce) {
@@ -346,14 +402,20 @@ export class PersistentSession {
     this.maxOutputBytes = options.maxOutputBytes || DEFAULT_MAX_OUTPUT_BYTES;
     this.maxJobBytes = options.maxJobBytes || DEFAULT_MAX_JOB_BYTES;
     this.maxJobs = options.maxJobs || DEFAULT_MAX_JOBS;
+    this.maxQueuedRuns = options.maxQueuedRuns || DEFAULT_MAX_QUEUED_RUNS;
     this.jobRetentionMs = options.jobRetentionMs || DEFAULT_JOB_RETENTION_MS;
     this.onExit = options.onExit;
     this.closed = false;
+    this._closeRequested = false;
     this.exit = undefined;
     this._exitPromise = new Promise((resolve) => {
       this._resolveExit = resolve;
     });
     this._queue = Promise.resolve();
+    // One abort hook per admitted but not yet started run, so close() can reject
+    // the queue at once instead of letting each task discover the dead shell.
+    this._queueAborts = new Set();
+    this._queued = 0;
     this._pending = null;
     this._child = null;
     this._killTimer = undefined;
@@ -368,11 +430,11 @@ export class PersistentSession {
     this._sharedPaths = [];
     this._jobs = new Map();
     this._jobsInternal = new Set();
-    this._jobSequence = 0;
+    this._jobStartQueue = Promise.resolve();
   }
 
   get running() {
-    return !this.closed && Number.isInteger(this._child?.pid);
+    return !this.closed && !this._closeRequested && Number.isInteger(this._child?.pid);
   }
 
   get pid() {
@@ -411,7 +473,7 @@ export class PersistentSession {
   }
 
   async open(paths, cwdInfo) {
-    if (this.closed) throw new Error(`session ${this.id} is closed`);
+    if (this.closed || this._closeRequested) throw sessionClosedError(this.id);
     if (this.manager.disposed || this.manager.gate.exclusive || this.manager.gate.pendingExclusive > 0) {
       throw new Error('Linux runtime is busy with a management operation; session was not opened');
     }
@@ -439,7 +501,7 @@ export class PersistentSession {
     // without touching another live session's outputs.
     const root = this.jobRoot();
     if (root) await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
-    if (this.closed) throw new Error(`session ${this.id} is closed`);
+    if (this.closed || this._closeRequested) throw sessionClosedError(this.id);
     const nonce = randomBytes(12).toString('hex');
     this._parser = new SessionProtocolParser(this.maxOutputBytes, nonce);
     const environment = this.manager._executionEnvironment(paths, cwdInfo);
@@ -584,6 +646,9 @@ export class PersistentSession {
   _finish(extra = {}) {
     if (this.closed) return;
     this.closed = true;
+    // Every closure path (timeout, dispose drain, explicit close, shell death)
+    // lands here, so queued commands are rejected once and immediately.
+    this._abortQueuedRuns();
     this.exit = extra;
     if (this._killTimer) clearTimeout(this._killTimer);
     this._killTimer = undefined;
@@ -599,22 +664,19 @@ export class PersistentSession {
     this._pending = null;
     if (pending) {
       if (pending.timer) clearTimeout(pending.timer);
-      const partial = this._parser?.current;
-      if (partial && this._parser.phase === 'body') {
-        appendBounded(partial.stdout, this._parser.buffer, this.maxOutputBytes);
-      }
+      const partial = this._parser?.snapshot();
       this._parser = null;
       pending.resolve({
-        stdout: partial?.stdout.value ?? '',
-        stderr: [partial?.stderr.value, Number.isInteger(extra.exitCode) ? '' : 'session exited before the command completed']
+        stdout: partial?.stdout ?? '',
+        stderr: [partial?.stderr, Number.isInteger(extra.exitCode) ? '' : 'session exited before the command completed']
           .filter(Boolean)
           .join('\n'),
         exitCode: Number.isInteger(extra.exitCode) ? extra.exitCode : null,
         signal: extra.signal ?? null,
         timedOut: Boolean(pending.timedOut),
         sessionClosed: true,
-        stdoutTruncated: partial?.stdout.truncated ?? false,
-        stderrTruncated: partial?.stderr.truncated ?? false,
+        stdoutTruncated: partial?.stdoutTruncated ?? false,
+        stderrTruncated: partial?.stderrTruncated ?? false,
         cwd: this._cwd,
         session: this.id,
         running: false,
@@ -650,13 +712,61 @@ export class PersistentSession {
     if (typeof command !== 'string' || command.trim() === '') {
       throw new TypeError('command must be a non-empty string');
     }
-    const task = this._queue.then(() => this._run(command, cwd, timeoutMs));
+    if (this.closed || this._closeRequested) return Promise.reject(sessionClosedError(this.id));
+    const maxQueued = Number.isInteger(this.maxQueuedRuns) && this.maxQueuedRuns > 0
+      ? this.maxQueuedRuns
+      : DEFAULT_MAX_QUEUED_RUNS;
+    if (this._queued >= maxQueued) {
+      return Promise.reject(
+        new Error(
+          'session ' + this.id + ' already has ' + this._queued + ' queued commands; wait for the running one before queueing more',
+        ),
+      );
+    }
+    this._queued += 1;
+    let aborted = false;
+    let abort;
+    const rejection = new Promise((_resolve, reject) => {
+      abort = reject;
+    });
+    // The queued run must not become an unhandled rejection before it is awaited.
+    rejection.catch(() => undefined);
+    const admit = () => {
+      // An aborted run must never reach the shell afterwards: the session is
+      // gone, and its rejection would be unobserved.
+      if (aborted) return undefined;
+      this._queueAborts.delete(hook);
+      this._queued -= 1;
+      return this._run(command, cwd, timeoutMs);
+    };
+    const hook = (error) => {
+      aborted = true;
+      abort(error);
+    };
+    this._queueAborts.add(hook);
+    const task = Promise.race([this._queue.then(admit), rejection]);
     this._queue = task.catch(() => undefined);
     return task;
   }
 
+  /**
+   * Reject every run that was queued but had not started. Their replies are
+   * AbortError/ERR_SESSION_CLOSED, not "session is not running": a management
+   * operation closed the session, and the caller must see that abort instead of
+   * a shell symptom that looks like a command failure.
+   */
+  _abortQueuedRuns() {
+    if (this._queueAborts.size === 0) return;
+    const aborts = [...this._queueAborts];
+    this._queueAborts.clear();
+    this._queued = Math.max(0, this._queued - aborts.length);
+    for (const abort of aborts) abort(sessionClosedError(this.id));
+    this._queue = Promise.resolve();
+  }
+
   async _run(command, cwd, timeoutMs) {
-    if (this.closed || !this._child) throw new Error(`session ${this.id} is not running`);
+    if (this.closed || this._closeRequested) throw sessionClosedError(this.id);
+    if (!this._child) throw new Error(`session ${this.id} is not running`);
     if (this._pending) throw new Error(`session ${this.id} is busy`);
     const marker = this._frameMarker(command);
     const nonce = marker.slice(MARKER.length);
@@ -680,16 +790,28 @@ export class PersistentSession {
         const timedOut = this._pending;
         this._pending = null;
         if (timedOut?.timer) clearTimeout(timedOut.timer);
+        // Capture what the command already produced before close() tears the
+        // shell down. A stuck long build's partial log is the only diagnostic
+        // the caller gets, so an empty stdout here was a real data loss.
+        const partial = this._parser?.snapshot() ?? {
+          stdout: '',
+          stderr: '',
+          exitCode: null,
+          cwd: null,
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        };
+        const note = `command timed out after ${timeout} ms; the session was closed`;
         void this.close({ timedOut: true }).then(() => {
           finish({
-            stdout: '',
-            stderr: `command timed out after ${timeout} ms; the session was closed`,
+            stdout: partial.stdout,
+            stderr: [partial.stderr, note].filter(Boolean).join('\n'),
             exitCode: null,
             signal: null,
             timedOut: true,
             sessionClosed: true,
-            stdoutTruncated: false,
-            stderrTruncated: false,
+            stdoutTruncated: partial.stdoutTruncated,
+            stderrTruncated: partial.stderrTruncated,
             cwd: this._cwd,
             session: this.id,
             running: false,
@@ -713,18 +835,32 @@ export class PersistentSession {
    * or environment. Output is kept in a bounded log so poll() can return new
    * bytes without replaying the whole build.
    */
-  async startJob({ command, cwd } = {}) {
+  startJob(options = {}) {
+    // Serialize admission, not execution: concurrent callers must not all see
+    // the same free slot before their asynchronous launch frames complete.
+    const task = this._jobStartQueue.then(() => this._startJob(options));
+    this._jobStartQueue = task.catch(() => undefined);
+    return task;
+  }
+
+  async _startJob({ command, cwd } = {}) {
     if (typeof command !== 'string' || command.trim() === '') {
       throw new TypeError('command must be a non-empty string');
     }
-    if (this.closed) throw new Error(`session ${this.id} is not running`);
+    if (this.closed || this._closeRequested) throw sessionClosedError(this.id);
     const root = this.jobRoot();
     if (!root) throw new Error('session has no guest rootfs to store job output');
-    await this._pruneJobs();
+    await this._pruneJobs({ reserve: 1 });
+    if (this.closed || this._closeRequested) throw sessionClosedError(this.id);
     const job = randomBytes(12).toString('hex');
     const directory = path.join(root, job);
-    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-    await fs.writeFile(path.join(directory, 'command.sh'), command + '\n', { mode: 0o700 });
+    try {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(directory, 'command.sh'), command + '\n', { mode: 0o700 });
+    } catch (error) {
+      await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
     const guestDir = this._shellPath(directory);
     const logLimit = Number.isFinite(this.maxJobBytes) && this.maxJobBytes > 0 ? this.maxJobBytes : DEFAULT_MAX_JOB_BYTES;
     const scope = 'session-' + this.id + ':' + job;
@@ -750,12 +886,13 @@ export class PersistentSession {
       ' setsid bash -c ' + shellQuote(inner) + '; else exec env ' + JOB_SCOPE_ENV + '=' + shellQuote(scope) +
       ' bash -c ' + shellQuote(inner) + '; fi';
     const launch = [
+      // Isolate launch-only cd/exit from the persistent session shell.
+      process.platform === 'win32' ? '( set -m;' : '( set +m;',
       cwd ? 'cd -- ' + shellQuote(cwd) + ' || exit 125' : '',
-      'mkdir -p ' + shellQuote(guestDir),
+      'mkdir -p ' + shellQuote(guestDir) + ' || exit 125',
       // Job control gives the job its own process group, including descendants
       // that clear their environment (for example `env -i`). Without it a
       // non-interactive shell leaves the job in the session shell's group.
-      process.platform === 'win32' ? '( set -m;' : '( set +m;',
       '  ( ' + supervisor + ' ) > ' + output + ' 2>&1 </dev/null &',
       '  __bionilux_job_pid=$!',
       '  printf "%s\\n" "$__bionilux_job_pid" > ' + shellQuote(guestDir + '/pid'),
@@ -766,23 +903,11 @@ export class PersistentSession {
     ]
       .filter(Boolean)
       .join('\n');
-    const result = await this.run({ command: launch });
-    const pid = await fs.readFile(path.join(directory, 'pid'), 'utf8').then(
-      (value) => Number.parseInt(value.trim(), 10),
-      () => null,
-    );
-    const start = PROC_SCOPES && Number.isInteger(pid)
-      ? await fs.readFile(`/proc/${pid}/stat`, 'utf8').then(procStarttime, () => null)
-      : null;
-    const winpid = await fs.readFile(path.join(directory, 'winpid'), 'utf8').then(
-      (value) => Number.parseInt(value.trim(), 10),
-      () => null,
-    );
     const jobInfo = {
       job,
-      pid: Number.isInteger(pid) ? pid : null,
-      start,
-      winpid: Number.isInteger(winpid) && winpid > 0 ? winpid : null,
+      pid: null,
+      start: null,
+      winpid: null,
       scope,
       offset: 0,
       size: 0,
@@ -791,23 +916,50 @@ export class PersistentSession {
       exitCode: null,
       finishedAt: null,
     };
+    // Track before the launch frame: shutdown must also see in-flight starts.
     this._jobsInternal.add(jobInfo);
-    if (result.exitCode !== 0) {
-      await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
-      throw new Error(result.stderr.trim() || `session ${this.id} could not start the job (exit ${result.exitCode})`);
-    }
-    this._jobs.set(job, jobInfo);
-    return {
-      session: this.id,
-      job,
-      pid: jobInfo.pid,
-      running: true,
-      launchExitCode: result.exitCode,
-      launchStderr: result.stderr,
+    const readIdentity = async () => {
+      const pid = await fs.readFile(path.join(directory, 'pid'), 'utf8').then(
+        (value) => Number.parseInt(value.trim(), 10), () => null,
+      );
+      jobInfo.pid = Number.isInteger(pid) && pid > 0 ? pid : null;
+      jobInfo.start = PROC_SCOPES && jobInfo.pid
+        ? await fs.readFile(`/proc/${jobInfo.pid}/stat`, 'utf8').then(procStarttime, () => null)
+        : null;
+      const winpid = await fs.readFile(path.join(directory, 'winpid'), 'utf8').then(
+        (value) => Number.parseInt(value.trim(), 10), () => null,
+      );
+      jobInfo.winpid = Number.isInteger(winpid) && winpid > 0 ? winpid : null;
     };
+    try {
+      const result = await this.run({ command: launch });
+      await readIdentity();
+      if (result.exitCode !== 0) {
+        throw new Error(result.stderr.trim() || `session ${this.id} could not start the job (exit ${result.exitCode})`);
+      }
+      if (this.closed || this._closeRequested) throw sessionClosedError(this.id);
+      this._jobs.set(job, jobInfo);
+      return {
+        session: this.id,
+        job,
+        pid: jobInfo.pid,
+        running: true,
+        launchExitCode: result.exitCode,
+        launchStderr: result.stderr,
+      };
+    } catch (error) {
+      // run() can reject before a frame is admitted too. Never leak its files or
+      // bookkeeping; stop any producer that did start before discarding identity.
+      await readIdentity();
+      await this._stopJobs([jobInfo]);
+      this._jobs.delete(job);
+      this._jobsInternal.delete(jobInfo);
+      await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
   }
 
-  async _pruneJobs() {
+  async _pruneJobs({ reserve = 0 } = {}) {
     const maxJobs = Number.isInteger(this.maxJobs) && this.maxJobs > 0 ? this.maxJobs : DEFAULT_MAX_JOBS;
     const retention = Number.isFinite(this.jobRetentionMs) && this.jobRetentionMs > 0
       ? this.jobRetentionMs
@@ -821,16 +973,23 @@ export class PersistentSession {
       if (now - job.finishedAt >= retention) remove.push(job);
     }
     const keep = this._jobs.size - remove.length;
-    if (keep > maxJobs) {
-      const excess = keep - maxJobs + 1;
-      remove.push(...finished.filter((job) => !remove.includes(job)).slice(0, excess));
+    const target = Math.max(0, maxJobs - reserve);
+    if (keep > target) {
+      // Polling retains up to the limit; only a start reserves one new slot.
+      const excess = keep - target;
+      const candidates = finished.filter((job) => !remove.includes(job));
+      // Oldest observed completions go first; do not discard an extra log
+      // merely because the caller is polling at the capacity limit.
+      remove.push(...candidates.slice(0, excess));
     }
     for (const job of remove) {
+      // Keep the internal set in step with the public map on every removal
+      // branch: _stopJobs() iterates the set with the same objects.
       this._jobs.delete(job.job);
       this._jobsInternal.delete(job);
       await fs.rm(job.directory, { recursive: true, force: true }).catch(() => undefined);
     }
-    if (this._jobs.size >= maxJobs) {
+    if (reserve > 0 && this._jobs.size + reserve > maxJobs) {
       throw new Error(`session ${this.id} has ${this._jobs.size} unfinished jobs; poll or close them before starting another`);
     }
   }
@@ -895,7 +1054,10 @@ export class PersistentSession {
     // Closing is idempotent and must settle once even when dispose, timeout and
     // the manager drain race each other. A bare `exit 0` would kill the job
     // supervisor before its producer, leaving reparented descendants behind.
-    this._closing ??= this._close(options);
+    // Set this before the first await in shutdown: even a slow job drain must
+    // not admit new commands or launches into the closing shell.
+    this._closeRequested = true;
+    this._closing = this._close(options);
     return this._closing;
   }
 
@@ -945,8 +1107,7 @@ export class PersistentSession {
     }
   }
 
-  async _stopJobs() {
-    const jobs = [...this._jobsInternal];
+  async _stopJobs(jobs = [...this._jobsInternal]) {
     if (!jobs.length) return;
     if (process.platform === 'win32') {
       for (const job of jobs) {
@@ -1022,6 +1183,9 @@ export class PersistentSession {
   }
 
   async _close(options) {
+    // Abort queued commands before the slow job/child shutdown, so callers stop
+    // waiting on work that can no longer run.
+    this._abortQueuedRuns();
     await this._stopJobs();
     const child = this._child;
     if (!child) {
@@ -1073,9 +1237,12 @@ export class SessionRegistry {
     this.disposed = false;
   }
 
-  _assertAvailable() {
+  async _assertAvailable() {
     if (this.disposed || this.manager.disposed) throw new Error('Linux runtime sessions are disposed');
-    const status = this.manager.status();
+    const status = typeof this.manager.verify === 'function'
+      ? await this.manager.verify()
+      : this.manager.status();
+    if (this.disposed || this.manager.disposed) throw new Error('Linux runtime sessions are disposed');
     if (!status.healthy) throw new Error(`Linux runtime is unavailable: ${status.reason ?? 'unhealthy'}`);
     if (this.manager.gate.exclusive || this.manager.gate.pendingExclusive > 0) {
       throw new Error('Linux runtime is busy with a management operation');
@@ -1110,7 +1277,7 @@ export class SessionRegistry {
   }
 
   async open({ id, cwd, sharedPaths = [] } = {}) {
-    const status = this._assertAvailable();
+    const status = await this._assertAvailable();
     const name = this._name(id);
     const existing = this.sessions.get(name);
     if (existing && existing.running) {
@@ -1146,7 +1313,7 @@ export class SessionRegistry {
   }
 
   async _session(id, { cwd, sharedPaths = [] } = {}) {
-    const status = this._assertAvailable();
+    const status = await this._assertAvailable();
     const name = assertSessionId(id);
     let session = this.sessions.get(name);
     if (!session || !session.running) {

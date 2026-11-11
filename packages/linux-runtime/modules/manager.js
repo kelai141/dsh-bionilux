@@ -16,6 +16,7 @@ import {
   statSync,
 } from 'node:fs';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { defaultRuntimeIdForArch, resolveHostArchitecture, selectRuntime } from './manifest.js';
 import { assertOfficialAssetUrl, isAllowedAssetOrigin } from './asset-installer.js';
 import { ProcessScope } from './process-scope.js';
@@ -27,6 +28,12 @@ const DEFAULT_GUEST_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 const SIGTERM_GRACE_MS = 2_000;
 const STOP_SETTLE_MS = 2_000;
 const FORCE_KILL_SETTLE_MS = 1_000;
+/** Upper bound for the one real execution that proves the runtime works. */
+const PROBE_TIMEOUT_MS = 60_000;
+const PROBE_CACHE_MS = 30_000;
+const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+/** Printed by the probe command; unrelated output must not count as success. */
+const PROBE_MARKER = 'bionilux-runtime-probe-ok';
 const HOST_SCRIPT_INTERPRETER =
   process.platform === 'android' && existsSync('/system/bin/sh') ? '/system/bin/sh' : 'sh';
 const ROOTFS_REQUIRED_FILES = [
@@ -445,6 +452,30 @@ function inspectRootfsObject(rootfs, relative) {
   }
 }
 
+function boundedOutput(limit) {
+  const buffer = Buffer.allocUnsafe(limit);
+  let size = 0;
+  return {
+    truncated: false,
+    append(chunk) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const count = Math.min(bytes.length, limit - size);
+      bytes.copy(buffer, size, 0, count);
+      size += count;
+      if (count < bytes.length) this.truncated = true;
+    },
+    // Do not flush an incomplete UTF-8 suffix into a replacement character:
+    // that could exceed the byte cap. Complete characters survive chunk splits.
+    text() {
+      const decoded = new StringDecoder('utf8').write(buffer.subarray(0, size));
+      const encoded = Buffer.from(decoded);
+      if (encoded.length <= limit) return decoded;
+      this.truncated = true; // Invalid byte sequences expanded during decoding.
+      return new StringDecoder('utf8').write(encoded.subarray(0, limit));
+    },
+  };
+}
+
 function normaliseCommandResult(result) {
   const value = isObject(result) ? result : {};
   const exitCode = Number.isInteger(value.exitCode)
@@ -458,6 +489,8 @@ function normaliseCommandResult(result) {
     exitCode,
     signal: value.signal == null ? null : String(value.signal),
     timedOut: Boolean(value.timedOut),
+    stdoutTruncated: Boolean(value.stdoutTruncated),
+    stderrTruncated: Boolean(value.stderrTruncated),
   };
 }
 
@@ -484,6 +517,10 @@ function normaliseRunnerResult(raw) {
  * adapters and tests can use the same termination contract as the manager.
  */
 export function spawnCommand(spec) {
+  const maxOutputBytes = spec.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {
+    throw new TypeError('maxOutputBytes must be a positive safe integer');
+  }
   const detached = process.platform !== 'win32';
   const child = spawn(spec.file, spec.args ?? [], {
     cwd: spec.cwd,
@@ -492,16 +529,12 @@ export function spawnCommand(spec) {
     detached,
     windowsHide: true,
   });
-  let stdout = '';
-  let stderr = '';
-  child.stdout?.setEncoding('utf8');
-  child.stderr?.setEncoding('utf8');
-  child.stdout?.on('data', (chunk) => {
-    stdout += chunk;
-  });
-  child.stderr?.on('data', (chunk) => {
-    stderr += chunk;
-  });
+  // Drain both pipes even after reaching the per-stream cap, so a verbose
+  // guest cannot grow host memory or block forever on a full pipe.
+  const stdout = boundedOutput(maxOutputBytes);
+  const stderr = boundedOutput(maxOutputBytes);
+  child.stdout?.on('data', (chunk) => stdout.append(chunk));
+  child.stderr?.on('data', (chunk) => stderr.append(chunk));
 
   let timer;
   let killTimer;
@@ -561,7 +594,10 @@ export function spawnCommand(spec) {
     child.once('close', (code, signal) => {
       if (settled) return;
       cleanup();
-      resolve({ stdout, stderr, exitCode: code, signal, timedOut });
+      resolve({
+        stdout: stdout.text(), stderr: stderr.text(), exitCode: code, signal, timedOut,
+        stdoutTruncated: stdout.truncated, stderrTruncated: stderr.truncated,
+      });
     });
   });
   return { promise, cancel: terminate, forceKill, child };
@@ -728,10 +764,17 @@ export class LinuxRuntimeManager {
     // The host app passes ApplicationInfo.nativeLibraryDir here. It is the only
     // directory an app process may execute on targetSdk >= 29, so the launcher
     // and its glibc loader can be started from it when app data cannot.
-    if (options.nativeLibDir !== undefined && typeof options.nativeLibDir !== 'string') {
-      throw new TypeError('nativeLibDir must be a string');
+    const nativeLibDir = options.nativeLibDir ?? process.env.DSH_NATIVE_LIB_DIR ?? '';
+    if (typeof nativeLibDir !== 'string' || nativeLibDir.includes('\0') ||
+      (nativeLibDir !== '' && !path.isAbsolute(nativeLibDir))) {
+      throw new TypeError('nativeLibDir must be an absolute directory path or empty');
     }
-    this.nativeLibDir = options.nativeLibDir ?? '';
+    this.nativeLibDir = nativeLibDir;
+    const probeTimeoutMs = options.probeTimeoutMs ?? PROBE_TIMEOUT_MS;
+    if (!Number.isSafeInteger(probeTimeoutMs) || probeTimeoutMs < 1 || probeTimeoutMs > 120_000) {
+      throw new TypeError('probeTimeoutMs must be an integer between 1 and 120000');
+    }
+    this.probeTimeoutMs = probeTimeoutMs;
     if (options.dnsServers !== undefined && !Array.isArray(options.dnsServers)) {
       throw new TypeError('dnsServers must be an array of IP addresses');
     }
@@ -952,6 +995,16 @@ export class LinuxRuntimeManager {
     };
   }
 
+  _probeKey(record, paths) {
+    const files = [paths.launcher, paths.preload, path.join(paths.node, 'bin', 'node'),
+      ...ROOTFS_REQUIRED_FILES.map((relative) => resolveRootfsTarget(paths.rootfs, path.join(paths.rootfs, relative)))];
+    const identities = files.map((file) => {
+      const stat = statSync(file, { bigint: true });
+      return [String(stat.dev), String(stat.ino), String(stat.size), String(stat.mtimeNs), String(stat.ctimeNs)];
+    });
+    return JSON.stringify([record.instanceId, record.nodeKey ?? record.nodeVersion, paths.nativeLibDir, identities]);
+  }
+
   status() {
     if (this.disposed) {
       return Object.freeze({ healthy: false, installed: false, state: 'disposed', reason: 'manager is disposed' });
@@ -977,11 +1030,21 @@ export class LinuxRuntimeManager {
     }
     const record = validation.record;
     const health = this._healthForRecord(record);
+    let verdict;
+    if (health.healthy) {
+      try {
+        if (this._probeVerdict?.key === this._probeKey(record, health.paths)) verdict = this._probeVerdict;
+      } catch (error) {
+        health.healthy = false;
+        health.reason = `runtime changed during inspection: ${error.message}`;
+      }
+    }
+    const healthy = health.healthy && verdict?.ok === true;
     return Object.freeze({
-      healthy: health.healthy,
+      healthy,
       installed: true,
-      state: health.healthy ? 'healthy' : 'unhealthy',
-      reason: health.reason,
+      state: healthy ? 'healthy' : health.healthy && !verdict ? 'unverified' : 'unhealthy',
+      reason: health.reason ?? (verdict ? verdict.reason : 'runtime has not been verified'),
       runtimeId: record.runtimeId,
       version: record.version,
       architecture: record.architecture,
@@ -999,6 +1062,84 @@ export class LinuxRuntimeManager {
       // State observers cannot break installation or execution.
     }
     return state;
+  }
+
+  /** Prove bash itself, child-process rerouting and the shared Node all work. */
+  async _probeRuntime(paths, { timeoutMs = this.probeTimeoutMs } = {}) {
+    const command = [
+      'set -e',
+      '[ -n "$BASH_VERSION" ]',
+      '[ "$(/usr/bin/id -u)" = 0 ]',
+      '/usr/bin/uname -m >/dev/null',
+      '/usr/bin/ls / >/dev/null',
+      'node --version >/dev/null',
+      "printf '%s\n' '" + PROBE_MARKER + "'",
+    ].join('; ');
+    const start = launchArgv(paths.launcher, ['/bin/bash', '--noprofile', '--norc', '-c', command]);
+    const environment = this._executionEnvironment(paths, { guestCwd: '/', hostPaths: [] });
+    try {
+      const result = normaliseCommandResult(await this._runManaged({
+        file: start.file, args: start.args, cwd: this.dataDir, env: environment,
+        timeout: timeoutMs, maxOutputBytes: 16 * 1024,
+      }));
+      if (result.timedOut) return { ok: false, reason: 'runtime probe timed out after ' + timeoutMs + ' ms: ' +
+        (firstLine(result.stderr) || firstLine(result.stdout)) };
+      if (result.exitCode !== 0) {
+        return { ok: false, reason: 'runtime probe failed (exit ' + result.exitCode + '): ' +
+          (firstLine(result.stderr) || firstLine(result.stdout)) };
+      }
+      if (result.stdout.trim() !== PROBE_MARKER || result.stdoutTruncated || result.stderrTruncated) {
+        return { ok: false, reason: 'runtime probe did not produce the expected marker: ' + firstLine(result.stdout) };
+      }
+      return { ok: true };
+    } catch (error) {
+      // Missing launcher/interpreter, permission denial and every spawn error
+      // are runtime failures, never a special test-mode success.
+      return { ok: false, reason: 'runtime probe could not start: ' + (error.code ?? error.message) };
+    }
+  }
+
+  /** Caller holds a shared (verify/execute) or exclusive (install) permit. */
+  async _verifyLocked({ force = false } = {}) {
+    const state = this.status();
+    const record = this._readActive();
+    if (!record || !state.paths) return state;
+    const health = this._healthForRecord(record);
+    if (!health.healthy) return this.status();
+    const key = this._probeKey(record, health.paths);
+    if (!force && this._probeVerdict?.key === key && Date.now() - this._probeVerdict.checkedAt < PROBE_CACHE_MS) {
+      return state;
+    }
+    if (!this._probePending || this._probePending.key !== key) {
+      const promise = (async () => {
+        const verdict = await this._probeRuntime(health.paths);
+        // Do not publish a verdict about files changed during the probe.
+        if (key === this._probeKey(record, health.paths)) {
+          this._probeVerdict = { key, checkedAt: Date.now(), ...verdict };
+          this._emitState();
+        }
+      })();
+      this._probePending = { key, promise };
+      promise.finally(() => {
+        if (this._probePending?.promise === promise) this._probePending = undefined;
+      }).catch(() => undefined);
+    }
+    await this._probePending.promise;
+    return this.status();
+  }
+
+  /** Refresh the cached execution proof without racing runtime replacement. */
+  async verify(options = {}) {
+    for (;;) {
+      await this.gate.acquireShared();
+      if (!this.gate.managementPending) break;
+      this.gate.releaseShared();
+    }
+    try {
+      return await this._verifyLocked(options);
+    } finally {
+      this.gate.releaseShared();
+    }
   }
 
   /**
@@ -1037,10 +1178,100 @@ export class LinuxRuntimeManager {
 
   async _ensureDirectories() {
     const paths = this._paths();
-    await fs.mkdir(paths.instances, { recursive: true });
-    await fs.mkdir(paths.sharedNode, { recursive: true });
-    await fs.mkdir(paths.staging, { recursive: true });
-    await fs.mkdir(paths.deleting, { recursive: true });
+    await fs.mkdir(this.dataDir, { recursive: true });
+    // Never traverse a redirected managed directory during recovery/deletion.
+    for (const directory of [path.join(this.dataDir, 'shared'), paths.instances,
+      paths.sharedNode, paths.staging, paths.deleting]) {
+      try {
+        const stat = await fs.lstat(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('unsafe runtime directory: ' + directory);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        await fs.mkdir(directory);
+      }
+    }
+    if (!this._reconciled) {
+      await this._reconcileLeftovers();
+      // A failed recovery must be retried, not silently skipped forever.
+      this._reconciled = true;
+    }
+  }
+
+  /** Recover only owned debris, never guess ownership from a broken record. */
+  async _reconcileLeftovers() {
+    const paths = this._paths();
+    let active;
+    try {
+      await fs.lstat(paths.active);
+      active = this._readActive();
+      if (!active) throw new Error('refusing runtime recovery: active.json is unreadable or invalid');
+      assertSafeId(active.nodeKey ?? active.nodeVersion, 'active.nodeKey');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    // Restore a tree retired by a crash before reclaiming its staging parent.
+    for (const entry of await readDirectoryEntries(paths.staging)) {
+      const stage = path.join(paths.staging, entry.name);
+      if (entry.isDirectory()) await this._recoverNodeSwap(stage);
+      await removeTree(stage);
+    }
+    for (const entry of await readDirectoryEntries(paths.deleting)) {
+      const tombstone = path.join(paths.deleting, entry.name);
+      // uninstall renames the instance before removing active.json. If killed
+      // in that gap, it is still active and must be restored, not reclaimed.
+      if (active && entry.isDirectory() && !existsSync(this._instancePaths(active.instanceId).root)) {
+        const value = JSON.parse(await fs.readFile(path.join(tombstone, 'metadata.json'), 'utf8'));
+        if (value.instanceId === active.instanceId && this._validateActiveRecord(value).record) {
+          await fs.rename(tombstone, this._instancePaths(active.instanceId).root);
+          continue;
+        }
+      }
+      await removeTree(tombstone);
+    }
+    for (const entry of await readDirectoryEntries(paths.instances)) {
+      if (!entry.isDirectory() || entry.name === active?.instanceId) continue;
+      try {
+        const value = JSON.parse(await fs.readFile(path.join(paths.instances, entry.name, 'metadata.json'), 'utf8'));
+        // Only our completed/promoted single-active instances are disposable.
+        // Foreign, incomplete or unreadable directories are preserved and pin
+        // Node conservatively via _nodeReferencedByAnyInstance below.
+        if (!this._validateActiveRecord(value).record || value.instanceId !== entry.name) continue;
+        assertSafeId(value.nodeKey ?? value.nodeVersion, 'metadata.nodeKey');
+      } catch { continue; }
+      await removeTree(path.join(paths.instances, entry.name));
+    }
+    const activeKey = active?.nodeKey ?? active?.nodeVersion;
+    for (const entry of await readDirectoryEntries(paths.sharedNode)) {
+      if (entry.name === activeKey || !entry.isDirectory() || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(entry.name)) continue;
+      if (!this._nodeReferencedByAnyInstance(this._nodePath(entry.name))) {
+        await removeTree(this._nodeRoot(entry.name));
+      }
+    }
+  }
+
+  async _recoverNodeSwap(staging) {
+    const journal = path.join(staging, 'node-swap.json');
+    let raw;
+    try { raw = await fs.readFile(journal, 'utf8'); }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      if (existsSync(path.join(staging, 'node.retired'))) {
+        throw new Error('retired shared Node has no recovery journal; preserving staging');
+      }
+      return;
+    }
+    const value = JSON.parse(raw);
+    if (value.schemaVersion !== 1) throw new Error('invalid shared Node recovery journal');
+    const node = this._nodePath(value.nodeKey);
+    // A redirected content-addressed parent is not a recovery target.
+    const parent = await fs.lstat(path.dirname(node));
+    if (!parent.isDirectory() || parent.isSymbolicLink()) throw new Error('unsafe shared Node recovery directory');
+    const retired = path.join(staging, 'node.retired');
+    if (!existsSync(retired)) return;
+    if (this._readActive()?.instanceId === path.basename(staging) && this._nodeIsHealthy(node)) return;
+    // No proven active cutover: restore even a structurally valid replacement.
+    await removeTree(node);
+    await fs.rename(retired, node);
   }
 
   async _download(asset, destination) {
@@ -1227,20 +1458,41 @@ export class LinuxRuntimeManager {
   }
 
   async _ensureSharedNode(runtime, staging, activeRecord) {
-    const node = this._nodePath(nodeKeyFor(runtime));
+    const nodeKey = nodeKeyFor(runtime);
+    const node = this._nodePath(nodeKey);
     if (this._nodeIsHealthy(node)) return { node, created: false };
-    const hadBrokenNode = existsSync(node);
-    if (hadBrokenNode && activeRecord) await this._stopChildren();
-    if (hadBrokenNode) await removeTree(node);
     const nodeStage = path.join(staging, 'node');
     const archive = path.join(staging, 'node.archive');
     await this._materialize(runtime.nodeAsset, archive, nodeStage, 'node');
-    if (!this._nodeIsHealthy(nodeStage)) {
-      throw new Error('shared Linux Node archive is incomplete');
-    }
+    if (!this._nodeIsHealthy(nodeStage)) throw new Error('shared Linux Node archive is incomplete or invalid');
+    const hadBrokenNode = existsSync(node);
+    if (hadBrokenNode && activeRecord) await this._stopChildren();
+    const retired = path.join(staging, 'node.retired');
     await fs.mkdir(path.dirname(node), { recursive: true });
-    await fs.rename(nodeStage, node);
-    return { node, created: true };
+    const parent = await fs.lstat(path.dirname(node));
+    if (!parent.isDirectory() || parent.isSymbolicLink()) throw new Error('unsafe shared Node directory');
+    if (hadBrokenNode) {
+      // Persist the target identity before the first rename. Startup can put the
+      // retired tree back if this process dies in the two-rename gap.
+      await fs.writeFile(path.join(staging, 'node-swap.json'),
+        JSON.stringify({ schemaVersion: 1, nodeKey }), { flag: 'wx' });
+      await fs.rename(node, retired); // Never swallow a failed retirement.
+    }
+    try {
+      await fs.rename(nodeStage, node);
+    } catch (error) {
+      if (hadBrokenNode) {
+        try { await fs.rename(retired, node); }
+        catch (recoveryError) {
+          // Do not delete the only surviving copy from install's finally.
+          error.preserveStaging = true;
+          error.recoveryError = recoveryError;
+        }
+      }
+      throw error;
+    }
+    // Keep rollback until the entire runtime proves this Node can execute.
+    return { node, created: !hadBrokenNode, retired: hadBrokenNode ? retired : undefined };
   }
 
   async _prepareHostPaths(rootfs, directories) {
@@ -1260,7 +1512,9 @@ export class LinuxRuntimeManager {
   }
 
   _nodeIsHealthy(node) {
-    return fileExists(path.join(node, 'bin', 'node')) && directoryExists(path.join(node, 'lib', 'node_modules', 'npm'));
+    if (!executableFileExists(path.join(node, 'bin', 'node')) || !directoryExists(path.join(node, 'lib', 'node_modules', 'npm'))) return false;
+    try { assertElfArchitecture(path.join(node, 'bin', 'node'), this.arch); return true; }
+    catch { return false; }
   }
 
   async _writeActive(record) {
@@ -1279,15 +1533,26 @@ export class LinuxRuntimeManager {
     if (!record?.instanceId) return;
     const instance = this._instancePaths(record.instanceId).root;
     if (!pathIsWithin(this.dataDir, instance)) return;
-    await removeTree(instance);
+    // Ask before deleting: the retired instance's own metadata.json names the
+    // Node, so removing the directory first made the reference test answer
+    // "no references" for the very tree another instance might still use.
     const previousNodeKey = record.nodeKey ?? record.nodeVersion;
-    if (previousNodeKey && previousNodeKey !== keepNodeKey) {
-      const node = this._nodePath(previousNodeKey);
-      if (!this._nodeReferencedByAnyInstance(node)) await removeTree(this._nodeRoot(previousNodeKey));
+    const nodeStillReferenced = previousNodeKey && previousNodeKey !== keepNodeKey
+      ? this._nodeReferencedByAnyInstance(this._nodePath(previousNodeKey), record.instanceId)
+      : true;
+    await removeTree(instance);
+    if (previousNodeKey && previousNodeKey !== keepNodeKey && !nodeStillReferenced) {
+      await removeTree(this._nodeRoot(previousNodeKey));
     }
   }
 
-  _nodeReferencedByAnyInstance(node) {
+  /**
+   * Whether an instance other than `ignoreInstanceId` still names this Node.
+   *
+   * `ignoreInstanceId` exists because the caller may be about to delete that
+   * very directory: the question is what *survives* it, not what it says now.
+   */
+  _nodeReferencedByAnyInstance(node, ignoreInstanceId) {
     const instances = this._paths().instances;
     if (!directoryExists(instances)) return false;
     let entries;
@@ -1296,11 +1561,22 @@ export class LinuxRuntimeManager {
     } catch {
       return true;
     }
+    const active = this._readActive();
+    if (active && active.instanceId !== ignoreInstanceId) {
+      const key = active.nodeKey ?? active.nodeVersion;
+      try { if (path.resolve(this._nodePath(key)) === path.resolve(node)) return true; }
+      catch { return true; }
+    }
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory()) {
+        if (entry.isSymbolicLink()) return true;
+        continue;
+      }
+      if (ignoreInstanceId && entry.name === ignoreInstanceId) continue;
       const metadata = path.join(instances, entry.name, 'metadata.json');
       try {
         const value = JSON.parse(readFileSync(metadata, 'utf8'));
+        if (!this._validateActiveRecord(value).record) return true;
         const key = value.nodeKey ?? value.nodeVersion;
         if (key && path.resolve(this._nodePath(key)) === path.resolve(node)) return true;
       } catch {
@@ -1333,6 +1609,9 @@ export class LinuxRuntimeManager {
     const stagedInstance = path.join(staging, 'instance');
     const finalInstance = this._instancePaths(instanceId).root;
     let nodeCreated = false;
+    let retiredNode;
+    let activated = false;
+    let preserveStaging = false;
     let promoted = false;
     const nodeKey = nodeKeyFor(selection.runtime);
     try {
@@ -1344,6 +1623,7 @@ export class LinuxRuntimeManager {
       };
       const nodeResult = await this._ensureSharedNode(selection.runtime, staging, previous);
       nodeCreated = nodeResult.created;
+      retiredNode = nodeResult.retired;
       await this._materialize(
         selection.runtime.backendAsset,
         path.join(staging, 'backend.archive'),
@@ -1379,8 +1659,15 @@ export class LinuxRuntimeManager {
       await this._prepareAndroidRootfs(this._instancePaths(instanceId));
       const health = this._healthForRecord(record);
       if (!health.healthy) throw new Error(`staged runtime is unhealthy: ${health.reason}`);
+      // Static checks cannot tell a working runtime from one built out of an
+      // older tree. Run it once before it becomes the active runtime, so a
+      // broken install fails here instead of at the agent's first command.
+      const probe = await this._probeRuntime(health.paths);
+      if (!probe.ok) throw new Error(`staged runtime does not run: ${probe.reason}`);
       await this._stopChildren();
       await this._writeActive(record);
+      activated = true;
+      this._probeVerdict = { key: this._probeKey(record, health.paths), checkedAt: Date.now(), ...probe };
       if (previous && previous.instanceId !== record.instanceId) {
         // Cleanup of the retired instance is best effort: the new runtime is
         // already active, so a stale directory must not turn a successful
@@ -1389,6 +1676,16 @@ export class LinuxRuntimeManager {
       }
       return this._emitState();
     } catch (error) {
+      preserveStaging = Boolean(error.preserveStaging);
+      if (!activated && retiredNode) {
+        try {
+          await removeTree(this._nodePath(nodeKey));
+          await fs.rename(retiredNode, this._nodePath(nodeKey));
+        } catch (recoveryError) {
+          preserveStaging = true;
+          error.recoveryError = recoveryError;
+        }
+      }
       // A failure after promotion (for example an unhealthy staged tree) must
       // not leave an instance directory behind: its metadata would also pin the
       // shared Node as referenced forever.
@@ -1400,7 +1697,8 @@ export class LinuxRuntimeManager {
       }
       throw error;
     } finally {
-      await removeTree(staging).catch(() => undefined);
+      if (preserveStaging) this._reconciled = false;
+      else await removeTree(staging).catch(() => undefined);
     }
   }
 
@@ -1560,12 +1858,13 @@ export class LinuxRuntimeManager {
     }
     try {
       if (this.disposed) throw new Error('manager is disposed');
-      const current = this.status();
+      const current = await this._verifyLocked();
       if (!current.healthy) {
         throw new Error(`Linux runtime is unavailable: ${current.reason ?? 'unhealthy'}`);
       }
       const cwdInfo = this._resolveCwd(cwd, current.paths.rootfs, sharedPaths);
       await this._prepareHostPaths(current.paths.rootfs, cwdInfo.hostPaths);
+      if (this.gate.managementPending) throw new Error('Linux runtime is busy with a management operation; command was not started');
       const environment = this._executionEnvironment(current.paths, cwdInfo);
       const start = launchArgv(current.paths.launcher, ['/bin/bash', '-c', command]);
       const result = normaliseCommandResult(
@@ -1621,10 +1920,31 @@ function nodeKeyFor(runtime) {
   return `sha256-${sha256}`;
 }
 
+/** First non-empty line of `text`, for a one-line health reason. */
+function firstLine(text) {
+  const line = String(text ?? '').split('\n').map((value) => value.trim()).find(Boolean);
+  return line ? line.slice(0, 300) : '';
+}
+
 function requireDirectoryEntries(directory) {
   // The synchronous form keeps status/uninstall fail-closed without making
   // status() unexpectedly asynchronous.
   return readdirSync(directory, { withFileTypes: true });
+}
+
+/**
+ * Directory entries, or an empty list when the directory is absent.
+ *
+ * Used by startup reconciliation, where a missing directory means "nothing to
+ * reclaim" rather than an error worth failing the install over.
+ */
+async function readDirectoryEntries(directory) {
+  try {
+    return await fs.readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return [];
+    throw error;
+  }
 }
 
 export function createManager(options) {
