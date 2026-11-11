@@ -399,6 +399,9 @@ export class PersistentSession {
   constructor(manager, options = {}) {
     this.manager = manager;
     this.id = assertSessionId(options.id);
+    // Public names are registry-local. Two conversations may both use 'build'
+    // against one rootfs, so disk ownership must identify this shell instance.
+    this._jobNamespace = this.id + '-' + randomBytes(12).toString('hex');
     this.maxOutputBytes = options.maxOutputBytes || DEFAULT_MAX_OUTPUT_BYTES;
     this.maxJobBytes = options.maxJobBytes || DEFAULT_MAX_JOB_BYTES;
     this.maxJobs = options.maxJobs || DEFAULT_MAX_JOBS;
@@ -443,7 +446,7 @@ export class PersistentSession {
 
   jobRoot() {
     if (!this._paths?.rootfs) return null;
-    return path.join(this._paths.rootfs, 'tmp', '.bionilux-sessions', this.id);
+    return path.join(this._paths.rootfs, 'tmp', '.bionilux-sessions', this._jobNamespace);
   }
 
   _shellPath(hostPath) {
@@ -497,8 +500,8 @@ export class PersistentSession {
       await this.manager._prepareHostPaths(paths.rootfs, cwdInfo.hostPaths);
     }
     this._cwd = cwdInfo.guestCwd;
-    // A session name is unique in the registry, so its job root can be reset
-    // without touching another live session's outputs.
+    // This shell instance alone owns this directory, even when another
+    // conversation uses the same public session name against the same rootfs.
     const root = this.jobRoot();
     if (root) await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
     if (this.closed || this._closeRequested) throw sessionClosedError(this.id);
@@ -510,15 +513,23 @@ export class PersistentSession {
         ? this.manager._sessionLaunch(paths)
         : { file: paths.launcher, args: ['/bin/bash', '--noprofile', '--norc', '-s'] };
     this._shellExecutable = launch.file;
+    const spawnOptions = {
+      cwd: this.manager.dataDir,
+      env: this.manager.processScope.environment(environment),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
+      windowsHide: true,
+    };
     let child;
     try {
-      child = spawn(launch.file, launch.args, {
-        cwd: this.manager.dataDir,
-        env: this.manager.processScope.environment(environment),
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: process.platform !== 'win32',
-        windowsHide: true,
-      });
+      // Host-path preparation and directory cleanup above yield. Management may
+      // have drained children meanwhile; no await may separate this admission
+      // check, spawn and registration below. A later drain will see this child.
+      if (this.closed || this._closeRequested) throw sessionClosedError(this.id);
+      if (this.manager.disposed || this.manager.gate.exclusive || this.manager.gate.pendingExclusive > 0) {
+        throw new Error('Linux runtime is busy with a management operation; session was not opened');
+      }
+      child = spawn(launch.file, launch.args, spawnOptions);
     } catch (error) {
       this._finish({ exitCode: null, signal: null, error });
       throw error;

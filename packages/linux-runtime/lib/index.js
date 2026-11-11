@@ -260,9 +260,6 @@ export function registerLinuxBash(ctx, manager, options = {}) {
           ...directories,
           timeoutMs,
         });
-        if (result.timedOut) {
-          throw new Error(`Command timed out after ${timeoutMs} ms; session ${String(args.session)} was closed.`);
-        }
         return {
           ...result,
           runtimeId: manager.status().runtimeId,
@@ -273,15 +270,16 @@ export function registerLinuxBash(ctx, manager, options = {}) {
         command: String(args.command ?? ''),
         ...directories,
         timeout: timeoutMs,
+        signal: exec?.signal,
       });
-      if (result.timedOut) {
-        throw new Error(`Command timed out after ${timeoutMs} ms inside the Linux environment.`);
-      }
       return {
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode ?? 1,
+        signal: result.signal ?? null,
         timedOut: result.timedOut,
+        stdoutTruncated: result.stdoutTruncated === true,
+        stderrTruncated: result.stderrTruncated === true,
         cwd: result.cwd,
         runtimeId: result.runtimeId,
         ...(options.metadata ?? {}),

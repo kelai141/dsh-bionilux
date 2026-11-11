@@ -1650,3 +1650,77 @@ test('mobile native library path defaults to engine environment with explicit ov
     else process.env.DSH_NATIVE_LIB_DIR = previous;
   }
 });
+
+for (const crash of ['node-swap', 'uninstall-rename']) {
+  test('cold verify restores interrupted ' + crash + ' without reinstalling', async () => {
+    const fixture = makeManifest();
+    const dataDir = tempDir();
+    const { manager: old } = makeManager(fixture, { dataDir });
+    const installed = await old.install(fixture.manifest);
+    const activeBefore = await readFile(old._paths().active, 'utf8');
+    await old.dispose();
+    let leftover;
+    if (crash === 'node-swap') {
+      const key = JSON.parse(activeBefore).nodeKey;
+      leftover = path.join(old._paths().staging, 'crashed-install');
+      await mkdir(leftover);
+      await writeFile(path.join(leftover, 'node-swap.json'), JSON.stringify({ schemaVersion: 1, nodeKey: key }));
+      await rename(installed.paths.node, path.join(leftover, 'node.retired'));
+    } else {
+      leftover = path.join(old._paths().deleting, 'crashed-uninstall');
+      await rename(installed.paths.instance, leftover);
+    }
+    const { manager, io, runner } = makeManager(fixture, { dataDir });
+    assert.equal(manager.status().healthy, false, 'crash fixture must require recovery');
+    let reconciles = 0;
+    const reconcile = manager._reconcileLeftovers.bind(manager);
+    manager._reconcileLeftovers = async () => {
+      assert.equal(manager.gate.exclusive, true, 'recovery must hold exclusive ownership');
+      assert.equal(manager.gate.active, 0, 'no shared verification permit may deadlock recovery');
+      reconciles += 1;
+      await reconcile();
+    };
+    try {
+      const [first, concurrent] = await Promise.all([manager.verify(), manager.verify()]);
+      assert.equal(first.healthy, true, first.reason);
+      assert.equal(concurrent.healthy, true, concurrent.reason);
+      assert.equal(first.instanceId, installed.instanceId);
+      assert.equal(await readFile(manager._paths().active, 'utf8'), activeBefore);
+      assert.equal(existsSync(leftover), false);
+      assert.equal(io.stats.downloads.length, 0, 'recovery must not reinstall or download');
+      assert.equal(reconciles, 1, 'concurrent cold verification must share one recovery');
+      assert.equal(runner.calls.filter(({ spec }) => isProbe(spec)).length, 1);
+      assert.equal((await manager.execute({ command: 'echo recovered' })).exitCode, 0);
+      await manager.verify({ force: true });
+      assert.equal(reconciles, 1, 'active execute/verify must not repeatedly reconcile');
+    } finally {
+      await manager.dispose();
+    }
+  });
+}
+
+test('cold execute recovers once and a failed startup recovery can be retried', async () => {
+  const fixture = makeManifest();
+  const dataDir = tempDir();
+  const { manager: old } = makeManager(fixture, { dataDir });
+  const installed = await old.install(fixture.manifest);
+  const activeBefore = await readFile(old._paths().active, 'utf8');
+  await old.dispose();
+  const tombstone = path.join(old._paths().deleting, 'cold-execute-uninstall');
+  await rename(installed.paths.instance, tombstone);
+  const { manager } = makeManager(fixture, { dataDir });
+  try {
+    await writeFile(manager._paths().active, '{invalid');
+    await assert.rejects(manager.verify(), /refusing runtime recovery/);
+    assert.notEqual(manager._reconciled, true);
+    assert.equal(manager.gate.exclusive, false, 'failed recovery must release exclusive ownership');
+    await writeFile(manager._paths().active, activeBefore);
+    const result = await manager.execute({ command: 'echo cold recovered' });
+    assert.equal(result.exitCode, 0);
+    assert.equal(manager.status().healthy, true);
+    assert.equal(existsSync(tombstone), false);
+    assert.equal(manager._reconciled, true);
+  } finally {
+    await manager.dispose();
+  }
+});

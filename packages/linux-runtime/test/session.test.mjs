@@ -208,6 +208,64 @@ test('snapshot output bounds preserve UTF-8 and distinguish a full prefix from t
   assert.equal(cut.snapshot().stdoutTruncated, true);
 });
 
+test('session startup rechecks management after deferred host-path preparation', async (t) => {
+  for (const state of ['pending', 'exclusive', 'disposed']) {
+    await t.test(state, async () => {
+      const { manager } = await makeManager();
+      const session = new PersistentSession(manager, { id: 'admission-' + state });
+      let prepared;
+      let release;
+      const entered = new Promise((resolve) => { prepared = resolve; });
+      const wait = new Promise((resolve) => { release = resolve; });
+      manager._prepareHostPaths = async () => { prepared(); await wait; };
+      // The launch must never reach spawn, even on a host without Bash.
+      manager._sessionLaunch = () => ({ file: path.join(manager.dataDir, 'must-not-spawn'), args: [] });
+      const opening = session.open(manager.status().paths, { guestCwd: '/', hostPaths: [] });
+      const rejected = assert.rejects(opening, /busy with a management operation/);
+      await entered;
+      assert.equal(session._child, null);
+      assert.equal(manager.children.size, 0, 'management drains before the preparation completes');
+      if (state === 'pending') manager.gate.pendingExclusive = 1;
+      if (state === 'exclusive') manager.gate.exclusive = true;
+      if (state === 'disposed') manager.disposed = true;
+      release();
+      await rejected;
+      assert.equal(session._child, null, 'a late open must not spawn after the management drain');
+      assert.equal(manager.children.size, 0);
+      await session.close();
+      await manager.dispose();
+    });
+  }
+});
+
+test('same-named sessions in separate registries never share or remove job files', { skip, timeout: 60_000 }, async (t) => {
+  const { manager } = await makeManager();
+  const first = new SessionRegistry(manager);
+  const second = new SessionRegistry(manager);
+  t.after(async () => { await first.dispose(); await second.dispose(); await manager.dispose(); });
+  const started = await first.start('build', { command: 'printf owned-by-first' });
+  const firstSession = first.sessions.get('build');
+  const firstRoot = firstSession.jobRoot();
+  const firstDirectory = firstSession._jobs.get(started.job).directory;
+  const commandFile = path.join(firstDirectory, 'command.sh');
+  const original = await readFile(commandFile, 'utf8');
+  await second.open({ id: 'build' });
+  const secondRoot = second.sessions.get('build').jobRoot();
+  assert.notEqual(secondRoot, firstRoot, 'registry-local names must not define shared disk ownership');
+  assert.equal(await readFile(commandFile, 'utf8'), original, 'opening the second shell must preserve the first job');
+  const secondDirectory = path.join(secondRoot, 'owned-by-second');
+  await mkdir(secondDirectory, { recursive: true });
+  await writeFile(path.join(secondDirectory, 'output.log'), 'second');
+  await second.close('build');
+  assert.equal(existsSync(secondRoot), false, 'close removes only the second shell namespace');
+  assert.equal(await readFile(commandFile, 'utf8'), original, 'closing the second shell must preserve the first job');
+  let result;
+  await waitFor(async () => { result = await first.poll('build', { job: started.job }); return result.finished; },
+    'the first job must remain pollable after the second shell closes', 30_000);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, 'owned-by-first');
+});
+
 test('a background job that exits immediately is not reported as running', { skip, timeout: 60_000 }, async (t) => {
   const { manager } = await makeManager();
   t.after(() => manager.dispose());

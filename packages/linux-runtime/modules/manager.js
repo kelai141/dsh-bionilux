@@ -1128,8 +1128,34 @@ export class LinuxRuntimeManager {
     return this.status();
   }
 
+  /** Recover a cold manager before health inspection takes a shared permit. */
+  async _ensureStartupRecovery() {
+    if (this._reconciled || this.disposed) return;
+    if (!this._startupRecovery) {
+      const recovery = (async () => {
+        // Acquire before draining: an install may already be running. Its own
+        // startup recovery completes first, and must not be aborted by verify.
+        await this.gate.acquireExclusive();
+        try {
+          if (!this.disposed && !this._reconciled) {
+            await this._stopChildren();
+            await this._ensureDirectories();
+          }
+        } finally {
+          this.gate.releaseExclusive();
+        }
+      })();
+      this._startupRecovery = recovery;
+      recovery.finally(() => {
+        if (this._startupRecovery === recovery) this._startupRecovery = undefined;
+      }).catch(() => undefined);
+    }
+    await this._startupRecovery;
+  }
+
   /** Refresh the cached execution proof without racing runtime replacement. */
   async verify(options = {}) {
+    await this._ensureStartupRecovery();
     for (;;) {
       await this.gate.acquireShared();
       if (!this.gate.managementPending) break;
@@ -1848,6 +1874,7 @@ export class LinuxRuntimeManager {
     if (typeof command !== 'string' || command.trim() === '') {
       throw new TypeError('command must be a non-empty string');
     }
+    await this._ensureStartupRecovery();
     // Close the microtask window where a command was admitted just before
     // management announced a cutover: release the permit and wait instead of
     // spawning a guest process that the drain would not see.
