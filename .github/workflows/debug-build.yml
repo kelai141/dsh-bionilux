@@ -132,10 +132,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - name: Install AArch64 glibc test tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
       - name: Rust format, lint, and unit tests
         run: |
           cargo fmt --check
@@ -158,13 +154,22 @@ jobs:
           bash tests/preload_paths.sh
           bash tests/ubsan.sh
           bash tests/prepare_rootfs.sh
-          bash tests/aarch64.sh
       - name: Plugin package tests
         run: |
           npm ci --prefix packages/linux-runtime --ignore-scripts --no-audit --no-fund
           node --test packages/linux-bootstrap/test/*.test.mjs packages/linux-runtime/test/*.test.mjs
-      - name: Release metadata and manifest contract tests
-        run: python3 tests/test_release_workflows.py -v
+      - name: Release metadata, manifest and ELF layout contract tests
+        run: |
+          python3 tests/test_release_workflows.py -v
+          python3 tests/test_elf_alignment.py -v
+          python3 tests/test_ci_packages.py -v
+
+      - name: Install AArch64 glibc test tools
+        timeout-minutes: 18
+        run: |
+          bash scripts/ci-install-packages.sh gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+      - name: Required AArch64 glibc QEMU regressions (not Android)
+        run: bash tests/aarch64.sh
 
   build-runtime-assets:
     name: build ${{ matrix.architecture }} runtime assets
@@ -185,6 +190,7 @@ jobs:
             preload_rpath: /usr/lib/aarch64-linux-gnu
             elf_machine: AArch64
             debian_loader: /lib/ld-linux-aarch64.so.1
+            guest_page_size: 16384
             cross_arch: true
           - architecture: x86_64
             runtime_architecture: x64
@@ -197,6 +203,8 @@ jobs:
             preload_rpath: /usr/lib/x86_64-linux-gnu
             elf_machine: X86-64
             debian_loader: /lib64/ld-linux-x86-64.so.2
+            # x86_64 emulator runtime targets 4KB kernels, not ARM64 16KB devices.
+            guest_page_size: 4096
             cross_arch: false
     steps:
       - uses: actions/checkout@v4
@@ -218,17 +226,17 @@ jobs:
         with:
           platforms: arm64
       - name: Install compiler and Debian bootstrap tools
+        timeout-minutes: 18
         env:
           CROSS_ARCH: ${{ matrix.cross_arch }}
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
           packages="binutils build-essential debootstrap debian-archive-keyring gnupg xz-utils"
           if [[ "$CROSS_ARCH" == "true" ]]; then
-            packages="$packages gcc-aarch64-linux-gnu qemu-user-static binfmt-support"
+            packages="$packages gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static binfmt-support"
           fi
-          sudo apt-get install -y $packages
+          bash scripts/ci-install-packages.sh $packages
           bash scripts/prepare-debian-keyring.sh "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg"
           if [[ "$CROSS_ARCH" == "true" ]]; then
             sudo update-binfmts --enable qemu-aarch64
@@ -256,6 +264,7 @@ jobs:
           export "CARGO_TARGET_${target_upper}_LINKER=$linker"
           export "CC_${target_key}=$linker"
           export "AR_${target_key}=$tc/bin/llvm-ar"
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-z,max-page-size=16384"
           cargo build --release --locked --target "$TARGET"
 
           stage="$GITHUB_WORKSPACE/target/release-assets"
@@ -263,7 +272,7 @@ jobs:
           mkdir -p "$stage" "$backend/bin" "$backend/lib" "$backend/scripts"
           install -m 755 "target/$TARGET/release/bionilux" "$stage/bionilux-$ARCH"
           "$PRELOAD_CC" -shared -fPIC -O2 -Wall -Wextra -Werror \
-            -Wl,-soname,libbionilux_preload.so \
+            -Wl,-soname,libbionilux_preload.so -Wl,-z,max-page-size=16384 \
             -Wl,-rpath,"$PRELOAD_RPATH" \
             -o "$stage/libbionilux_preload-$ARCH.so" \
             src/preload/hooks.c -pthread -ldl
@@ -291,11 +300,11 @@ jobs:
           sudo rm -rf "$rootfs"
           sudo mkdir -p "$rootfs"
           snapshot_release="$GITHUB_WORKSPACE/target/debian-trixie-InRelease"
-          curl --fail --location --retry 4 --retry-all-errors \
+          timeout --signal=TERM --kill-after=15s 600s curl --fail --location --connect-timeout 15 --max-time 240 --retry 2 --retry-max-time 540 --retry-all-errors \
             "$DEBIAN_SNAPSHOT/dists/$DEBIAN_SUITE/InRelease" -o "$snapshot_release"
           echo "$DEBIAN_INRELEASE_SHA256  $snapshot_release" | sha256sum --check --strict
           gpgv --keyring "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" "$snapshot_release"
-          sudo debootstrap --arch="$DEBIAN_ARCHITECTURE" --foreign --variant=minbase \
+          sudo timeout --signal=TERM --kill-after=30s 1500s debootstrap --arch="$DEBIAN_ARCHITECTURE" --foreign --variant=minbase \
             --keyring="$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" \
             --include=apt,bash,ca-certificates,debian-archive-keyring,libstdc++6 \
             --components=main "$DEBIAN_SUITE" "$rootfs" "$DEBIAN_SNAPSHOT"
@@ -310,7 +319,7 @@ jobs:
             sudo umount "$rootfs/dev" 2>/dev/null || true
           }
           trap cleanup_mounts EXIT
-          sudo chroot "$rootfs" /debootstrap/debootstrap --second-stage
+          sudo timeout --signal=TERM --kill-after=30s 1500s chroot "$rootfs" /debootstrap/debootstrap --second-stage
           test "$(sudo chroot "$rootfs" dpkg --print-architecture)" = "$DEBIAN_ARCHITECTURE"
           grep -q '^VERSION_CODENAME=trixie$' "$rootfs/etc/os-release"
           test -x "$rootfs/usr/bin/apt-get"
@@ -331,7 +340,7 @@ jobs:
           SOURCES
           sudo rm -f "$rootfs/etc/resolv.conf"
           sudo cp /etc/resolv.conf "$rootfs/etc/resolv.conf"
-          if ! sudo chroot "$rootfs" /usr/bin/apt-get -o Acquire::Languages=none update \
+          if ! sudo timeout --signal=TERM --kill-after=15s 300s chroot "$rootfs" /usr/bin/apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=60 -o Acquire::Languages=none -o APT::Update::Error-Mode=any update \
             > "$GITHUB_WORKSPACE/target/apt-update.log" 2>&1; then
             cat "$GITHUB_WORKSPACE/target/apt-update.log"
             exit 1
@@ -373,7 +382,7 @@ jobs:
           asset="node-glibc-v${NODE_VERSION}-linux-${NODE_ARCHITECTURE}.tar.xz"
           source_date_epoch="$(git show -s --format=%ct HEAD)"
           mkdir -p "$stage" "$node_stage" "$node_source"
-          curl --fail --location --retry 4 --retry-all-errors \
+          timeout --signal=TERM --kill-after=15s 600s curl --fail --location --connect-timeout 15 --max-time 240 --retry 2 --retry-max-time 540 --retry-all-errors \
             "https://nodejs.org/dist/v${NODE_VERSION}/$upstream" -o "$node_source/$upstream"
           echo "$expected_sha256  $node_source/$upstream" | sha256sum --check --strict
           python3 - "$node_source/$upstream" "$node_source" <<'PY'
@@ -404,6 +413,45 @@ jobs:
             -cJf "$stage/$asset" -C "$node_stage" .
           tar -tJf "$stage/$asset" | grep '^\./bin/node$' > /dev/null
           tar -tJf "$stage/$asset" | grep '^\./lib/node_modules/npm/' > /dev/null
+      - name: Check complete packaged runtime ELF page layout prerequisites
+        env:
+          ARCH: ${{ matrix.architecture }}
+          GUEST_PAGE_SIZE: ${{ matrix.guest_page_size }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$GITHUB_WORKSPACE/target/release-assets"
+          reports="$GITHUB_WORKSPACE/target/independent-linux/elf-layout"
+          mkdir -p "$reports"
+          failed=0
+          # Our rebuilt objects promise strong declared alignment as well as
+          # congruent offsets. Preload runs under glibc, but shares that build contract.
+          python3 scripts/check_elf_alignment.py --policy android --machine "$ARCH" \
+            --report "$reports/backend-$ARCH.json" \
+            "$stage/bionilux-$ARCH" "$stage/libbionilux_preload-$ARCH.so" || failed=1
+          # Inspect every ET_EXEC/ET_DYN by ELF magic, not just .so names.
+          # Low p_align alone is not a glibc failure: segment congruence is checked
+          # for APK loader, rootfs, Node and backend at the target kernel page size.
+          # ARM64 must pass 16KB; x86_64 only targets 4KB Android emulator kernels.
+          python3 scripts/check_elf_alignment.py --policy guest --machine "$ARCH" \
+            --page-size "$GUEST_PAGE_SIZE" \
+            --report "$reports/runtime-$ARCH.json" \
+            "$stage/bionilux-loader-$ARCH.so" \
+            "$stage/bionilux-backend-$ARCH.tar.xz" \
+            "$stage/debian-minimal-$ARCH.tar.xz" \
+            "$stage"/node-glibc-*-linux-*.tar.xz || failed=1
+          echo "$ARCH guest ELF layout checked for $GUEST_PAGE_SIZE-byte kernels; own launcher/preload both built for 16KB alignment. Actual target-page-size glibc/Android execution is NOT tested." >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$ARCH" == "x86_64" ]]; then
+            echo "x86_64 runtime is a 4KB emulator target, NOT a 16KB device-support claim." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$failed"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: elf-layout-reports-${{ matrix.architecture }}
+          path: target/independent-linux/elf-layout/*.json
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         with:
           name: release-runtime-${{ matrix.architecture }}

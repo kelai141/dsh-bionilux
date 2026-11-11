@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      build_legacy_artifacts:
+        description: Build legacy setup artifacts (not used by the modern release)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,12 +21,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Release metadata and manifest positive/negative tests
-        run: python3 tests/test_release_workflows.py -v
+      - name: Release metadata, manifest and ELF positive/negative tests
+        run: |
+          python3 tests/test_release_workflows.py -v
+          python3 tests/test_elf_alignment.py -v
+          python3 tests/test_ci_packages.py -v
       - name: Validate Actions syntax with pinned actionlint
         run: |
           set -euo pipefail
-          curl --fail --location --retry 3 \
+          timeout --signal=TERM --kill-after=15s 300s curl --fail --location --connect-timeout 15 --max-time 120 --retry 2 --retry-max-time 240 --retry-all-errors \
             https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
             -o "$RUNNER_TEMP/actionlint.tar.gz"
           echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --strict
@@ -30,7 +38,7 @@ jobs:
 
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,7 +76,7 @@ jobs:
     # pure Node.js; they are gated on every PR so the install/update contract
     # (checksums, opt-in activation, shared Node reuse) cannot regress.
     name: linux environment plugins
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -148,7 +156,7 @@ jobs:
 
   preload-paths:
     name: preload path semantics
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: run hook path tests
@@ -167,14 +175,14 @@ jobs:
 
   preload:
     name: preload (aarch64-glibc)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
       - name: install cross toolchain
+        timeout-minutes: 18
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+          bash scripts/ci-install-packages.sh gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
 
       - name: build
         run: |
@@ -182,7 +190,8 @@ jobs:
             -o libbionilux_preload.so \
             src/preload/hooks.c -pthread -ldl \
             -Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1 \
-            -Wl,-rpath,/usr/lib/aarch64-linux-gnu
+            -Wl,-rpath,/usr/lib/aarch64-linux-gnu -Wl,-z,max-page-size=16384
+          python3 scripts/check_elf_alignment.py --policy android --machine aarch64 libbionilux_preload.so
 
       - name: AArch64 glibc QEMU regressions (not Android)
         run: bash tests/aarch64.sh
@@ -194,7 +203,7 @@ jobs:
 
   bionilux:
     name: bionilux (aarch64-bionic)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -219,7 +228,9 @@ jobs:
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC/bin/aarch64-linux-android24-clang"
           export CC_aarch64_linux_android="$TC/bin/aarch64-linux-android24-clang"
           export AR_aarch64_linux_android="$TC/bin/llvm-ar"
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-z,max-page-size=16384"
           cargo build --release --locked --target aarch64-linux-android
+          python3 scripts/check_elf_alignment.py --policy android --machine aarch64 target/aarch64-linux-android/release/bionilux
           cp target/aarch64-linux-android/release/bionilux .
 
       - uses: actions/upload-artifact@v4
@@ -228,17 +239,20 @@ jobs:
           path: bionilux
 
   box64:
+    # Legacy setup artifacts are opt-in, never substitutes for modern release gates.
+    if: github.event_name == 'workflow_dispatch' && inputs.build_legacy_artifacts
     name: box64-glibc
     runs-on: ubuntu-24.04-arm
     steps:
+      - uses: actions/checkout@v4
       - name: install build deps
+        timeout-minutes: 18
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git cmake build-essential python3
+          bash scripts/ci-install-packages.sh git cmake build-essential python3
 
       - name: clone and build
         run: |
-          git clone --depth 1 https://github.com/ptitSeb/box64 /tmp/box64
+          timeout --signal=TERM --kill-after=15s 300s git -c http.connectTimeout=15 -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 clone --depth 1 https://github.com/ptitSeb/box64 /tmp/box64
           cd /tmp/box64
           mkdir build && cd build
           cmake .. -DARM64=1 -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -252,13 +266,15 @@ jobs:
           path: box64-glibc
 
   x86-libs:
+    # Legacy setup artifacts are opt-in, never substitutes for modern release gates.
+    if: github.event_name == 'workflow_dispatch' && inputs.build_legacy_artifacts
     name: x86_64 runtime libs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: fetch ubuntu 26.04 base rootfs (amd64)
         run: |
           set -eux
-          curl -fLO https://cdimage.ubuntu.com/ubuntu-base/resolute/daily/current/resolute-base-amd64.tar.gz
+          timeout --signal=TERM --kill-after=15s 300s curl --fail --location --remote-name --connect-timeout 15 --max-time 120 --retry 2 --retry-max-time 240 --retry-all-errors https://cdimage.ubuntu.com/ubuntu-base/resolute/daily/current/resolute-base-amd64.tar.gz
           mkdir rootfs
           tar -xzf resolute-base-amd64.tar.gz -C rootfs
 

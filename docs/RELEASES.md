@@ -15,7 +15,7 @@
 
 ## 2. 发布物清单
 
-标签 `vX.Y.Z` 触发 `release.yml`，发布以下**稳定文件名**：
+发布操作通过 `release.yml` 的 workflow_dispatch 显式选择 `vX.Y.Z` 与源码提交；workflow 只创建草稿，公开正式版需要核验后单独提升。以下为 ARM64 的稳定文件名，x86_64 同时使用对应 `x86_64` / Node `x64` 名称：
 
 | 文件 | 内容 |
 |------|------|
@@ -28,8 +28,7 @@
 | `node-glibc-v<版本>-linux-arm64.tar.xz` | 官方 Node.js 的 glibc arm64 包（应用级共享一份） |
 | `linux-release.json` | 发布清单（安装器唯一读取入口） |
 
-当前只发布 **arm64**（真机验证过的架构）。x64 需要单独构建与验证后才可加入矩阵，
-不得以“同源代码”推断兼容。
+当前发布构建覆盖 **arm64 与 x64**，并提供各自 `bionilux-loader-<架构>.so`、`BUILD_INFO.json` 与 `SHA256SUMS`。这代表资产架构，不代表所有对应设备已经验证。ARM64 的实际 16 KB 页设备与正式壳的一键安装需要独立验收，见 [移动端兼容条件](MOBILE_COMPATIBILITY.md)。不得以“同源代码”或静态 ELF 检查推断全设备兼容。
 
 ## 3. 清单（`linux-release.json`）
 

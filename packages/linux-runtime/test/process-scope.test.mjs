@@ -2,7 +2,9 @@
  * Process-scope acceptance on a real Linux host.
  *
  * These tests deliberately use the public manager lifecycle and the real
- * spawnCommand implementation. A compiled exec launcher fixture turns
+ * spawnCommand implementation for lifecycle commands. Only the fake-root
+ * health probe is simulated; this host-forwarding fixture cannot virtualize UID.
+ * A compiled exec launcher fixture turns
  * each manager command into a normal host shell command, so a manager-owned
  * setsid daemon can be observed through /proc after the command promise has
  * already settled.
@@ -140,6 +142,17 @@ function makeIo(fixtureManifest) {
   };
 }
 
+// The fixture launcher forwards to the host without preload/fake-root. Its
+// host UID need not be zero on CI. Intercept only the manager proof command;
+// every command under lifecycle/daemon test still uses real spawn and cleanup.
+function runFixtureCommand(spec) {
+  if (String(spec.args?.at(-1) ?? '').includes('bionilux-runtime-probe-ok')) {
+    assert.equal(spec.args[0], '/bin/bash');
+    return { promise: Promise.resolve({ stdout: 'bionilux-runtime-probe-ok\n', stderr: '', exitCode: 0 }) };
+  }
+  return spawnCommand(spec);
+}
+
 async function installedManager(name, version = '1.0.0') {
   const dataDir = path.join(testRoot, name);
   const fixtureManifest = makeManifest(version);
@@ -149,7 +162,7 @@ async function installedManager(name, version = '1.0.0') {
     arch: 'x64',
     downloadAsset: io.downloadAsset,
     extractArchive: io.extractArchive,
-    runCommand: spawnCommand,
+    runCommand: runFixtureCommand,
   });
   const status = await manager.install(fixtureManifest.manifest);
   assert.equal(status.healthy, true, status.reason);
@@ -323,7 +336,7 @@ test('the tag is stable for a canonical dataDir and distinct for another', { ski
     arch: 'x64',
     downloadAsset: first.io.downloadAsset,
     extractArchive: first.io.extractArchive,
-    runCommand: spawnCommand,
+    runCommand: runFixtureCommand,
   });
   const tagRestarted = (await restarted.execute({ command })).stdout.trim();
   assert.equal(tagRestarted, tagA, 'a restarted owner must compute the same dataDir tag');
@@ -358,8 +371,10 @@ async function spawnEscapedOwner(dataDir) {
   const managerUrl = new URL('../modules/manager.js', import.meta.url).href;
   const source = [
     "import { createManager, spawnCommand } from " + JSON.stringify(managerUrl) + ';',
-    "const manager = createManager({ dataDir: process.env.BN_OWNER_DATA, arch: 'x64', runCommand: spawnCommand });",
-    'const status = manager.status();',
+    "import assert from 'node:assert/strict';",
+    'const runFixtureCommand = ' + runFixtureCommand.toString() + ';',
+    "const manager = createManager({ dataDir: process.env.BN_OWNER_DATA, arch: 'x64', runCommand: runFixtureCommand });",
+    'const status = await manager.verify();',
     "if (!status.healthy) throw new Error('owner fixture is unhealthy: ' + status.reason);",
     'const result = await manager.execute({ command: ' + JSON.stringify(daemonCommand(pidFile)) + ' });',
     "if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout);",
@@ -405,9 +420,9 @@ test('a restarted owner cleans the previous escaped daemon on dispose', { skip: 
     arch: 'x64',
     downloadAsset: io.downloadAsset,
     extractArchive: io.extractArchive,
-    runCommand: spawnCommand,
+    runCommand: runFixtureCommand,
   });
-  assert.equal(restarted.status().healthy, true);
+  assert.equal((await restarted.verify()).healthy, true);
   await restarted.dispose();
   assert.equal(await waitGone(pid), true, 'a new owner must clean the deterministic tag on dispose');
   daemons.delete(pid);
@@ -423,7 +438,7 @@ test('a restarted owner cleans the previous escaped daemon on install', { skip: 
     arch: 'x64',
     downloadAsset: io.downloadAsset,
     extractArchive: io.extractArchive,
-    runCommand: spawnCommand,
+    runCommand: runFixtureCommand,
   });
   const status = await restarted.install(fixtureManifest.manifest, 'debian-minimal-x64');
   assert.equal(status.healthy, true, status.reason);
@@ -443,9 +458,9 @@ test('a disposed old owner cannot kill the replacement owner daemon', { skip: !l
     arch: 'x64',
     downloadAsset: first.io.downloadAsset,
     extractArchive: first.io.extractArchive,
-    runCommand: spawnCommand,
+    runCommand: runFixtureCommand,
   });
-  assert.equal(replacement.status().healthy, true);
+  assert.equal((await replacement.verify()).healthy, true);
   const pid = await startManagerDaemon(replacement);
 
   // Repeated calls on the retired object must be inert: it no longer owns the

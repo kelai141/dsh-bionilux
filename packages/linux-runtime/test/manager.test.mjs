@@ -1,8 +1,8 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { chmod, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { existsSync, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -161,6 +161,22 @@ function makeIo(fixture, { onExtract } = {}) {
  * cancels it — that is what the cutover gate has to do before it replaces an
  * active rootfs.
  */
+const PROBE_MARKER = 'bionilux-runtime-probe-ok';
+function isProbe(spec) {
+  return String(spec.args?.at(-1) ?? '').includes(PROBE_MARKER);
+}
+
+/** Explicitly emulate successful execution; fake ELF files never run on host. */
+function successfulCommand(spec) {
+  if (isProbe(spec)) {
+    assert.equal(spec.args[0], '/bin/bash');
+    for (const external of ['/usr/bin/id -u', '/usr/bin/uname -m', '/usr/bin/ls /', 'node --version']) {
+      assert.ok(spec.args.at(-1).includes(external), 'probe must execute ' + external);
+    }
+  }
+  return { stdout: isProbe(spec) ? PROBE_MARKER + '\n' : 'ok', stderr: '', exitCode: 0 };
+}
+
 function makeRunner({ instant } = {}) {
   const calls = [];
   const isInstant =
@@ -186,7 +202,7 @@ function makeRunner({ instant } = {}) {
             },
             { once: true },
           );
-          if (isInstant(spec)) settle({ stdout: 'ok', stderr: '', exitCode: 0 });
+          if (isInstant(spec)) settle(successfulCommand(spec));
         }),
         cancel: () => {
           record.cancelled = true;
@@ -248,7 +264,7 @@ function makeDeferredAbortRunner({ abortDelayMs = 75 } = {}) {
         { once: true },
       );
       if (!String(spec.args?.at(-1) ?? '').includes('sleep')) {
-        record.settle({ stdout: 'ok', stderr: '', exitCode: 0 });
+        record.settle(successfulCommand(spec));
       }
       return {
         promise,
@@ -285,7 +301,7 @@ function makeStubbornRunner({ forceKillDelayMs = 100 } = {}) {
         record.aborted = true;
       }, { once: true });
       if (!String(spec.args?.at(-1) ?? '').includes('sleep')) {
-        record.settle({ stdout: 'ok', stderr: '', exitCode: 0 });
+        record.settle(successfulCommand(spec));
       }
       return {
         promise,
@@ -310,7 +326,7 @@ function makeUnkillableRunner() {
       const record = { spec, aborted: false, cancelled: false, forceKilled: false };
       calls.push(record);
       if (!String(spec.args?.at(-1) ?? '').includes('sleep')) {
-        return { promise: Promise.resolve({ stdout: 'ok', stderr: '', exitCode: 0 }) };
+        return { promise: Promise.resolve(successfulCommand(spec)) };
       }
       return {
         promise: new Promise(() => {}),
@@ -385,7 +401,7 @@ test('a failing install leaves the previous active runtime untouched', async () 
 
   await assert.rejects(() => second.install(broken.manifest, 'debian-minimal'), /unhealthy|rootfs file is missing/);
 
-  const after = second.status();
+  const after = await second.verify();
   assert.equal(after.healthy, true, 'the previously active instance must stay active');
   assert.equal(after.version, '1.0.0');
   const record = JSON.parse(await readFile(path.join(dataDir, 'active.json'), 'utf8'));
@@ -665,7 +681,8 @@ test('a second live manager for the same dataDir is rejected without touching th
       runCommand: runner.runCommand,
     }),
   };
-  assert.equal(replacement.manager.status().healthy, true);
+  assert.equal(replacement.manager.status().state, 'unverified');
+  assert.equal((await replacement.manager.verify()).healthy, true);
   assert.equal((await replacement.manager.execute({ command: 'echo released' })).exitCode, 0);
   await replacement.manager.dispose();
 });
@@ -768,7 +785,7 @@ test('plugin teardown disposes the manager it created and stops guest sessions',
       teardown = setup();
     },
   };
-  const manager = apply(ctx, {
+  const manager = await apply(ctx, {
     dataDir,
     arch: 'arm64',
     downloadAsset: io.downloadAsset,
@@ -797,7 +814,7 @@ test('the host native library directory reaches the plugin manager', async () =>
   };
   // The plugin forwards the host's ApplicationInfo.nativeLibraryDir, which is
   // where the glibc loader is executable on targetSdk >= 29.
-  const manager = apply(ctx, {
+  const manager = await apply(ctx, {
     dataDir,
     arch: 'arm64',
     downloadAsset: io.downloadAsset,
@@ -828,7 +845,7 @@ test('plugin teardown leaves a host-owned manager running', async () => {
       teardown = setup();
     },
   };
-  apply(ctx, { manager });
+  await apply(ctx, { manager });
 
   await teardown();
   assert.equal(manager.status().state, 'absent', 'the host owns its manager lifecycle');
@@ -838,7 +855,7 @@ test('plugin teardown leaves a host-owned manager running', async () => {
 test('failed plugin service registration releases its newly owned manager', async () => {
   const dataDir = tempDir();
   let failedManager;
-  assert.throws(() => apply({
+  await assert.rejects(() => apply({
     provide(_name, manager) {
       failedManager = manager;
       throw new Error('service registration rejected');
@@ -860,7 +877,7 @@ test('failed plugin service registration releases its newly owned manager', asyn
 test('failed plugin service registration detaches without disposing a host manager', async () => {
   const { manager } = makeManager(makeManifest(), { dataDir: tempDir() });
   try {
-    assert.throws(() => apply({
+    await assert.rejects(() => apply({
       provide() { throw new Error('service registration rejected'); },
     }, { manager }), /service registration rejected/);
     assert.equal(manager.disposed, false);
@@ -1293,10 +1310,7 @@ test('runtime defaults derive from the host architecture and never retarget an e
   assert.equal(resolveHostArchitecture('arm64'), 'arm64');
   assert.equal(resolveHostArchitecture('x64'), 'x64');
   assert.throws(() => resolveHostArchitecture('riscv64'), /arm64 or x64/);
-  if (process.arch === 'arm64' || process.arch === 'x64') {
-    assert.equal(resolveHostArchitecture(), process.arch);
-  }
-
+  if (process.arch === 'arm64' || process.arch === 'x64') assert.equal(resolveHostArchitecture(), process.arch);
   const dual = makeDualManifest();
   assert.equal(selectRuntime(dual, 'debian-minimal-x64', 'x64').runtime.architecture, 'x64');
   assert.throws(() => selectRuntime(dual, 'debian-minimal', 'x64'), /targets arm64, but this host is x64/);
@@ -1305,30 +1319,408 @@ test('runtime defaults derive from the host architecture and never retarget an e
 
 test('the manager derives arch from the host when it is not supplied', () => {
   if (process.arch !== 'arm64' && process.arch !== 'x64') return;
-  const manager = createManager({
-    dataDir: tempDir(),
-    runCommand: () => {
-      throw new Error('not used');
-    },
-  });
+  const manager = createManager({ dataDir: tempDir(), runCommand: () => { throw new Error('not used'); } });
   assert.equal(manager.arch, process.arch);
 });
 
 test('manager install defaults to the runtime id for its own architecture', async () => {
   for (const [arch, expected] of [['arm64', 'debian-minimal'], ['x64', 'debian-minimal-x64']]) {
-    const manager = createManager({
-      dataDir: tempDir(),
-      arch,
-      runCommand: () => {
-        throw new Error('not used');
-      },
-    });
+    const manager = createManager({ dataDir: tempDir(), arch, runCommand: () => { throw new Error('not used'); } });
     let selected;
-    manager._installLocked = async (_manifest, runtimeId) => {
-      selected = runtimeId;
-      return { healthy: true };
-    };
+    manager._installLocked = async (_manifest, runtimeId) => { selected = runtimeId; return { healthy: true }; };
     await manager.install(makeDualManifest());
     assert.equal(selected, expected);
+  }
+});
+
+test('probe deadlines are bounded, configurable and preserve timeout diagnostics', async () => {
+  const { manager } = makeManager(makeManifest(), { dataDir: tempDir(), probeTimeoutMs: 1234 });
+  manager.runCommand = (spec) => {
+    assert.equal(spec.timeout, 1234);
+    return Promise.resolve({ exitCode: null, timedOut: true, stdout: 'partial progress', stderr: 'loader stalled' });
+  };
+  const verdict = await manager._probeRuntime({ launcher: '/launcher', rootfs: '/rootfs', node: '/node', preload: '/preload' });
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.reason, /timed out after 1234 ms: loader stalled/);
+  await manager.dispose();
+  for (const probeTimeoutMs of [0, -1, 120001, 1.5, NaN]) {
+    assert.throws(() => createManager({ dataDir: tempDir(), probeTimeoutMs }), /probeTimeoutMs/);
+  }
+});
+
+test('runtime probes fail closed for spawn errors, external failures and forged markers', async () => {
+  const { manager } = makeManager(makeManifest(), { dataDir: tempDir() });
+  const paths = { launcher: '/missing/bionilux', rootfs: '/guest', preload: '/preload', node: '/node' };
+  for (const code of ['ENOENT', 'EACCES']) {
+    manager.runCommand = () => { throw Object.assign(new Error('injected'), { code }); };
+    const verdict = await manager._probeRuntime(paths);
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, new RegExp(code));
+  }
+  for (const result of [
+    { exitCode: 1, stderr: 'libtinfo.so.6 missing' },
+    { exitCode: 127, stdout: PROBE_MARKER, stderr: 'id failed' },
+    { exitCode: 0, stderr: PROBE_MARKER },
+    { exitCode: 0, stdout: 'prefix ' + PROBE_MARKER },
+    { exitCode: 0, stdout: PROBE_MARKER, timedOut: true },
+    { exitCode: 0, stdout: PROBE_MARKER, stdoutTruncated: true },
+  ]) {
+    manager.runCommand = () => Promise.resolve(result);
+    assert.equal((await manager._probeRuntime(paths)).ok, false, JSON.stringify(result));
+  }
+  manager.runCommand = (spec) => Promise.resolve(successfulCommand(spec));
+  assert.equal((await manager._probeRuntime(paths)).ok, true);
+  await manager.dispose();
+});
+
+test('failed preactivation execution preserves the previous active record', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  const before = await manager.install(fixture.manifest);
+  const active = await readFile(manager._paths().active, 'utf8');
+  const run = manager.runCommand;
+  manager.runCommand = (spec) => isProbe(spec)
+    ? Promise.resolve({ exitCode: 127, stderr: 'external command failed' }) : run(spec);
+  await assert.rejects(manager.reinstall(fixture.manifest), /staged runtime does not run.*external command failed/);
+  assert.equal(await readFile(manager._paths().active, 'utf8'), active);
+  assert.deepEqual(await readdir(manager._paths().instances), [before.instanceId]);
+  await manager.dispose();
+});
+
+test('restored instances require proof; cache expires, failures recover and changes invalidate it', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest();
+  const { manager: first } = makeManager(fixture, { dataDir });
+  await first.install(fixture.manifest);
+  await first.dispose();
+  const { manager, runner } = makeManager(fixture, { dataDir });
+  assert.equal(manager.status().healthy, false);
+  assert.equal(manager.status().state, 'unverified');
+  assert.equal((await manager.verify()).healthy, true);
+  const probes = () => runner.calls.filter(({ spec }) => isProbe(spec)).length;
+  assert.equal(probes(), 1);
+  await manager.verify();
+  assert.equal(probes(), 1);
+  manager._probeVerdict.checkedAt -= 30_001;
+  await manager.verify();
+  assert.equal(probes(), 2);
+  const run = manager.runCommand;
+  manager.runCommand = () => Promise.resolve({ exitCode: 1, stderr: 'broken bash' });
+  assert.equal((await manager.verify({ force: true })).healthy, false);
+  assert.equal(manager.status().state, 'unhealthy');
+  await assert.rejects(manager.execute({ command: 'echo unsafe' }), /broken bash/);
+  manager.runCommand = run;
+  assert.equal((await manager.verify({ force: true })).healthy, true);
+  await writeFile(path.join(manager.status().paths.rootfs, 'bin/bash'), '#!/bin/sh\n# replaced\n');
+  assert.equal(manager.status().state, 'unverified');
+  await manager.execute({ command: 'echo reproved' });
+  assert.equal(manager.status().healthy, true);
+  await manager.dispose();
+});
+
+test('concurrent verification shares one managed probe and uninstall drains it first', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  await manager.install(fixture.manifest);
+  let started;
+  const ready = new Promise((resolve) => { started = resolve; });
+  let calls = 0;
+  manager.runCommand = (spec) => {
+    calls += 1;
+    return { promise: new Promise((resolve) => {
+      spec.signal.addEventListener('abort', () => resolve({ exitCode: 130 }), { once: true });
+      started();
+    }) };
+  };
+  const one = manager.verify({ force: true });
+  const two = manager.verify({ force: true });
+  await ready;
+  assert.equal(manager.children.size, 1);
+  await Promise.all([one, two, manager.uninstall()]);
+  assert.equal(calls, 1);
+  assert.equal(manager.status().state, 'absent');
+  await manager.dispose();
+});
+
+test('spawnCommand caps UTF-8 streams, drains excess and reports truncation', async () => {
+  const result = await spawnCommand({ file: process.execPath,
+    args: ['-e', "process.stdout.write('é'.repeat(100000)); process.stderr.write('x'.repeat(200000));"],
+    cwd: os.tmpdir(), env: process.env, maxOutputBytes: 1001 }).promise;
+  assert.equal(result.exitCode, 0);
+  assert.equal(Buffer.byteLength(result.stdout), 1000);
+  assert.equal(result.stdout.includes('�'), false);
+  assert.equal(Buffer.byteLength(result.stderr), 1001);
+  assert.equal(result.stdoutTruncated, true);
+  assert.equal(result.stderrTruncated, true);
+  assert.throws(() => spawnCommand({ maxOutputBytes: -1 }), /positive safe integer/);
+});
+
+test('execute preserves output truncation metadata returned by the runner', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  await manager.install(fixture.manifest);
+  manager.runCommand = () => Promise.resolve({ stdout: 'bounded', stderr: '', exitCode: 0, stdoutTruncated: true });
+  const result = await manager.execute({ command: 'verbose' });
+  assert.equal(result.stdout, 'bounded');
+  assert.equal(result.stdoutTruncated, true);
+  assert.equal(result.stderrTruncated, false);
+  await manager.dispose();
+});
+
+async function put(file, contents = 'keep') {
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, contents);
+}
+
+test('reconcile reclaims owned debris and pins active Node even with missing metadata', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  const installed = await manager.install(fixture.manifest);
+  const paths = manager._paths();
+  const active = JSON.parse(await readFile(paths.active, 'utf8'));
+  await rm(path.join(installed.paths.instance, 'metadata.json'));
+  const orphan = path.join(paths.instances, 'orphan', 'metadata.json');
+  await put(orphan, JSON.stringify({ ...active, instanceId: 'orphan' }));
+  await put(path.join(paths.staging, 'abandoned', 'partial'));
+  await put(path.join(paths.deleting, 'retired', 'partial'));
+  const unused = path.join(paths.sharedNode, 'unused', 'partial');
+  await put(unused);
+  await manager._exclusive(() => manager._reconcileLeftovers());
+  assert.equal(existsSync(path.dirname(orphan)), false);
+  assert.deepEqual(await readdir(paths.staging), []);
+  assert.deepEqual(await readdir(paths.deleting), []);
+  assert.equal(existsSync(installed.paths.node), true);
+  assert.equal(existsSync(unused), true, 'unreadable metadata conservatively pins unknown Node');
+  await manager.dispose();
+});
+
+test('reconcile removes unreferenced Node but retains foreign instance data', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  await manager.install(fixture.manifest);
+  const unused = path.join(manager._paths().sharedNode, 'unused');
+  await put(path.join(unused, 'partial'));
+  await manager._exclusive(() => manager._reconcileLeftovers());
+  assert.equal(existsSync(unused), false);
+  const foreign = path.join(manager._paths().instances, 'foreign', 'private');
+  await put(foreign);
+  await put(path.join(unused, 'partial'));
+  await manager._exclusive(() => manager._reconcileLeftovers());
+  assert.equal(existsSync(foreign), true);
+  assert.equal(existsSync(unused), true);
+  await manager.dispose();
+});
+
+test('invalid active record aborts cleanup without deleting data and permits retry', async () => {
+  const { manager } = makeManager(makeManifest(), { dataDir: tempDir() });
+  await manager._exclusive(() => manager._ensureDirectories());
+  const paths = manager._paths();
+  manager._reconciled = false;
+  const keep = path.join(paths.staging, 'keep', 'partial');
+  await put(keep);
+  await writeFile(paths.active, '{broken json');
+  await assert.rejects(manager._exclusive(() => manager._ensureDirectories()), /refusing runtime recovery/);
+  assert.equal(existsSync(keep), true);
+  assert.equal(manager._reconciled, false);
+  await rm(paths.active);
+  await manager._exclusive(() => manager._ensureDirectories());
+  assert.equal(existsSync(keep), false);
+  assert.equal(manager._reconciled, true);
+  await manager.dispose();
+});
+
+test('reconcile restores uninstall interrupted before active record removal', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  const installed = await manager.install(fixture.manifest);
+  const tombstone = path.join(manager._paths().deleting, 'interrupted-delete');
+  await rename(installed.paths.instance, tombstone);
+  await manager._exclusive(() => manager._reconcileLeftovers());
+  assert.equal(existsSync(tombstone), false);
+  assert.equal(existsSync(installed.paths.instance), true);
+  assert.equal((await manager.verify()).healthy, true);
+  await manager.dispose();
+});
+
+for (const fault of ['download', 'extract', 'invalid-elf', 'permission', 'retire', 'promote', 'late-backend', 'late-probe']) {
+  test('shared Node repair preserves old tree when ' + fault + ' fails', {
+    skip: fault === 'permission' && process.platform === 'win32',
+  }, async () => {
+    const fixture = makeManifest();
+    const { manager } = makeManager(fixture, { dataDir: tempDir() });
+    const installed = await manager.install(fixture.manifest);
+    const node = installed.paths.node;
+    await put(path.join(node, 'old-sentinel'));
+    await rm(path.join(node, 'lib/node_modules/npm'), { recursive: true });
+    const active = await readFile(manager._paths().active, 'utf8');
+    const oldDownload = manager.downloadAsset, oldExtract = manager.extractArchive, oldRun = manager.runCommand;
+    const oldRename = fs.rename;
+    manager.downloadAsset = async (...args) => {
+      if (fault === 'download' && args[0].url.includes('node-glibc')) throw new Error('injected download');
+      return oldDownload(...args);
+    };
+    manager.extractArchive = async (...args) => {
+      const [, destination, { kind }] = args;
+      if (kind === 'node' && fault === 'extract') throw new Error('injected extract');
+      if (kind === 'backend' && fault === 'late-backend') throw new Error('injected backend');
+      await oldExtract(...args);
+      if (kind === 'node' && fault === 'invalid-elf') await writeFile(path.join(destination, 'bin/node'), makeElf('x64'));
+      if (kind === 'node' && fault === 'permission') await chmod(path.join(destination, 'bin/node'), 0o600);
+    };
+    manager.runCommand = (spec) => fault === 'late-probe' && isProbe(spec)
+      ? Promise.resolve({ exitCode: 1, stderr: 'injected probe' }) : oldRun(spec);
+    fs.rename = async (from, to) => {
+      if (fault === 'retire' && path.basename(to) === 'node.retired') throw new Error('injected retire');
+      if (fault === 'promote' && path.basename(from) === 'node' && String(from).includes('.staging')) throw new Error('injected promote');
+      return oldRename(from, to);
+    };
+    try {
+      await assert.rejects(manager.reinstall(fixture.manifest), /injected|incomplete or invalid/);
+      assert.equal(await readFile(manager._paths().active, 'utf8'), active);
+      assert.equal(await readFile(path.join(node, 'old-sentinel'), 'utf8'), 'keep');
+      assert.deepEqual(await readdir(manager._paths().staging), []);
+    } finally {
+      fs.rename = oldRename;
+      manager.runCommand = oldRun;
+      await manager.dispose();
+    }
+  });
+}
+
+test('startup restores unproven retired Node before deleting its staging journal', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  const installed = await manager.install(fixture.manifest);
+  const active = JSON.parse(await readFile(manager._paths().active, 'utf8'));
+  const stage = path.join(manager._paths().staging, 'interrupted-install');
+  await put(path.join(installed.paths.node, 'old-sentinel'));
+  await mkdir(stage);
+  await writeFile(path.join(stage, 'node-swap.json'), JSON.stringify({ schemaVersion: 1, nodeKey: active.nodeKey }));
+  await rename(installed.paths.node, path.join(stage, 'node.retired'));
+  await manager.extractArchive('unused', installed.paths.node, { kind: 'node' });
+  await manager._exclusive(() => manager._reconcileLeftovers());
+  assert.equal(await readFile(path.join(installed.paths.node, 'old-sentinel'), 'utf8'), 'keep');
+  assert.equal(existsSync(stage), false);
+  await manager.dispose();
+});
+
+test('failed Node rollback preserves journal and backup for startup recovery', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  const installed = await manager.install(fixture.manifest);
+  await put(path.join(installed.paths.node, 'old-sentinel'));
+  await rm(path.join(installed.paths.node, 'lib/node_modules/npm'), { recursive: true });
+  const original = fs.rename;
+  fs.rename = async (from, to) => {
+    if ((path.basename(from) === 'node' && String(from).includes('.staging')) || path.basename(from) === 'node.retired') {
+      throw new Error('injected promotion and rollback failure');
+    }
+    return original(from, to);
+  };
+  try { await assert.rejects(manager.reinstall(fixture.manifest), /injected/); }
+  finally { fs.rename = original; }
+  const stages = await readdir(manager._paths().staging);
+  assert.equal(stages.length, 1);
+  assert.equal(existsSync(path.join(manager._paths().staging, stages[0], 'node.retired/old-sentinel')), true);
+  assert.equal(manager._reconciled, false, 'failed rollback must re-arm recovery in the same manager');
+  await manager._exclusive(() => manager._ensureDirectories());
+  assert.equal(manager._reconciled, true);
+  assert.equal(await readFile(path.join(installed.paths.node, 'old-sentinel'), 'utf8'), 'keep');
+  await manager.dispose();
+});
+
+test('mobile native library path defaults to engine environment with explicit override', async () => {
+  const previous = process.env.DSH_NATIVE_LIB_DIR;
+  process.env.DSH_NATIVE_LIB_DIR = path.resolve(temporaryRoot, 'apk-libraries');
+  try {
+    const inherited = createManager({ dataDir: tempDir(), arch: 'arm64' });
+    assert.equal(inherited.nativeLibDir, process.env.DSH_NATIVE_LIB_DIR);
+    await inherited.dispose();
+    const explicit = createManager({ dataDir: tempDir(), arch: 'arm64', nativeLibDir: path.resolve(temporaryRoot, 'override') });
+    assert.equal(explicit.nativeLibDir, path.resolve(temporaryRoot, 'override'));
+    await explicit.dispose();
+    const disabled = createManager({ dataDir: tempDir(), arch: 'arm64', nativeLibDir: '' });
+    assert.equal(disabled.nativeLibDir, '');
+    await disabled.dispose();
+    process.env.DSH_NATIVE_LIB_DIR = 'relative/apk-path';
+    assert.throws(() => createManager({ dataDir: tempDir(), arch: 'arm64' }), /absolute directory/);
+    assert.throws(() => createManager({ dataDir: tempDir(), nativeLibDir: 1 }), /absolute directory/);
+  } finally {
+    if (previous === undefined) delete process.env.DSH_NATIVE_LIB_DIR;
+    else process.env.DSH_NATIVE_LIB_DIR = previous;
+  }
+});
+
+for (const crash of ['node-swap', 'uninstall-rename']) {
+  test('cold verify restores interrupted ' + crash + ' without reinstalling', async () => {
+    const fixture = makeManifest();
+    const dataDir = tempDir();
+    const { manager: old } = makeManager(fixture, { dataDir });
+    const installed = await old.install(fixture.manifest);
+    const activeBefore = await readFile(old._paths().active, 'utf8');
+    await old.dispose();
+    let leftover;
+    if (crash === 'node-swap') {
+      const key = JSON.parse(activeBefore).nodeKey;
+      leftover = path.join(old._paths().staging, 'crashed-install');
+      await mkdir(leftover);
+      await writeFile(path.join(leftover, 'node-swap.json'), JSON.stringify({ schemaVersion: 1, nodeKey: key }));
+      await rename(installed.paths.node, path.join(leftover, 'node.retired'));
+    } else {
+      leftover = path.join(old._paths().deleting, 'crashed-uninstall');
+      await rename(installed.paths.instance, leftover);
+    }
+    const { manager, io, runner } = makeManager(fixture, { dataDir });
+    assert.equal(manager.status().healthy, false, 'crash fixture must require recovery');
+    let reconciles = 0;
+    const reconcile = manager._reconcileLeftovers.bind(manager);
+    manager._reconcileLeftovers = async () => {
+      assert.equal(manager.gate.exclusive, true, 'recovery must hold exclusive ownership');
+      assert.equal(manager.gate.active, 0, 'no shared verification permit may deadlock recovery');
+      reconciles += 1;
+      await reconcile();
+    };
+    try {
+      const [first, concurrent] = await Promise.all([manager.verify(), manager.verify()]);
+      assert.equal(first.healthy, true, first.reason);
+      assert.equal(concurrent.healthy, true, concurrent.reason);
+      assert.equal(first.instanceId, installed.instanceId);
+      assert.equal(await readFile(manager._paths().active, 'utf8'), activeBefore);
+      assert.equal(existsSync(leftover), false);
+      assert.equal(io.stats.downloads.length, 0, 'recovery must not reinstall or download');
+      assert.equal(reconciles, 1, 'concurrent cold verification must share one recovery');
+      assert.equal(runner.calls.filter(({ spec }) => isProbe(spec)).length, 1);
+      assert.equal((await manager.execute({ command: 'echo recovered' })).exitCode, 0);
+      await manager.verify({ force: true });
+      assert.equal(reconciles, 1, 'active execute/verify must not repeatedly reconcile');
+    } finally {
+      await manager.dispose();
+    }
+  });
+}
+
+test('cold execute recovers once and a failed startup recovery can be retried', async () => {
+  const fixture = makeManifest();
+  const dataDir = tempDir();
+  const { manager: old } = makeManager(fixture, { dataDir });
+  const installed = await old.install(fixture.manifest);
+  const activeBefore = await readFile(old._paths().active, 'utf8');
+  await old.dispose();
+  const tombstone = path.join(old._paths().deleting, 'cold-execute-uninstall');
+  await rename(installed.paths.instance, tombstone);
+  const { manager } = makeManager(fixture, { dataDir });
+  try {
+    await writeFile(manager._paths().active, '{invalid');
+    await assert.rejects(manager.verify(), /refusing runtime recovery/);
+    assert.notEqual(manager._reconciled, true);
+    assert.equal(manager.gate.exclusive, false, 'failed recovery must release exclusive ownership');
+    await writeFile(manager._paths().active, activeBefore);
+    const result = await manager.execute({ command: 'echo cold recovered' });
+    assert.equal(result.exitCode, 0);
+    assert.equal(manager.status().healthy, true);
+    assert.equal(existsSync(tombstone), false);
+    assert.equal(manager._reconciled, true);
+  } finally {
+    await manager.dispose();
   }
 });

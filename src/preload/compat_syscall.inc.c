@@ -140,6 +140,7 @@ static long bn_compat_readlinkat_call(long dirfd, long path, long buf, long size
     raw[rc] = '\0';
     char logical[PATH_MAX];
     const char *u = bn_unmap(raw, logical, sizeof logical);
+    if (u == bn_invalid_path) { errno = ENAMETOOLONG; return -1; }
     size_t len = strlen(u);
     size_t copy = len < (size_t)size ? len : (size_t)size;
     memcpy(out, u, copy);

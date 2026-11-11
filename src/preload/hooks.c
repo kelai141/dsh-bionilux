@@ -85,11 +85,12 @@ static struct { const char *key; char *entry; } bn_context[] = {
     {"BIONILUX_RUNTIME_DIR=", NULL}, {"BIONILUX_HOST_PATHS=", NULL},
     {"BIONILUX_ANDROID_PATHS=", NULL}, {"BIONILUX_BOX64=", NULL},
     {"BIONILUX_PRELOAD=", NULL}, {"BIONILUX_LOADER=", NULL},
+    {"BIONILUX_NATIVE_LIB_DIR=", NULL},
     {"BIONILUX_GUEST_PATH=", NULL}, {"BIONILUX_GUEST_HOME=", NULL},
     {"BIONILUX_GUEST_TMP=", NULL}, {"BIONILUX_GUEST_CWD=", NULL},
     {"BIONILUX_FAKE_ROOT=", NULL}, {"BIONILUX_LENIENT=", NULL},
     {"BIONILUX_BINARY_PATH=", NULL}, {"BIONILUX_DNS=", NULL},
-    {"BIONILUX_DNS_SERVERS=", NULL},
+    {"BIONILUX_DNS_SERVERS=", NULL}, {"BIONILUX_DNS_BUDGET_MS=", NULL},
     {"BIONILUX_TARGET_EXE=", NULL}, {"BIONILUX_GUEST_SESSION=", NULL},
     {"BIONILUX_PROCESS_SCOPE=", NULL}
 };
@@ -323,16 +324,37 @@ static void bn_normalize(const char *in, char *out, size_t size) {
     out[o < size ? o : size - 1] = '\0';
 }
 
-// Rewrite `path` into `buf`, returning either `buf` or `path`.
+// A failure path must be impossible to open *or create*. A named sentinel in
+// the rootfs can exist (or be created by O_CREAT), and an empty path succeeds
+// for some *at calls with AT_EMPTY_PATH. This absolute name is PATH_MAX bytes
+// long and has one overlong component, so the kernel rejects every lookup.
+// Return static storage rather than truncating it into the caller's buffer.
+static const char bn_invalid_path[PATH_MAX + 1] = {
+    [0] = '/', [1 ... PATH_MAX - 1] = 'x', [PATH_MAX] = '\0'
+};
+
+// Mapping helpers preserve their path-or-buffer interface on success. On
+// overflow they return this guaranteed failing name, never an unmapped host
+// path or a usable truncated name. Callers must use the returned pointer.
+static const char *bn_unrepresentable(const char *path) {
+    DBG("map: %s -> unrepresentable path\n", path ? path : "(null)");
+    errno = ENAMETOOLONG;
+    return bn_invalid_path;
+}
+
+// Rewrite `path` into `buf`, returning either `buf`, `path`, or a failure name.
 static const char *bn_map(const char *path, char *buf, size_t size) {
     const char *root = bn_rootfs();
     if (!root || !path || !*path || bn_passthrough(path)) return path;
 
     char norm[PATH_MAX];
+    // bn_normalize() truncates silently; a truncated guest path would alias a
+    // different guest file, so treat it as unrepresentable instead.
+    if (strlen(path) >= sizeof norm) return bn_unrepresentable(path);
     bn_normalize(path, norm, sizeof norm);
 
     int written = snprintf(buf, size, "%s%s", root, norm);
-    if (written <= 0 || (size_t)written >= size) return path;
+    if (written <= 0 || (size_t)written >= size) return bn_unrepresentable(path);
 
     if (bn_lenient() && access(buf, F_OK) != 0) return path;
     DBG("map: %s -> %s\n", path, buf);
@@ -346,7 +368,9 @@ static const char *bn_unmap(const char *path, char *buf, size_t size) {
     const char *rest = path + strlen(root);
     if (*rest == '\0') rest = "/";
     int written = snprintf(buf, size, "%s", rest);
-    if (written <= 0 || (size_t)written >= size) return path;
+    // Report the absent guest name rather than the physical path the caller
+    // already holds: the guest can only turn it into a failing lookup.
+    if (written <= 0 || (size_t)written >= size) return bn_unrepresentable(path);
     return buf;
 }
 
@@ -404,12 +428,14 @@ static const char *bn_resolve(int dirfd, const char *path, char *buf, size_t siz
         const char *logical = bn_unmap(physical, logical_buf, sizeof logical_buf);
         if (logical == physical) return path;
         int n = snprintf(joined, sizeof joined, "%s/%s", logical, path);
-        if (n <= 0 || (size_t)n >= sizeof joined) return path;
+        // Returning `path` here would hand the kernel a path whose mapping we
+        // could not even compute; fail closed like the rest of the mapper.
+        if (n <= 0 || (size_t)n >= sizeof joined) return bn_unrepresentable(path);
         char norm[PATH_MAX];
         bn_normalize(joined, norm, sizeof norm);
         if (!bn_under_host_paths(norm)) return path;
         n = snprintf(buf, size, "%s", norm);
-        if (n <= 0 || (size_t)n >= size) return path;
+        if (n <= 0 || (size_t)n >= size) return bn_unrepresentable(path);
         return buf;
     }
 
@@ -425,7 +451,10 @@ static const char *bn_resolve(int dirfd, const char *path, char *buf, size_t siz
 
     char joined[PATH_MAX];
     int n = snprintf(joined, sizeof joined, "%s/%s", logical, path);
-    if (n <= 0 || (size_t)n >= sizeof joined) return path;
+    // A relative path with ".." is only contained because it was resolved here
+    // first; if that resolution does not fit, passing `path` through lets the
+    // kernel climb out of the rootfs from the physical working directory.
+    if (n <= 0 || (size_t)n >= sizeof joined) return bn_unrepresentable(path);
 
     char norm[PATH_MAX];
     bn_normalize(joined, norm, sizeof norm);
@@ -462,8 +491,14 @@ static const char *system_linker(void) {
 // A caller may supply a minimal child environment. Keep only the runtime's
 // own configuration when absent from envp; never inherit arbitrary host values.
 static char **strip_ld_preload(char *const envp[]) {
+    // Linux treats NULL envp like { NULL }. Both still need private rootfs
+    // transport for the launcher; on_init restores the requested empty guest
+    // environment after caching that context. Dropping transport escapes the
+    // guest and does not keep the launcher from adding its own defaults.
+    char *empty[] = {NULL};
+    if (!envp) envp = empty;
     size_t envc = 0;
-    while (envp && envp[envc]) envc++;
+    while (envp[envc]) envc++;
     const char *preload = NULL;
     for (size_t i = 0; i < envc; i++)
         if (!strncmp(envp[i], "LD_PRELOAD=", 11)) preload = envp[i] + 11;
@@ -686,23 +721,27 @@ static int real_execve(const char *p, char *const a[], char *const e[]) {
     return fn(p, a, e);
 }
 
+// Prefix an Android system linker without ever treating argv[0] as a filename.
+static char **bn_linker_argv(const char *linker, const char *path, char *const argv[]) {
+    size_t n = 0;
+    while (argv && argv[n]) n++;
+    char **shifted = calloc(n + 3, sizeof *shifted);
+    if (!shifted) return NULL;
+    shifted[0] = (char *)linker;
+    shifted[1] = (char *)path;
+    for (size_t i = 1; i < n; i++) shifted[i + 1] = argv[i];
+    return shifted;
+}
+
 static int run_rerouted(const char *launcher, char **av, char **ev) {
     // On Android the launcher in app data cannot be execve'd; the system
-    // linker maps it instead. The kernel overwrites argv[0] with the program it
-    // executed, so the linker reads the first remaining argument as the program
-    // to load; that argument has to be the launcher itself.
+    // linker maps it instead. Its first argument names the executable to map,
+    // independent of the caller's argv[0]. The launcher then observes its own
+    // path in argv[0], while /proc/self/exe still names the system linker.
     const char *linker = system_linker();
     if (linker) {
-        size_t n = 0;
-        while (av && av[n]) n++;
-        char **shifted = calloc(n + 2, sizeof *shifted);
+        char **shifted = bn_linker_argv(linker, launcher, av);
         if (!shifted) { free(av); free(ev); errno = ENOMEM; return -1; }
-        shifted[0] = (char *)linker;
-        // av[0] is not the launcher: the kernel already replaced it with the
-        // program it executed. `launcher` holds the path the caller wanted.
-        shifted[1] = (char *)launcher;
-        for (size_t i = 1; i < n; i++) shifted[i + 1] = av[i];
-        DBG("linker prefix: file=%s av1=%s av2=%s n=%zu\n", linker, shifted[1], shifted[2] ? shifted[2] : "(null)", n);
         int r = real_execve(linker, shifted, ev);
         int e = errno;
         free(shifted); free(av); free(ev);
@@ -722,13 +761,8 @@ static int exec_launcher(const char *path, char *const argv[], char *const envp[
     const char *linker = system_linker();
     int r;
     if (linker) {
-        size_t n = 0;
-        while (argv && argv[n]) n++;
-        char **shifted = calloc(n + 2, sizeof *shifted);
+        char **shifted = bn_linker_argv(linker, path, argv);
         if (!shifted) { free(clean); errno = ENOMEM; return -1; }
-        shifted[0] = (char *)linker;
-        shifted[1] = argv[0];
-        for (size_t i = 1; i < n; i++) shifted[i + 1] = argv[i];
         r = real_execve(linker, shifted, clean);
         free(shifted);
     } else {
@@ -928,13 +962,8 @@ static int spawn_impl(int search_path, pid_t *pid, const char *path,
         const char *linker = system_linker();
         int r;
         if (linker) {
-            size_t n = 0;
-            while (argv && argv[n]) n++;
-            char **shifted = calloc(n + 2, sizeof *shifted);
+            char **shifted = bn_linker_argv(linker, path, argv);
             if (!shifted) { free(clean); return ENOMEM; }
-            shifted[0] = (char *)linker;
-            shifted[1] = argv[0];
-            for (size_t i = 1; i < n; i++) shifted[i + 1] = argv[i];
             r = plain(pid, linker, fa, attr, shifted, clean);
             free(shifted);
         } else {
@@ -948,8 +977,11 @@ static int spawn_impl(int search_path, pid_t *pid, const char *path,
     int re = reroute(search_path ? 2 : 0, path, argv, envp, &l, &av, &ev);
     if (re < 0) return errno;
     if (re) {
-        int r = plain(pid, l, fa, attr, av, ev);
-        int e = errno; free(av); free(ev); errno = e;
+        const char *linker = system_linker();
+        char **shifted = linker ? bn_linker_argv(linker, l, av) : NULL;
+        if (linker && !shifted) { free(av); free(ev); return ENOMEM; }
+        int r = plain(pid, linker ? linker : l, fa, attr, shifted ? shifted : av, ev);
+        int e = errno; free(shifted); free(av); free(ev); errno = e;
         return r;
     }
 
@@ -1415,6 +1447,11 @@ char *getcwd(char *buf, size_t size) {
     char mapped[PATH_MAX];
     const char *logical = bn_unmap(r, mapped, sizeof mapped);
     if (logical == r) return r;
+    if (logical == bn_invalid_path) {
+        if (!buf) free(r);
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
     size_t len = strlen(logical);
     if (buf) {
         if (len >= size) { errno = ERANGE; return NULL; }
@@ -1657,13 +1694,13 @@ static const char *bn_map_symlink_target(const char *target, int dirfd,
     if (!bn_has_dotdot(target) || !linkpath || !*linkpath) return target;
     char physical[PATH_MAX];
     if (linkpath[0] == '/') {
-        if (strlen(linkpath) >= sizeof physical) return target;
+        if (strlen(linkpath) >= sizeof physical) return bn_unrepresentable(target);
         memcpy(physical, linkpath, strlen(linkpath) + 1);
     } else {
         char base[PATH_MAX];
         if (!bn_dir_base(dirfd, base, sizeof base)) return target;
         int n = snprintf(physical, sizeof physical, "%s/%s", base, linkpath);
-        if (n <= 0 || (size_t)n >= sizeof physical) return target;
+        if (n <= 0 || (size_t)n >= sizeof physical) return bn_unrepresentable(target);
     }
     char *slash = strrchr(physical, '/');
     if (!slash) return target;
@@ -1671,7 +1708,7 @@ static const char *bn_map_symlink_target(const char *target, int dirfd,
     if (!bn_under(physical, bn_rootfs())) return target; // authorized host cwd
     char joined[PATH_MAX], norm[PATH_MAX];
     int n = snprintf(joined, sizeof joined, "%s/%s", physical, target);
-    if (n <= 0 || (size_t)n >= sizeof joined) return target;
+    if (n <= 0 || (size_t)n >= sizeof joined) return bn_unrepresentable(target);
     bn_normalize(joined, norm, sizeof norm);
     if (bn_under(norm, bn_rootfs())) return target; // ordinary relative link
 
@@ -1680,7 +1717,7 @@ static const char *bn_map_symlink_target(const char *target, int dirfd,
     char logical[PATH_MAX];
     const char *parent = bn_unmap(physical, logical, sizeof logical);
     n = snprintf(joined, sizeof joined, "%s/%s", parent, target);
-    if (n <= 0 || (size_t)n >= sizeof joined) return target;
+    if (n <= 0 || (size_t)n >= sizeof joined) return bn_unrepresentable(target);
     bn_normalize(joined, norm, sizeof norm);
     return bn_map(norm, buf, size);
 }
@@ -1774,6 +1811,7 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t size) {
     raw[r] = '\0';
     char logical[PATH_MAX];
     const char *u = bn_unmap(raw, logical, sizeof logical);
+    if (u == bn_invalid_path) { errno = ENAMETOOLONG; return -1; }
     size_t len = strlen(u);
     size_t copy = len < size ? len : size;
     memcpy(buf, u, copy);
@@ -1807,15 +1845,20 @@ char *realpath(const char *path, char *resolved) {
     char logical[PATH_MAX];
     const char *u = bn_unmap(r, logical, sizeof logical);
     if (u == r) return r;
-    size_t len = strlen(logical);
+    if (u == bn_invalid_path) {
+        if (!resolved) free(r);
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    size_t len = strlen(u);
     if (resolved) {
-        memcpy(resolved, logical, len + 1);
+        memcpy(resolved, u, len + 1);
         return resolved;
     }
     // glibc allocated the result; hand back a guest-sized copy instead.
     char *copy = malloc(len + 1);
     if (!copy) { free(r); errno = ENOMEM; return NULL; }
-    memcpy(copy, logical, len + 1);
+    memcpy(copy, u, len + 1);
     free(r);
     return copy;
 }
@@ -2339,6 +2382,24 @@ int getifaddrs(struct ifaddrs **ifap) {
 #define BN_DNS_MAXV4 8
 #define BN_DNS_MAXV6 4
 #define BN_DNS_MAXSEARCH 4
+// Retry limit for one server. glibc allows 5; here every attempt is paid again
+// per server and per search domain, so 2 is the ceiling.
+#define BN_DNS_MAXATTEMPTS 2
+// Total wall-clock budget for one getaddrinfo() call, search list included.
+// Without it the worst case is attempts x servers x timeout, multiplied by the
+// search domains — minutes with a resolver that silently drops packets.
+#define BN_DNS_BUDGET_DEFAULT_MS 10000
+#define BN_DNS_BUDGET_MAX_MS 30000
+
+// The budget in force for this call, from BIONILUX_DNS_BUDGET_MS, clamped.
+static int bn_dns_budget_ms(void) {
+    const char *v = bn_env("BIONILUX_DNS_BUDGET_MS");
+    if (!v) return BN_DNS_BUDGET_DEFAULT_MS;
+    char *end = NULL;
+    long ms = strtol(v, &end, 10);
+    if (end == v || *end || ms <= 0) return BN_DNS_BUDGET_DEFAULT_MS;
+    return ms > BN_DNS_BUDGET_MAX_MS ? BN_DNS_BUDGET_MAX_MS : (int)ms;
+}
 
 typedef struct {
     int v4_count, v6_count;
@@ -2445,11 +2506,16 @@ static void bn_dns_parse_config(bn_dns_config *c, char *text) {
             char *s2 = NULL;
             for (char *o = strtok_r(arg, " \t", &s2); o; o = strtok_r(NULL, " \t", &s2)) {
                 if (!strncmp(o, "timeout:", 8)) {
+                    // Per-attempt timeout. The single query budget enforced by
+                    // bn_dns_deadline() is what actually bounds a lookup.
                     long v = strtol(o + 8, NULL, 10);
                     if (v > 0) c->timeout_ms = (v > 30 ? 30 : (int)v) * 1000;
                 } else if (!strncmp(o, "attempts:", 9)) {
+                    // Bounded at BN_DNS_MAXATTEMPTS, not at glibc's 5: every
+                    // retry is multiplied by server_count and by the search
+                    // list, which is how a single name used to cost minutes.
                     long v = strtol(o + 9, NULL, 10);
-                    if (v > 0) c->attempts = v > 5 ? 5 : (int)v;
+                    if (v > 0) c->attempts = v > BN_DNS_MAXATTEMPTS ? BN_DNS_MAXATTEMPTS : (int)v;
                 } else if (!strncmp(o, "ndots:", 6)) {
                     long v = strtol(o + 6, NULL, 10);
                     if (v >= 0) c->ndots = v > 15 ? 15 : (int)v;
@@ -2703,7 +2769,11 @@ static int bn_dns_tcp(const struct sockaddr_in *srv, const unsigned char *q, int
     return got;
 }
 
-static int bn_dns_query_one(const char *name, int qtype, bn_answer *out) {
+// Returns 0 for a usable answer, -1 when no server produced one, and -2 when
+// `deadline` (the shared budget of the whole getaddrinfo call) ran out first.
+// Every individual wait is clamped to what is left of that budget, so neither
+// resolv.conf's timeout/attempts nor the server count can stretch it.
+static int bn_dns_query_one(const char *name, int qtype, bn_answer *out, int64_t deadline) {
     unsigned char q[512], r[4096];
     uint16_t id = bn_dns_id();
     int qlen = bn_dns_build(q, sizeof q, name, id, qtype);
@@ -2712,14 +2782,21 @@ static int bn_dns_query_one(const char *name, int qtype, bn_answer *out) {
     out->v4_count = out->v6_count = 0;
     out->rcode = -1;
 
+    int64_t left = 0;
     for (int pass = 0; pass < bn_dns.attempts; pass++) {
         for (int i = 0; i < bn_dns.server_count; i++) {
-            int got = bn_dns_udp(&bn_dns.server[i], q, qlen, r, sizeof r, bn_dns.timeout_ms);
+            left = deadline - bn_dns_now();
+            if (left <= 0) return -2;
+            int timeout = bn_dns.timeout_ms < left ? bn_dns.timeout_ms : (int)left;
+            int got = bn_dns_udp(&bn_dns.server[i], q, qlen, r, sizeof r, timeout);
             if (got < 0) continue;
             // Truncation means the answer is incomplete: retry over TCP.
             if (got < 12) continue;
             if (r[2] & 0x02) {
-                got = bn_dns_tcp(&bn_dns.server[i], q, qlen, r, sizeof r, bn_dns.timeout_ms);
+                left = deadline - bn_dns_now();
+                if (left <= 0) return -2;
+                timeout = bn_dns.timeout_ms < left ? bn_dns.timeout_ms : (int)left;
+                got = bn_dns_tcp(&bn_dns.server[i], q, qlen, r, sizeof r, timeout);
                 if (got < 0) continue;
             }
             bn_answer parsed = {0};
@@ -2739,7 +2816,12 @@ static int bn_dns_query_one(const char *name, int qtype, bn_answer *out) {
 
 // Apply the search list the way the resolver would: a name with at least
 // ndots dots is tried as-is first, otherwise the search domains come first.
-static int bn_dns_query(const char *name, int af, bn_answer *out) {
+//
+// Returns 0 for an answer, -1 when the name did not resolve, and -2 when the
+// single shared budget `deadline` expired. The search list is where the cost
+// used to multiply, so it shares one deadline with the queries themselves: the
+// first thing checked before every candidate name is how much budget is left.
+static int bn_dns_query(const char *name, int af, bn_answer *out, int64_t deadline) {
     int dots = 0;
     for (const char *p = name; *p; p++)
         if (*p == '.') dots++;
@@ -2749,23 +2831,34 @@ static int bn_dns_query(const char *name, int af, bn_answer *out) {
     int absolute = len && name[len - 1] == '.';
     int as_is_first = absolute || dots >= bn_dns.ndots;
     int answered = 0;
+    int qtype = af == AF_INET6 ? 28 : 1;
     if (as_is_first) {
-        if (bn_dns_query_one(name, af == AF_INET6 ? 28 : 1, out) == 0) {
+        int rc = bn_dns_query_one(name, qtype, out, deadline);
+        if (rc == 0) {
             answered = 1;
             if (out->v4_count || out->v6_count || absolute) return 0;
+        } else if (rc == -2) {
+            return -2;
         }
         if (absolute) return -1;
     }
     for (int i = 0; i < bn_dns.search_count; i++) {
         int n = snprintf(buf, sizeof buf, "%s.%s", name, bn_dns.search[i]);
         if (n < 0 || (size_t)n >= sizeof buf) continue;
-        if (bn_dns_query_one(buf, af == AF_INET6 ? 28 : 1, out) == 0) {
+        int rc = bn_dns_query_one(buf, qtype, out, deadline);
+        if (rc == 0) {
             answered = 1;
             if (out->v4_count || out->v6_count) return 0;
+        } else if (rc == -2) {
+            return answered ? 0 : -2;
         }
     }
-    if (!as_is_first && bn_dns_query_one(name, af == AF_INET6 ? 28 : 1, out) == 0)
-        return 0;
+    if (!as_is_first && (bn_dns_now() >= deadline)) return answered ? 0 : -2;
+    if (!as_is_first) {
+        int rc = bn_dns_query_one(name, qtype, out, deadline);
+        if (rc == 0) return 0;
+        if (rc == -2) return answered ? 0 : -2;
+    }
     return answered ? 0 : -1;
 }
 
@@ -2834,9 +2927,16 @@ static gai_fn bn_real_getaddrinfo(void) {
     return real;
 }
 
-// Resolve `node` to numeric addresses the guest can agree on. Returns the number
-// of addresses appended to `nums`, or -1 when the guest has no usable resolver
-// and libc's own behaviour should stand.
+// Resolve `node` to numeric addresses the guest can agree on.
+//
+// Returns the number of addresses appended to `nums`; -1 means "this hook does
+// not handle it", so the caller falls through to libc's own getaddrinfo; -2
+// means the guest's resolver was consulted and produced no usable answer (which
+// the callers report as EAI_AGAIN / TRY_AGAIN).
+//
+// The whole lookup — the search list and both address families for AF_UNSPEC —
+// shares one CLOCK_MONOTONIC deadline. That is the only real bound on the cost;
+// resolv.conf's timeout/attempts and the server list are multipliers on it.
 static int bn_resolve_to_numeric(const char *node, int af, char nums[][INET6_ADDRSTRLEN], int max) {
     if (!bn_dns_enabled()) return -1;
     bn_dns_refresh();
@@ -2845,18 +2945,22 @@ static int bn_resolve_to_numeric(const char *node, int af, char nums[][INET6_ADD
     int have_hosts = (bn_hosts_lookup(node, af, &ans) == 0);
 
     if (!have_hosts) {
-        if (bn_dns.server_count == 0) {
-            return -2;
-        }
+        // The guest's hosts file was already consulted. glibc's hidden NSS
+        // lookups use the *host* configuration and are outside our budget; do
+        // not fall back there when the guest has no nameservers.
+        if (bn_dns.server_count == 0) return 0;
+
+        int64_t deadline = bn_dns_now() + bn_dns_budget_ms();
         if (af == AF_UNSPEC) {
             bn_answer v4 = {0}, v6 = {0};
-            int r4 = bn_dns_query(node, AF_INET, &v4);
-            int r6 = bn_dns_query(node, AF_INET6, &v6);
-            if (r4 < 0 && r6 < 0) return -2;
+            int r4 = bn_dns_query(node, AF_INET, &v4, deadline);
+            // No point starting the second family once the budget is spent.
+            int r6 = bn_dns_now() < deadline ? bn_dns_query(node, AF_INET6, &v6, deadline) : -2;
+            if (r4 != 0 && r6 != 0) return -2;
             ans = v4;
             ans.v6_count = v6.v6_count;
             memcpy(ans.v6, v6.v6, sizeof ans.v6);
-        } else if (bn_dns_query(node, af, &ans) != 0) return -2;
+        } else if (bn_dns_query(node, af, &ans, deadline) != 0) return -2;
     }
 
     int n = 0;

@@ -1,5 +1,5 @@
 export const MANIFEST_SCHEMA_VERSION = 1;
-export const PACKAGE_VERSION = '0.5.0';
+export const PACKAGE_VERSION = '0.10.0';
 export const MIN_MOBILE_VERSION = '0.14.0';
 export const SUPPORTED_ARCHITECTURES = new Set(['arm64', 'x64']);
 export const DEFAULT_RUNTIME_IDS = Object.freeze({

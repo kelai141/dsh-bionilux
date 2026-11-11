@@ -62,7 +62,8 @@ const runtimeManager = {
   install: async () => {},
   reinstall: async () => {},
   uninstall: async () => {},
-  status: async () => ({ running: false }),
+  status: async () => ({ healthy: true }),
+  verify: async () => ({ healthy: true }),
 }
 
 function harness({ dataDir = path.join(root, `state-${Math.random().toString(16).slice(2)}`) } = {}) {

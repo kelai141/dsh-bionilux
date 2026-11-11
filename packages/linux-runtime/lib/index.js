@@ -260,9 +260,6 @@ export function registerLinuxBash(ctx, manager, options = {}) {
           ...directories,
           timeoutMs,
         });
-        if (result.timedOut) {
-          throw new Error(`Command timed out after ${timeoutMs} ms; session ${String(args.session)} was closed.`);
-        }
         return {
           ...result,
           runtimeId: manager.status().runtimeId,
@@ -273,15 +270,16 @@ export function registerLinuxBash(ctx, manager, options = {}) {
         command: String(args.command ?? ''),
         ...directories,
         timeout: timeoutMs,
+        signal: exec?.signal,
       });
-      if (result.timedOut) {
-        throw new Error(`Command timed out after ${timeoutMs} ms inside the Linux environment.`);
-      }
       return {
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode ?? 1,
+        signal: result.signal ?? null,
         timedOut: result.timedOut,
+        stdoutTruncated: result.stdoutTruncated === true,
+        stderrTruncated: result.stderrTruncated === true,
         cwd: result.cwd,
         runtimeId: result.runtimeId,
         ...(options.metadata ?? {}),
@@ -324,7 +322,7 @@ export function registerLinuxBash(ctx, manager, options = {}) {
  * @param {string} [config.nativeLibDir] - APK native library directory, the only place an app process may execute an ELF.
  * @returns {import('../modules/manager.js').LinuxRuntimeManager} the manager.
  */
-export function apply(ctx, config = {}) {
+export async function apply(ctx, config = {}) {
   // A manager supplied by the host belongs to the host. One created here must
   // stop its guest sessions when the plugin is unloaded.
   const ownsManager = config.manager == null;
@@ -343,24 +341,33 @@ export function apply(ctx, config = {}) {
       dnsProbe: config.dnsProbe,
       dnsProbeTimeoutMs: config.dnsProbeTimeoutMs,
       nativeLibDir: config.nativeLibDir,
+      probeTimeoutMs: config.probeTimeoutMs,
     });
 
   let disposeTool = () => {};
+  let registered = false;
+  let cleaned = false;
   const syncTool = () => {
+    if (cleaned) return;
+    const healthy = manager.status().healthy === true;
+    // Verification refreshes also emit change. Do not dispose live persistent
+    // registries on healthy -> healthy, including the session doing the probe.
+    if (healthy && registered) return;
+    if (!healthy && !registered) return;
     try {
       disposeTool();
     } catch {
       // A broken host tool disposer must not break a runtime state change.
     }
+    registered = false;
     disposeTool = () => {};
-    if (manager.status().healthy) {
+    if (healthy) {
       // Activation must fail if the real registry rejects a tool. Reporting a
       // healthy environment while silently hiding its tools strands the agent.
       disposeTool = registerLinuxBash(ctx, manager) ?? (() => {});
+      registered = true;
     }
   };
-
-  let cleaned = false;
   let cleanupResult;
   const cleanup = () => {
     if (!cleaned) {
@@ -378,8 +385,14 @@ export function apply(ctx, config = {}) {
     // not retain the directory's manager lease indefinitely.
     if (typeof ctx.effect === 'function') ctx.effect(() => cleanup);
     manager.on('change', syncTool);
-    syncTool();
-    if (typeof ctx.provide === 'function') ctx.provide('linuxRuntimeManager', manager);
+    // A restored active.json is not evidence that Android can execute this
+    // backend. Prove Bash, external commands and shared Node before publishing
+    // the service or tools; a failed proof remains visible but unregistered.
+    if (typeof manager.verify === 'function') await manager.verify();
+    if (!cleaned) {
+      syncTool();
+      if (typeof ctx.provide === 'function') ctx.provide('linuxRuntimeManager', manager);
+    }
   } catch (error) {
     Promise.resolve(cleanup()).catch(() => undefined);
     throw error;

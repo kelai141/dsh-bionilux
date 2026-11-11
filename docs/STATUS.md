@@ -1,6 +1,6 @@
 # STATUS — 执行状态
 
-> 本文件随每次提交更新。只写**有证据**的事，没验证的明确标注。
+> 本文件保留历次历史记录。当前 0.10.0 结论与未验证边界优先见 [发布前审计](RELEASE_0.10.0_AUDIT.md) 和 [移动端兼容条件](MOBILE_COMPATIBILITY.md)。历史“健康/失败”不代表当前状态。
 
 记录说明：第 1–6 节保留早期 x86_64 验证历史，不作为当前 ARM64 阻塞清单。
 当前已记录的 ARM64 设备结果与 GNU make 修正见第 9–10 节；本次 host 回归不新增设备兼容性结论。
@@ -266,3 +266,21 @@ FIFO 模式才失败。
 - 管理器补实际 ELF 架构校验、默认架构选择、会话排空/退出确认和失败安装清理；发布工作流增加 x86_64 矩阵及回归，但真实 tag 发布、APK 插件集成没有完成。
 - 静态/内联系统调用、完整动态链接器语义、内核级链接隔离、独立 PTY 清理仍有边界；Ruby 15 项残留失败未抹除。
 - 此轮不新增 ARM64 手机、SELinux Enforcing、完整长期压力或真实插件生命周期的通过结论。
+
+## 13. 稳定性复测（2026-11-11，emulator-5584 / dsh-api29）⚠️
+
+本轮结论**推翻了「装好即可用」的假设**：设备上已安装的环境是坏的，而系统报 healthy。
+完整证据、根因链与修复排序见 **[RISK.md](RISK.md)**。要点：
+
+- 设备上的 `backend/bin/bionilux` 与 `target/independent-linux/assets` 内的二进制逐字节相同
+  （SHA-256 `885a8713…`，时间戳 2026-11-04），**不含 2026-11-08 的 `f8a6031` 修复**。
+- 该旧二进制在 `linker64` 启动下把 `BIONILUX_BINARY_PATH` 导出成
+  `/apex/com.android.runtime/bin/linker64`；preload 的子进程 reroute 因此调用 Bionic linker，
+  报 `error: expected absolute path: "--argv0"`。
+- 实测：`echo`（内建）成功；`id -u`、`uname -m`、`ls`（外部命令）**全部失败**。
+- `manager.status()` 仍返回 `healthy: true`，因为健康检查只验文件存在与 ELF 架构，**从不执行**。
+- `node --test packages/linux-runtime/test/*.test.mjs`：88 passed / 0 failed / 16 skipped。
+- `scripts/start-independent-linux.ps1` 安装与激活成功，随后被验收脚本的
+  `reused:persisted` 断言判为失败——安装判据与验收判据被混为一谈。
+
+未验证：现行源码的 `launcher_identity()` 是否能修好（本机无法交叉编译，见 RISK.md）。

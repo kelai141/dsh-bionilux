@@ -301,6 +301,14 @@ export function createMobileBootstrap(options = {}) {
     if (!state.installedLinuxVersion) return
     const host = await hostInjection()
     if (!host) return
+    // Host membership alone cannot turn an unverified or failed restore back
+    // into a usable installation, but removals must still clear activation.
+    if (state.runtime?.healthy !== true) {
+      state.enabled = false
+      state.injectionActivated = false
+      await save()
+      return
+    }
     if (restoredThisLoad && host.injected && !host.active) return
     state.enabled = host.injected && host.active
     state.injectionActivated = state.enabled
@@ -315,6 +323,19 @@ export function createMobileBootstrap(options = {}) {
     manifest: publicManifest(manifest),
     runtimeId,
   })
+
+  // The manager's executable probe, not a persisted flag or a host scope, is
+  // the activation boundary. Older plugins without verification fail closed.
+  async function verifiedRuntime(candidate) {
+    if (typeof candidate.verify !== 'function') throw new Error('The Linux runtime plugin cannot prove usability; install a compatible runtime plugin')
+    const runtime = await candidate.verify()
+    if (runtime?.healthy !== true) {
+      const error = new Error('Linux runtime is not usable: ' + (runtime?.reason ?? 'health verification is unavailable'))
+      error.runtime = runtime ?? { healthy: false, reason: 'health verification is unavailable' }
+      throw error
+    }
+    return runtime
+  }
 
   /** A persisted activation is only restorable from a directory the host still owns. */
   const isInsidePluginRoot = (directory) => {
@@ -360,9 +381,13 @@ export function createMobileBootstrap(options = {}) {
       await save()
       return
     }
-    const config = pluginConfig(state.pinnedManifest, state.runtimeId)
+    let hostResult
     try {
-      const hostResult = await pluginHost.install({
+      const manifest = validateManifestShape(state.pinnedManifest)
+      ensureMobileCompatible(manifest, mobileVersion)
+      selectRuntimeForArch(manifest, state.runtimeId, hostArch)
+      const config = pluginConfig(manifest, state.runtimeId)
+      hostResult = await pluginHost.install({
         directory: state.pluginDirectory,
         entry: RUNTIME_ENTRY,
         config,
@@ -370,16 +395,9 @@ export function createMobileBootstrap(options = {}) {
       })
       installedPlugin = true
       const restored = await resolveManager({ hostResult, directory: state.pluginDirectory, config })
-      state.runtime = typeof restored.status === 'function' ? await restored.status() : state.runtime
+      state.runtime = await verifiedRuntime(restored)
       restoredThisLoad = true
-      // `status()` reads active.json; the runtime plugin registers its tools during
-      // activation only while that record is healthy, so surface an unhealthy
-      // restore instead of reporting a working environment.
-      if (state.runtime && state.runtime.healthy === false) {
-        state.lastError = 'Restored Linux runtime is unhealthy: ' + (state.runtime.reason ?? 'unknown reason')
-      } else {
-        state.lastError = null
-      }
+      state.lastError = null
       await save()
     } catch (error) {
       // Activation failure leaves the record installed but inactive: no download,
@@ -387,6 +405,15 @@ export function createMobileBootstrap(options = {}) {
       // An engine shutdown is cancellation, not a broken persisted install.
       // Keep the user's activation choice so the next engine can restore it.
       if (error?.code === 'LINUX_ENGINE_STOPPING') throw error
+      if (hostResult) {
+        try {
+          if (typeof hostResult.rollback === 'function') await hostResult.rollback()
+          else await pluginHost.uninstall({ runtimeId: state.runtimeId, directory: state.pluginDirectory, rollback: true })
+        } catch (rollbackError) {
+          error.rollbackError = safeError(rollbackError)
+        }
+      }
+      state.runtime = error.runtime ?? { healthy: false, reason: safeError(error) }
       state.enabled = false
       state.injectionActivated = false
       state.lastError = safeError(error)
@@ -459,6 +486,7 @@ export function createMobileBootstrap(options = {}) {
       resolvedManager = await resolveManager({ hostResult, directory: result.path, config })
       if (reinstall && typeof resolvedManager.reinstall === 'function') await resolvedManager.reinstall(publicManifest(manifest), runtimeId)
       else await resolvedManager.install(publicManifest(manifest), runtimeId)
+      const runtimeStatus = await verifiedRuntime(resolvedManager)
       state.installedLinuxVersion = manifest.version
       state.runtimeId = runtimeId
       state.pluginDirectory = result.path
@@ -473,7 +501,7 @@ export function createMobileBootstrap(options = {}) {
       state.updateAvailable = false
       state.updateBlocked = false
       state.lastError = null
-      state.runtime = typeof resolvedManager.status === 'function' ? await resolvedManager.status() : { id: runtime.id, label: runtime.label, architecture: runtime.architecture, backend: runtime.backend }
+      state.runtime = runtimeStatus
       await save()
       // issue #1374：全部成功才丢弃旧包备份——提交点必须在激活/manifest 落库之后。
       if (typeof assetHandle?.commit === 'function') await assetHandle.commit()
@@ -563,6 +591,8 @@ export function createMobileBootstrap(options = {}) {
       if (error?.code !== 'ENOENT') throw error
       await save()
     }
+    // A previous process's health verdict is not evidence for this process.
+    if (state.installedLinuxVersion) state.runtime = { healthy: false, state: 'unverified', reason: 'Runtime usability has not been verified in this process' }
     await updateMobileVersion()
     // Restore before the host view is reconciled (see restoreActivation).
     await restoreActivation()
