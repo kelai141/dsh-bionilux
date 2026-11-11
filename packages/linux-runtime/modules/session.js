@@ -1291,10 +1291,13 @@ export class SessionRegistry {
     const status = await this._assertAvailable();
     const name = this._name(id);
     const existing = this.sessions.get(name);
-    if (existing && existing.running) {
+    if (existing && (existing._opening || existing.running)) {
       if (sharedPaths != null && sharedPaths.length > 0) {
         this._assertSameSharedPaths(existing, this.manager._resolveCwd(cwd, status.paths.rootfs, sharedPaths));
       }
+      // Preparation has no PID yet, while a spawned child is not usable until
+      // READY. Both states belong to the same startup, never a replacement.
+      if (existing._opening) await existing._opening;
       return existing.info();
     }
     if (this.sessions.size >= this.maxSessions && !existing) {
@@ -1327,7 +1330,7 @@ export class SessionRegistry {
     const status = await this._assertAvailable();
     const name = assertSessionId(id);
     let session = this.sessions.get(name);
-    if (!session || !session.running) {
+    if (!session || session._opening || !session.running) {
       await this.open({ id: name, cwd, sharedPaths });
       session = this.sessions.get(name);
     }

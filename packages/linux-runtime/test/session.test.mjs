@@ -238,6 +238,61 @@ test('session startup rechecks management after deferred host-path preparation',
   }
 });
 
+test('concurrent registry opens share preparation and wait for the same child READY', { skip, timeout: 60_000 }, async (t) => {
+  const { manager } = await makeManager();
+  const registry = new SessionRegistry(manager);
+  t.after(async () => { await registry.dispose(); await manager.dispose(); });
+  let entered;
+  let releasePreparation;
+  const preparing = new Promise((resolve) => { entered = resolve; });
+  const preparation = new Promise((resolve) => { releasePreparation = resolve; });
+  manager._prepareHostPaths = async () => { entered(); await preparation; };
+  let launches = 0;
+  const launch = manager._sessionLaunch;
+  manager._sessionLaunch = (...args) => { launches += 1; return launch(...args); };
+  let firstSettled = false;
+  let secondSettled = false;
+  const first = registry.open({ id: 'together' }).then(value => { firstSettled = true; return value; });
+  await preparing;
+  const session = registry.sessions.get('together');
+  let receivedReady;
+  const ready = new Promise((resolve) => { receivedReady = resolve; });
+  const chunks = [];
+  const onStdout = session._onStdout.bind(session);
+  session._onStdout = chunk => { chunks.push(chunk); receivedReady(); };
+  const second = registry.open({ id: 'together' }).then(value => { secondSettled = true; return value; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(registry.sessions.get('together'), session);
+  assert.equal(firstSettled, false);
+  assert.equal(secondSettled, false);
+  assert.equal(launches, 0, 'deferred preparation must have no child yet');
+  releasePreparation();
+  await ready;
+  let thirdSettled = false;
+  let runSettled = false;
+  const third = registry.open({ id: 'together' }).then(value => { thirdSettled = true; return value; });
+  const run = registry.run('together', { command: 'printf ready' }).then(value => { runSettled = true; return value; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(session.running, true, 'a PID exists before its READY frame is consumed');
+  assert.equal(session._ready, false);
+  assert.equal(launches, 1);
+  assert.equal(manager.children.size, 1);
+  assert.equal(firstSettled, false);
+  assert.equal(secondSettled, false);
+  assert.equal(thirdSettled, false, 'a new open must not return a pre-READY child');
+  assert.equal(runSettled, false);
+  assert.equal(session._pending, null, 'run must not replace the startup parser before READY');
+  session._onStdout = onStdout;
+  for (const chunk of chunks) onStdout(chunk);
+  const infos = await Promise.all([first, second, third]);
+  assert.equal(session._ready, true);
+  assert.equal(infos[0].pid, infos[1].pid);
+  assert.equal(infos[1].pid, infos[2].pid);
+  assert.equal((await run).stdout, 'ready');
+  assert.equal(launches, 1, 'all callers must share exactly one spawn');
+  assert.equal(registry.sessions.get('together'), session);
+});
+
 test('same-named sessions in separate registries never share or remove job files', { skip, timeout: 60_000 }, async (t) => {
   const { manager } = await makeManager();
   const first = new SessionRegistry(manager);
