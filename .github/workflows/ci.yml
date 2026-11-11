@@ -182,7 +182,7 @@ jobs:
       - name: install cross toolchain
         timeout-minutes: 18
         run: |
-          bash scripts/ci-install-packages.sh gcc-aarch64-linux-gnu qemu-user
+          bash scripts/ci-install-packages.sh gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
 
       - name: build
         run: |

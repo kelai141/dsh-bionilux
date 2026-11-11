@@ -39,7 +39,7 @@ class SourceContractTests(unittest.TestCase):
     def test_workflows_use_shared_script_and_keep_required_cross(self):
         for name in ("ci.yml", "debug-build.yml"):
             text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
-            self.assertIn('bash scripts/ci-install-packages.sh gcc-aarch64-linux-gnu qemu-user', text)
+            self.assertIn('bash scripts/ci-install-packages.sh gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user', text)
             self.assertIn('bash tests/aarch64.sh', text)
             self.assertIn('python3 tests/test_ci_packages.py -v', text)
         text = (ROOT / ".github/workflows/debug-build.yml").read_text(encoding="utf-8")

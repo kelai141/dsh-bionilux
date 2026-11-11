@@ -167,7 +167,7 @@ jobs:
       - name: Install AArch64 glibc test tools
         timeout-minutes: 18
         run: |
-          bash scripts/ci-install-packages.sh gcc-aarch64-linux-gnu qemu-user
+          bash scripts/ci-install-packages.sh gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
       - name: Required AArch64 glibc QEMU regressions (not Android)
         run: bash tests/aarch64.sh
 
@@ -234,7 +234,7 @@ jobs:
           set -euo pipefail
           packages="binutils build-essential debootstrap debian-archive-keyring gnupg xz-utils"
           if [[ "$CROSS_ARCH" == "true" ]]; then
-            packages="$packages gcc-aarch64-linux-gnu qemu-user-static binfmt-support"
+            packages="$packages gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static binfmt-support"
           fi
           bash scripts/ci-install-packages.sh $packages
           bash scripts/prepare-debian-keyring.sh "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg"
