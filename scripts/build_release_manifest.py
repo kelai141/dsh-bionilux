@@ -14,10 +14,7 @@ runtime_specs = (
     ("aarch64", "debian-minimal", "arm64", "arm64", "ARM64"),
     ("x86_64", "debian-minimal-x64", "x64", "x64", "x86_64"),
 )
-required = [
-    "linux-bootstrap-plugin.tar.xz",
-    "linux-runtime-plugin.tar.xz",
-]
+required = []
 for asset_arch, _runtime_id, _runtime_arch, node_arch, _label in runtime_specs:
     required.extend((
         f"bionilux-{asset_arch}",
@@ -39,7 +36,6 @@ for name in required:
             raise SystemExit(f"Refusing to publish a Git LFS pointer as an asset: {name}")
 
 base_url = f"https://github.com/{repository}/releases/download/{quote(tag, safe='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-')}"
-page_url = f"https://github.com/{repository}/releases/tag/{quote(tag, safe='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-')}"
 
 def describe(name):
     path = root / name
@@ -66,18 +62,10 @@ def describe(name):
         "unpackedSize": unpacked,
     }
 
-bootstrap = describe("linux-bootstrap-plugin.tar.xz")
-runtime_plugin = describe("linux-runtime-plugin.tar.xz")
-bootstrap["pluginReleaseUrl"] = page_url
-runtime_plugin["pluginReleaseUrl"] = page_url
 manifest = {
     "schemaVersion": 1,
     "version": version,
     "minMobileVersion": min_mobile,
-    "plugins": {
-        "bootstrap": bootstrap,
-        "runtime": runtime_plugin,
-    },
     "runtimes": [{
         "id": runtime_id,
         "label": f"Debian 13 (trixie) for {label}",
@@ -93,7 +81,6 @@ out.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encodi
 print(f"Generated {out} for {repository}@{tag}")
 
 expected = {
-    "linux-bootstrap-plugin.tar.xz", "linux-runtime-plugin.tar.xz",
     "linux-release.json", "BUILD_INFO.json",
 }
 for asset_arch, node_arch in (("aarch64", "arm64"), ("x86_64", "x64")):

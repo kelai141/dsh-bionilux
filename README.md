@@ -1,10 +1,10 @@
-# bionilux — DSH Mobile 的 Linux 运行时
+# bionilux — Android 应用的 Debian/glibc 运行时
 
 > English version: [`README.en.md`](README.en.md).
 
-**这是 DSH Mobile 的 Linux 运行时。** 它在一个 Android 应用进程里承载完整的 Debian
+**这是一个 Android 应用的 Debian/glibc 运行时。** 它在一个 Android 应用进程里承载完整的 Debian
 用户空间：真实的 `apt`/`dpkg`、可用的 DNS 与 TLS、原生速度的 glibc 执行，并且不使用
-PRoot。它是 DSH Mobile 的一个*组件*，由 Cordis 插件驱动——不是独立的 Termux 工具。
+PRoot。它由消费方应用以 Release 资产的形式安装并驱动，不是独立的 Termux 工具。
 
 本仓库是 [`theonuverse/bionilux`](https://github.com/theonuverse/bionilux) 的 fork。上游解决的是
 「在 Termux 上运行一个 glibc 二进制」；本 fork 解决的是「成为某个 Android 应用的 Linux
@@ -32,9 +32,9 @@ x86_64 模拟器上验证。
 ## 快速开始
 
 需要独立模拟器和免手配的 Agent 入口时，见
-[独立 Linux 使用说明](docs/INDEPENDENT_LINUX.md)。本地启动命令为
-`pwsh -NoProfile -File scripts/start-independent-linux.ps1`，Agent 使用
-`node scripts/linux-agent.mjs exec '<command>'`。
+[独立 Linux 使用说明](docs/INDEPENDENT_LINUX.md)。原启动脚本
+`scripts/start-independent-linux.ps1` 已随插件层删除；验证回落到
+`cargo test` + `tests/*.sh`。
 
 运行时安装在一个由应用持有的前缀下；`PREFIX/files/...` 布局是**推导**出来的，不是假定
 的。
@@ -43,10 +43,15 @@ x86_64 模拟器上验证。
 # 一次性 rootfs 准备：绝对符号链接、resolver、目录。
 sh scripts/prepare-rootfs.sh --rootfs /path/to/rootfs --dns "$DNS_SERVERS"
 
+# 构建 Android launcher + glibc preload（需要 NDK 与交叉 gcc）。
+cargo xtask build --abi aarch64
+# 从同一份 rootfs 提取 APK 用的 glibc loader（写入 <out>/<jni-abi>/）。
+cargo xtask loader --abi aarch64 --rootfs /path/to/rootfs --out .bionilux-loader
+
 export BIONILUX_ROOTFS=/path/to/rootfs
 bionilux /bin/bash -c 'cat /etc/os-release; apt-get update'
 
-# 健康检查：只有这里给出肯定答案时，插件才注册该工具。
+# 健康检查：只有这里给出肯定答案时，消费方应用才注册该工具。
 bionilux --print-config | grep -E 'ROOTFS_ENABLED|ROOTFS_LOADER'
 ```
 
@@ -67,24 +72,17 @@ bionilux --rootfs "$R" --print-config | grep HOST_PATHS
 bionilux --rootfs "$R" /bin/sh -c 'cat /data/data/<pkg>/files/app-state.json'
 ```
 
-## 实验性 DSH Mobile 插件与更新
-
-Linux 环境是一套**实验性的、可选择启用的系统，由我们自己的内部插件构成**。引导插件随
-应用分发、放在内置（hard）插件目录里；它**默认不启用**——存在 ≠ 启用——而且它也**不挂
-进 Cordis profile**，因此只有在用户显式启用该系统时宿主才会加载它（见 `docs/DECISIONS.md`
-D-014）。运行时插件与其它一切一样，来自 Release。安装 APK 更新或发布新的 Linux Release
-都不会启用它们，也不会把用户关掉的重新打开。轻量的引导插件与运行时插件分别以版本钉定
-的 GitHub Release 资产发布，由 `linux-release.json` 描述；在用户启用系统并显式确认安装
-运行时之后，`linux_bash` 才会被注册。
-
-Linux 系统有它自己的版本生命周期。手动检查更新始终可用；自动检查只对**已经启用**的
-Linux 系统生效，且必须满足「已安装的 DSH Mobile 应用版本发生变化」并且用户把它的自动
-更新选项打开。手动检查在未经显式确认的情况下**永远不会**安装更新。
+## 发布与消费
 
 Bionilux、rootfs 与一份共享的 glibc Node.js 包都以带校验和的 Release 资产发布，不作为
-提交进仓库的源码，也不使用 Git LFS。应用级只安装一份 Linux Node，供各 rootfs 实例共用；
-宿主的 Bionic Node 与 Termux Bash 保持不变。rootfs 提供的是 Debian/glibc **运行环境
-支持**，不是安全沙箱。
+提交进仓库的源码，也不使用 Git LFS；`linux-release.json` 描述双 ABI 的资产清单。
+
+原 DSH/Cordis 插件层（`packages/linux-bootstrap`、`packages/linux-runtime`）已移除。
+安装、校验、解包与执行由消费方应用（acp-agent-ui 的 Rust 安装器）完成；loader 与 rootfs
+来自同一个 Release tag，版本天然一致。
+
+应用级只安装一份 Linux Node，供各 rootfs 实例共用。rootfs 提供的是 Debian/glibc
+**运行环境支持**，不是安全沙箱。
 
 ## guest 路径语义
 

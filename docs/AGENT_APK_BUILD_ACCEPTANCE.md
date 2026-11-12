@@ -1,5 +1,7 @@
 # 机内 agent 构建 APK 与环境契约修复（2026-11-05）
 
+> **2026-11-12：** `packages/linux-*` 插件层已移除，文中对 `linux_bash` 工具描述引用的位置已失效。
+
 设备为 MuMu `127.0.0.1:16448`，应用 `com.dsharnessmobile.shell`，真实提供商 d1，模型 `deepseek-v4.1-flash`。用户已授权使用该实例；本轮没有启用子代理。提供商凭据没有写入源码或报告。
 
 ## APK 构建与装机

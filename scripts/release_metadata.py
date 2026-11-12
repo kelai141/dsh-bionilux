@@ -12,17 +12,29 @@ import subprocess
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?")
 
 
+def package_version(root):
+    """Read the version from Cargo.toml's [workspace.package] table."""
+    in_table = False
+    for line in (root / "Cargo.toml").read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_table = stripped == "[workspace.package]"
+        elif in_table:
+            key, _, value = stripped.partition("=")
+            if key.strip() == "version":
+                return value.strip().strip('"')
+    raise ValueError("Cargo.toml [workspace.package] version is missing")
+
+
 def identity(root, tag, run_id, attempt):
-    versions = [json.loads((root / "packages" / name / "package.json").read_text())["version"]
-                for name in ("linux-bootstrap", "linux-runtime")]
-    version = versions[0]
-    if versions[1] != version or not VERSION.fullmatch(version):
-        raise ValueError("bootstrap/runtime package versions must agree and be valid versions")
+    version = package_version(root)
+    if not VERSION.fullmatch(version):
+        raise ValueError("Cargo package version must be a valid version")
     if tag:
         if not tag.startswith("v") or not VERSION.fullmatch(tag[1:]):
             raise ValueError("tag must be a version such as v0.5.0 or v0.5.0-rc.1")
         if tag[1:] != version:
-            raise ValueError(f"tag {tag} does not match plugin package version {version}")
+            raise ValueError(f"tag {tag} does not match crate version {version}")
         mode = "release"
     else:
         if not re.fullmatch(r"[0-9]+", run_id) or not re.fullmatch(r"[0-9]+", attempt):

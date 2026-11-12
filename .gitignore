@@ -1,6 +1,6 @@
 # Rust
 /target/
-
+.agentscope
 # Build artifacts
 libbionilux_preload.so
 *.o
@@ -9,8 +9,6 @@ preload_data.h
 # Vendored test fixtures
 tests/helpers/*.bin
 
-# Plugin package test scratch data
-packages/*/.test-data/
 node_modules/
 __pycache__/
 
@@ -23,3 +21,5 @@ tmp-*
 /armroot.tar.gz
 /bn-pre-aarch64.so
 COMMIT_MSG_TMP.txt
+# Local IDE state
+.openidea/

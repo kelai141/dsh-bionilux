@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 /** Agent client for the independent emulator environment; discovers auth itself. */
 import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
 const serial = process.env.BN_DEVICE ?? 'emulator-5580';
 const fixture = '/data/user/0/com.dsharnessmobile.shell/files/independent-linux';
@@ -15,11 +14,8 @@ try {
       const response = await fetch(new URL('/health', origin), { signal: AbortSignal.timeout(1500) });
       ready = response.ok && (await response.json()).ready === true;
     } catch { /* The Windows launcher restores the persistent instance below. */ }
-    if (!ready && process.platform === 'win32') {
-      const start = fileURLToPath(new URL('./start-independent-linux.ps1', import.meta.url));
-      execFileSync('pwsh', ['-NoProfile', '-File', start, '-Serial', serial], {
-        stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 600000,
-      });
+    if (!ready) {
+      throw new Error('Linux runtime is not reachable; start it from acp-agent-ui (the standalone launcher was removed)');
     }
   }
   execFileSync('adb', ['-s', serial, 'forward', 'tcp:19790', 'tcp:18790'], { stdio: 'ignore' });

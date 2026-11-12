@@ -19,8 +19,6 @@
 
 | 文件 | 内容 |
 |------|------|
-| `linux-bootstrap-plugin.tar.xz` | 引导插件（`packages/linux-bootstrap`，npm pack 产物） |
-| `linux-runtime-plugin.tar.xz` | 运行时插件（`packages/linux-runtime`，npm pack 产物） |
 | `bionilux-aarch64` | Android/Bionic launcher |
 | `libbionilux_preload-aarch64.so` | glibc preload hook |
 | `bionilux-backend-aarch64.tar.xz` | 运行时后端打包（`bin/`、`lib/`、`scripts/`） |
@@ -37,10 +35,6 @@
   "schemaVersion": 1,
   "version": "0.5.0",
   "minMobileVersion": "0.14.0",
-  "plugins": {
-    "bootstrap": { "url": "...", "sha256": "...", "size": 0, "unpackedSize": 0, "pluginReleaseUrl": "..." },
-    "runtime":   { "url": "...", "sha256": "...", "size": 0, "unpackedSize": 0, "pluginReleaseUrl": "..." }
-  },
   "runtimes": [{
     "id": "debian-minimal",
     "label": "Debian 13 (trixie) for ARM64",
@@ -56,13 +50,11 @@
 * `url` 一律是**版本化**的 GitHub Release 下载地址（`/releases/download/<tag>/<file>`），
   不使用 `latest` 重定向作为完整性依据。
 * `sha256` 与 `size` 由发布流程对**实际产物**计算，`unpackedSize` 由解包统计得到。
-* `pluginReleaseUrl` 是给人看的 Release 页面地址，安装界面据此提供两个插件的下载页链接。
-* `version` 是 **Linux 系统版本**，与 DSH Mobile 应用版本、与插件包版本各自独立演进。
+* `version` 是 **Linux 系统版本**，与消费方应用版本各自独立演进。
 * `minMobileVersion` 声明最低可用应用版本；低于它时安装与自动更新都会被拒绝。
 
-清单由 `packages/linux-runtime/modules/manifest.js` 与
-`packages/linux-bootstrap/src/manifest.js` **两个校验器同时校验**（发布时与 CI 各跑一遍），
-防止两侧模型漂移。
+清单由 `scripts/build_release_manifest.py` 单一实现生成并校验（CI 与发布流程同一个脚本），
+避免两套模型漂移。
 
 ## 4. 完整性
 
@@ -74,32 +66,23 @@
    SHA-256 与字节数，不符即删除并失败。
 3. **解包**：只调用注入的安全解包器，拒绝绝对路径、`..` 与逃逸符号链接；
    不调用 `tar`/shell。
-4. **插件包**：校验 `package.json` 名称与入口文件，且入口必须是包内普通文件。
+4. **后端包**：`bionilux-backend-<arch>.tar.xz` 只允许普通文件、目录与符号链接；
+   拒绝绝对路径、`..`、硬链接、块/字符设备与 FIFO/socket。
 5. **安装后**：Bionilux 的健康检查（rootfs 关键文件、launcher/preload、共享 Node）通过，
    才会原子切换 `active.json`。
 
-## 5. 更新策略（独立于应用发布）
+## 5. 更新策略
 
-* 自动更新**默认关闭**，由用户在设置中开启。
-* 开启后，仅当**已启用**的 Linux 环境记录的 DSH Mobile 应用版本与当前版本不同时，
-  才检查一次更新（每个应用版本最多一次）。
-* 手动检查随时可用，且**不会**自动安装：它只报告 `updateAvailable`，由用户确认安装。
-* 降级被拒绝；相同版本必须走“重新安装”。
-* 发布新 Linux 版本、发布新 APK、切换开关、恢复网络都不会重新注入或启用插件。
+本仓库只发布版本化资产，不实现自动更新：是否检查、何时安装、如何回滚由消费方应用
+（acp-agent-ui 的 Rust 安装器）决定。已安装运行时与发布资产的版本对应关系由
+`linux-release.json` 与 Release tag 表达，降级与重装语义由消费方保证。
 
 ## 6. 本地复现
 
 ```bash
-# 两个插件包的测试（CI 与发布流程都会跑）
-node --test packages/linux-bootstrap/test/*.test.mjs packages/linux-runtime/test/*.test.mjs
-
-# 清单双校验（发布流程同样执行）
-node --input-type=module -e '
-  import { validateManifest } from "./packages/linux-runtime/modules/manifest.js";
-  import { validateManifestShape } from "./packages/linux-bootstrap/src/manifest.js";
-  const m = JSON.parse(await (await import("node:fs/promises")).readFile("linux-release.json", "utf8"));
-  validateManifest(m); validateManifestShape(m, process.env.TAG);
-'
+# 清单生成与发布资产契约（CI 与发布流程都会跑）
+python3 tests/test_release_workflows.py -v
+python3 scripts/build_release_manifest.py target/release-assets <owner/repo> <tag> <version> <min-mobile> <node-version>
 ```
 
 ## 7. 已知缺口

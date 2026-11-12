@@ -3,7 +3,7 @@
 本项目的 Linux 命令、依赖安装、编译和打包，使用模拟器内的 Debian 环境。
 
 - 状态：`node scripts/linux-agent.mjs status`。
-- 未启动时：`pwsh -NoProfile -File scripts/start-independent-linux.ps1`。等待安装完成后继续。
+- 启动通道已随 DSH 插件层移除：原 `scripts/start-independent-linux.ps1` 依赖 `packages/*` 与 `tests/acceptance/standalone-device.mjs`。在 acp-agent-ui 的安装器接管前，本仓库只用 `cargo test` + `tests/*.sh` 做本机回归。
 - 执行：`node scripts/linux-agent.mjs exec '<Linux command>'`。默认复用 `agent` 会话，保留工作目录、环境变量和 shell 状态。
 - 工具说明：`node scripts/linux-agent.mjs tools`。
 - 长构建：调用 `linux_session` 的 `start` / `poll` 动作，按输出偏移续读；命令格式见工具说明。
@@ -12,3 +12,14 @@
 - Windows / Android 交叉构建仍在宿主执行。不要把 Debian 的成功结果冒充 Android 设备验证。
 
 所有本地归档、编译产物和验证报告放入 `target/independent-linux/`，不要提交二进制或令牌。
+
+## 构建编排
+
+`cargo xtask` 是 launcher / preload / backend / APK loader 的统一入口：
+
+- `cargo xtask build --abi <aarch64|x86_64>`：构建 Android launcher 与 glibc preload 到 `target/release-assets/`。
+- `cargo xtask backend --abi <...>`：组装 `target/backend-<abi>/`。
+- `cargo xtask loader --abi <...> --rootfs <dir> --out <dir>`：从同一份 rootfs 提取 glibc loader。
+- `cargo xtask all --abi <...>`：build + backend。
+
+Windows 宿主不能编译 launcher（`nix` 是 Unix-only）；`cargo build -p bionilux-install` 与 `cargo test -p bionilux-install` 可在 Windows 运行。
