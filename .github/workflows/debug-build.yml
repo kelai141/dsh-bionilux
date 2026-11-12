@@ -129,9 +129,6 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
       - name: Rust format, lint, and unit tests
         run: |
           cargo fmt --check
@@ -154,10 +151,6 @@ jobs:
           bash tests/preload_paths.sh
           bash tests/ubsan.sh
           bash tests/prepare_rootfs.sh
-      - name: Plugin package tests
-        run: |
-          npm ci --prefix packages/linux-runtime --ignore-scripts --no-audit --no-fund
-          node --test packages/linux-bootstrap/test/*.test.mjs packages/linux-runtime/test/*.test.mjs
       - name: Release metadata, manifest and ELF layout contract tests
         run: |
           python3 tests/test_release_workflows.py -v
@@ -459,64 +452,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  build-plugin-assets:
-    name: package installable plugins
-    needs: [prepare, validate]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.source_sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-      - name: Pack bootstrap and runtime plugins as standalone tar.xz assets
-        env:
-          PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          source_date_epoch="$(git show -s --format=%ct HEAD)"
-          stage="$GITHUB_WORKSPACE/target/release-assets"
-          mkdir -p "$stage" "$GITHUB_WORKSPACE/target/npm-packs" "$GITHUB_WORKSPACE/target/npm-unpacked"
-
-          for package in linux-bootstrap linux-runtime; do
-            package_dir="packages/$package"
-            package_version="$(node -p "require('./$package_dir/package.json').version")"
-            if [[ "$package_version" != "$PACKAGE_VERSION" ]]; then
-              echo "Expected package version $PACKAGE_VERSION does not match $package_dir version $package_version" >&2
-              exit 1
-            fi
-            mkdir -p "$GITHUB_WORKSPACE/target/npm-packs/$package" \
-              "$GITHUB_WORKSPACE/target/npm-unpacked/$package"
-            npm pack "./$package_dir" --json \
-              --pack-destination "$GITHUB_WORKSPACE/target/npm-packs/$package" \
-              > "$GITHUB_WORKSPACE/target/npm-packs/$package/pack.json"
-            tarball="$(node -e 'const fs=require("node:fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8"))[0].filename)' \
-              "$GITHUB_WORKSPACE/target/npm-packs/$package/pack.json")"
-            python3 -c 'import sys,tarfile; a=tarfile.open(sys.argv[1],"r:gz"); bad=[m.name for m in a.getmembers() if m.issym() or m.islnk()]; sys.exit("Refusing package symlink: "+bad[0]) if bad else a.extractall(sys.argv[2], filter="data")' \
-              "$GITHUB_WORKSPACE/target/npm-packs/$package/$tarball" \
-              "$GITHUB_WORKSPACE/target/npm-unpacked/$package"
-            test -f "$GITHUB_WORKSPACE/target/npm-unpacked/$package/package/package.json"
-            case "$package" in
-              linux-bootstrap) output="$stage/linux-bootstrap-plugin.tar.xz" ;;
-              linux-runtime) output="$stage/linux-runtime-plugin.tar.xz" ;;
-              *) echo "Unknown plugin package: $package" >&2; exit 1 ;;
-            esac
-            tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
-              -cJf "$output" -C "$GITHUB_WORKSPACE/target/npm-unpacked/$package/package" .
-          done
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-plugins
-          path: target/release-assets/*
-          if-no-files-found: error
-          retention-days: 7
-
   assemble:
     name: verify and collect debug/release assets
-    needs: [prepare, source-guard, validate, build-runtime-assets, build-plugin-assets]
+    needs: [prepare, source-guard, validate, build-runtime-assets]
     runs-on: ubuntu-24.04
     env:
       BUILD_TAG: ${{ needs.prepare.outputs.tag }}
@@ -527,9 +465,6 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
           persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -543,8 +478,6 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/build_release_manifest.py target/release-assets "$GITHUB_REPOSITORY" "$BUILD_TAG" "$BUILD_VERSION" "$MIN_MOBILE_VERSION" "$NODE_VERSION"
-          node --input-type=module -e 'import fs from "node:fs"; import {validateManifest} from "./packages/linux-runtime/modules/manifest.js"; validateManifest(JSON.parse(fs.readFileSync("target/release-assets/linux-release.json", "utf8")));'
-          node --input-type=module -e 'import fs from "node:fs"; import {validateManifestShape} from "./packages/linux-bootstrap/src/manifest.js"; validateManifestShape(JSON.parse(fs.readFileSync("target/release-assets/linux-release.json", "utf8")), process.env.BUILD_TAG);'
           cd target/release-assets
           sha256sum --check --strict SHA256SUMS
       - uses: actions/upload-artifact@v4

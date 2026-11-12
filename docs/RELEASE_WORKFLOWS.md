@@ -20,8 +20,8 @@ gh workflow run debug-build.yml \
 ~~~
 
 完成后下载该次运行的 **linux-assets** Artifact，保存 7 天。
-也会保留 release-runtime-aarch64、release-runtime-x86_64 和 release-plugins 分组。
-调试标识为 v<插件版本>-debug.<run_id>.<attempt>，无需建立 Git tag。
+也会保留 release-runtime-aarch64、release-runtime-x86_64 分组。
+调试标识为 v<crate 版本>-debug.<run_id>.<attempt>，无需建立 Git tag。
 此入口只有 contents:read，不创建 Release，也不替换已有安装。
 调试 manifest 中的 release 下载链接是占位的预期发布位置，Artifact 本身不是公开下载服务；
 不能把其中的链接当成已经可下载安装的 Release URL。
@@ -29,7 +29,7 @@ gh workflow run debug-build.yml \
 ## 草稿发布
 
 在 Actions 选择 **Draft release**，填入 tag，例如 v0.5.0。
-tag 去掉 v 后必须与 linux-bootstrap 和 linux-runtime 的 package.json 版本一致。
+tag 去掉 v 后必须与根 Cargo.toml 的 `[package] version` 一致。
 source_ref 与调试入口相同；整个运行固定为最初解析出的同一个提交。
 
 默认从该提交的仓库根 notes.md 读取说明，也可以修改 notes_file 指定仓库内其他文件。
@@ -48,10 +48,10 @@ gh workflow run release.yml \
 说明按 UTF-8 处理，不执行其中的反引号、$() 或其他 shell 内容。
 GitHub workflow_dispatch 整体输入有大小限制，大文件应提交到仓库并使用 notes_file。
 
-发布工作流复用同一双架构构建流程。两架构与插件全部成功、清单与校验和通过后，
+发布工作流复用同一双架构构建流程。两架构全部成功、清单与校验和通过后，
 自动上传到 **draft release**；不会自动公开发布，不会自动设置为 latest。
 已有草稿或正式 Release 一律不覆盖；相同 tag 如已指向其他提交也拒绝继续。
-要重新发布，请先明确处理旧草稿，或更新插件版本并使用新 tag。
+要重新发布，请先明确处理旧草稿，或更新 crate 版本并使用新 tag。
 公开发布由维护者在 GitHub 草稿页面审阅后手动决定。
 
 ## 产物与核验
@@ -59,8 +59,7 @@ GitHub workflow_dispatch 整体输入有大小限制，大文件应提交到仓�
 linux-assets 与 draft release 包含：
 
 - 两架构 launcher、preload、backend/rootfs/Node 归档。
-- linux-bootstrap-plugin.tar.xz 与 linux-runtime-plugin.tar.xz。
-- linux-release.json：双架构运行时及插件的下载地址、大小与 SHA-256。
+- linux-release.json：双架构运行时的下载地址、大小与 SHA-256。
 - BUILD_INFO.json：实际源码 SHA、构建 tag、插件版本及 debug/release 模式。
 - SHA256SUMS：全部其他产物的校验和。
 

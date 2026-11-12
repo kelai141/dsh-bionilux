@@ -1,6 +1,8 @@
 # HANDOFF — 历史工作交接（2026-11-11 22:40）
 
 > 此为上一轮停工快照。后续 0.10.0 工作已继续；不要把这里的失败测试、设备型号或未提交状态视为当前状态。设备重新识别、兼容前提见 [MOBILE_COMPATIBILITY.md](MOBILE_COMPATIBILITY.md)。
+>
+> **2026-11-12：** DSH/Cordis 插件层（`packages/linux-bootstrap`、`packages/linux-runtime`）已移除；文中对它们的引用仅为历史记录，安装与执行现由 acp-agent-ui 的 Rust 安装器承担。
 
 > 本轮任务：修掉 [RISK.md](RISK.md) 里的 P0/P1，然后 PR + 合并。
 > **实际状态：部分完成，未 PR、未合并。** 工作区有 7 个文件未提交的改动。

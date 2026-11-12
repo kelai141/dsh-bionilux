@@ -3,7 +3,7 @@
 本项目的 Linux 命令、依赖安装、编译和打包，使用模拟器内的 Debian 环境。
 
 - 状态：`node scripts/linux-agent.mjs status`。
-- 未启动时：`pwsh -NoProfile -File scripts/start-independent-linux.ps1`。等待安装完成后继续。
+- 启动通道已随 DSH 插件层移除：原 `scripts/start-independent-linux.ps1` 依赖 `packages/*` 与 `tests/acceptance/standalone-device.mjs`。在 acp-agent-ui 的安装器接管前，本仓库只用 `cargo test` + `tests/*.sh` 做本机回归。
 - 执行：`node scripts/linux-agent.mjs exec '<Linux command>'`。默认复用 `agent` 会话，保留工作目录、环境变量和 shell 状态。
 - 工具说明：`node scripts/linux-agent.mjs tools`。
 - 长构建：调用 `linux_session` 的 `start` / `poll` 动作，按输出偏移续读；命令格式见工具说明。

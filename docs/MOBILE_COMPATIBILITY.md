@@ -1,5 +1,9 @@
 # DSH Mobile compatibility — Bionilux 0.10.0
 
+> **2026-11-12：** 插件层（`packages/linux-*`）已移除；文中安装链路对插件源码的引用是历史实现，
+> 现由 acp-agent-ui 的 Rust 安装器（`src-tauri/src/linux_runtime/`）承担。loader 仍必须与 rootfs
+> 同 tag 并进入 APK 的 `jniLibs/<abi>/`。
+
 **0.10.0 does not guarantee that an existing DSH Mobile APK can install and run Linux.** Satisfying `minMobileVersion` is not proof that the APK ships a compatible native glibc loader. A backend/rootfs download cannot install an executable APK-native file into an existing APK.
 
 ## Prerequisites and evidence boundary

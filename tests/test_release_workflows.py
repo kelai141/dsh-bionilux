@@ -28,10 +28,7 @@ class MetadataTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        for package in ("linux-runtime", "linux-bootstrap"):
-            path = self.root / "packages" / package
-            path.mkdir(parents=True)
-            (path / "package.json").write_text('{"version":"0.5.0"}')
+        (self.root / "Cargo.toml").write_text('[package]\nname = "bionilux"\nversion = "0.5.0"\n')
 
     @patch.object(metadata.subprocess, "check_output", return_value=SHA + "\n")
     def test_debug_identity_and_release_identity(self, _git):
@@ -47,10 +44,9 @@ class MetadataTests(unittest.TestCase):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 metadata.identity(self.root, tag, "123", "2")
 
-    def test_reject_disagreeing_packages(self):
-        (self.root / "packages/linux-runtime/package.json").write_text('{"version":"0.6.0"}')
+    def test_reject_tag_that_does_not_match_crate_version(self):
         with self.assertRaises(ValueError):
-            metadata.identity(self.root, "v0.5.0", "123", "2")
+            metadata.identity(self.root, "v0.6.0", "123", "2")
 
     def test_notes_content_preserves_literal_shell_and_unicode(self):
         content = '# 更新\n$(touch BAD) `echo BAD` "quotes"\n'
@@ -122,7 +118,7 @@ class ManifestTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.archives = ["linux-bootstrap-plugin.tar.xz", "linux-runtime-plugin.tar.xz"]
+        self.archives = []
         for arch, node in (("aarch64", "arm64"), ("x86_64", "x64")):
             self.archives.extend((f"bionilux-backend-{arch}.tar.xz", f"debian-minimal-{arch}.tar.xz",
                                   f"node-glibc-v24.22.0-linux-{node}.tar.xz"))
@@ -150,7 +146,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((self.root / "linux-release.json").read_text())
         self.assertEqual([r["architecture"] for r in manifest["runtimes"]], ["arm64", "x64"])
-        self.assertEqual(len((self.root / "SHA256SUMS").read_text().splitlines()), 16)
+        self.assertEqual(len((self.root / "SHA256SUMS").read_text().splitlines()), 14)
 
     def test_missing_architecture_fails(self):
         (self.root / "debian-minimal-aarch64.tar.xz").unlink()

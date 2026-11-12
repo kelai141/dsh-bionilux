@@ -1,12 +1,12 @@
-# bionilux — the DSH Mobile Linux runtime
+# bionilux — a Debian/glibc runtime for Android apps
 
 > 中文版见 [`README.md`](README.md)。The primary README is the Chinese one; this
 > file preserves the English version.
 
-**This is DSH Mobile's Linux runtime.** It hosts a full Debian user space inside
-an Android app process: real `apt`/`dpkg`, working DNS and TLS, native-speed
-glibc execution, and no PRoot. It is a *component* of DSH Mobile, driven by a
-Cordis plugin — not a standalone Termux utility.
+**This is a Debian/glibc runtime for an Android app.** It hosts a full Debian
+user space inside an Android app process: real `apt`/`dpkg`, working DNS and
+TLS, native-speed glibc execution, and no PRoot. The consuming app installs and
+drives it as Release assets; it is not a standalone Termux utility.
 
 This repository is a fork of [`theonuverse/bionilux`](https://github.com/theonuverse/bionilux).
 Upstream solves "run one glibc binary on Termux". This fork solves "be the Linux
@@ -45,7 +45,7 @@ sh scripts/prepare-rootfs.sh --rootfs /path/to/rootfs --dns "$DNS_SERVERS"
 export BIONILUX_ROOTFS=/path/to/rootfs
 bionilux /bin/bash -c 'cat /etc/os-release; apt-get update'
 
-# Health check: the plugin registers the tool only when this says yes.
+# Health check: the consuming app registers the tool only when this says yes.
 bionilux --print-config | grep -E 'ROOTFS_ENABLED|ROOTFS_LOADER'
 ```
 
@@ -67,32 +67,20 @@ bionilux --rootfs "$R" --print-config | grep HOST_PATHS
 bionilux --rootfs "$R" /bin/sh -c 'cat /data/data/<pkg>/files/app-state.json'
 ```
 
-## Experimental DSH Mobile plugins and updates
-
-The Linux environment is an **experimental, opt-in system built from our own
-internal plugins**. The bootstrap is distributed with the app in the built-in
-(hard) plugin directory; it is not enabled by default — presence is not
-activation — and it is not mounted in the Cordis profile either, so the host
-loads it only when the user explicitly enables the system (`docs/DECISIONS.md`
-D-014). The runtime plugin arrives the same way everything else does, from a
-Release. Neither installing an
-APK update nor publishing a new Linux Release enables them, and neither
-re-enables one the user turned off. The lightweight bootstrap and runtime plugins
-are separately published as version-pinned GitHub Release assets described by
-`linux-release.json`; the user enables the system and explicitly confirms runtime
-installation before `linux_bash` is registered.
-
-The Linux system has its own version lifecycle. Manual update checks are
-available; automatic checking is only eligible for an already activated Linux
-system after the installed DSH Mobile app version changes, and only when its
-user-controlled auto-update option is enabled. A manual check never installs an
-update without explicit confirmation.
+## Publishing and consumption
 
 Bionilux, rootfs, and a shared glibc Node.js package are published as checksummed
-Release assets, not committed source or Git LFS objects. One app-level Linux
-Node installation is shared across rootfs instances; the host's Bionic Node and
-Termux Bash remain unchanged. The rootfs provides Debian/glibc runtime support,
-not a security sandbox.
+Release assets, not committed source or Git LFS objects. `linux-release.json`
+describes the dual-ABI asset set.
+
+The former DSH/Cordis plugin layer (`packages/linux-bootstrap`,
+`packages/linux-runtime`) has been removed. Downloading, verification,
+extraction and execution are owned by the consuming app (acp-agent-ui's Rust
+installer); the loader and rootfs come from the same Release tag, so their
+versions cannot drift apart.
+
+One app-level Linux Node installation is shared across rootfs instances. The
+rootfs provides Debian/glibc runtime support, not a security sandbox.
 
 ## Guest path semantics
 

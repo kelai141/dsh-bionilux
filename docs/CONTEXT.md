@@ -6,28 +6,22 @@
 ## 1. 系统全景
 
 ```
-dsh-mobile-apk (Android app, Bionic)
+消费方 Android app (acp-agent-ui, Bionic)
 │
-├── DSH Core / Cordis / Node.js         ← 始终跑在 Android Bionic 上
-│   └── Termux Bash                     ← 既有宿主任务，保持不变
+├── host Node / Termux Bash            ← 既有宿主任务，保持不变
 │
-└── Linux Environment System (可选、独立更新)
-    ├── Bootstrap Plugin (Cordis, tiny)
-    │   └── 设置 → Linux环境 / 安装入口 / 自动与手动更新
-    └── Runtime Plugin (按需安装)
-        ├── Runtime Manager             ← 下载/安装/启用/卸载
-        ├── Linux Tool Provider
-        │   └── linux_bash              ← Agent 选择 Debian/glibc 环境
-        ├── Shared glibc Node           ← 应用级一份，各 rootfs 复用
-        └── Runtime Backend             ← 本仓库
-            └── bionilux (Rust launcher, Bionic)
-                ├── launcher            src/main.rs, src/launcher/*
-                ├── rootfs 路径语义层    src/launcher/rootfs.rs
-                └── preload hook (glibc) src/preload/hooks.c
-                        │
-                        ▼
-                  Debian Minimal rootfs
-                  (/usr/bin/bash, glibc, apt, dpkg …)
+└── Linux Environment System
+    ├── 安装器（消费方，Rust）         ← 下载/校验/解包/启用/卸载
+    ├── Shared glibc Node              ← 应用级一份，各 rootfs 复用
+    └── Runtime Backend                ← 本仓库
+        └── bionilux (Rust launcher, Bionic)
+            ├── launcher            src/main.rs, src/launcher/*
+            ├── rootfs 路径语义层    src/launcher/rootfs.rs
+            └── preload hook (glibc) src/preload/hooks.c
+                    │
+                    ▼
+              Debian Minimal rootfs
+              (/usr/bin/bash, glibc, apt, dpkg …)
 ```
 
 ## 2. 术语
@@ -77,7 +71,7 @@ dsh-mobile-apk (Android app, Bionic)
 
 | 不变量 | 含义 |
 |--------|------|
-| **Cordis 只管接入** | 插件负责能力接入与生命周期，不参与路径语义 |
+| **消费方只管接入** | 插件/安装器负责能力接入与生命周期，不参与路径语义 |
 | **后端可替换** | 换 backend 不改变 `linux_bash` 的接口与快照格式 |
 | **DSH 数据边界** | 默认直通路径包含推导出的 App 私有目录；集成方须审查 HOST_PATHS，不能把 rootfs 当作 DSH Core 数据的安全隔离边界 |
 | **失败不降级** | 健康检查失败时不注册 `linux_bash`，也不破坏已有 PRoot 环境 |
