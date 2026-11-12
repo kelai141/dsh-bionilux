@@ -15,7 +15,7 @@
 #  2. Name resolution. Android has no standard /etc/resolv.conf, so the guest's
 #     resolver configuration must be supplied from outside. DNS reachability
 #     depends on the device and network. This script only writes what it is told to; the
-#     DSH plugin is responsible for learning the device's DNS servers and
+#     consuming app is responsible for learning the device's DNS servers and
 #     passing them here.
 #
 # Usage:
