@@ -21,3 +21,5 @@ tmp-*
 /armroot.tar.gz
 /bn-pre-aarch64.so
 COMMIT_MSG_TMP.txt
+# Local IDE state
+.openidea/
