@@ -131,8 +131,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Rust format, lint, and unit tests
         run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
+          cargo fmt --all --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo test --locked --verbose
       - name: Native and host regressions
         run: |

@@ -530,13 +530,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_file_over_symlink() {
+    fn replaces_symlink_instead_of_writing_through_it() {
         let dir = scratch("file-over-link");
-        let bytes = raw_tar(&[symlink("a", "/tmp/pwned"), file("a", b"x")]);
-        let error =
-            extract_tar(Cursor::new(bytes), &dir, limits_for(AssetKind::Rootfs)).unwrap_err();
-        assert!(error.contains("不是文件") || error.contains("穿"));
-        assert!(!Path::new("/tmp/pwned").exists());
+        let probe = format!("/tmp/bionilux-probe-{}", std::process::id());
+        let bytes = raw_tar(&[symlink("a", probe.as_str()), file("a", b"x")]);
+        let stats = extract_tar(Cursor::new(bytes), &dir, limits_for(AssetKind::Rootfs))
+            .expect("同名普通文件应当替换链接，而不是报错");
+        assert_eq!(stats.entries, 2);
+        // 关键安全性质：同名链接先被 unlink，写的是新文件，链接目标一个字节都没碰
+        assert!(!Path::new(&probe).exists(), "写入穿过了符号链接: {probe}");
+        let meta = fs::symlink_metadata(dir.join("a")).unwrap();
+        assert!(meta.is_file() && !meta.file_type().is_symlink());
         let _ = fs::remove_dir_all(&dir);
     }
 

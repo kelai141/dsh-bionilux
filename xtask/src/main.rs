@@ -197,10 +197,10 @@ fn backend(abi: &Abi) -> Result<(), String> {
         "prepare-android-rootfs.sh",
         "ldconfig-android.sh",
     ] {
-        copy(
-            &root.join("scripts").join(script),
-            &backend.join("scripts").join(script),
-        )?;
+        let target = backend.join("scripts").join(script);
+        copy(&root.join("scripts").join(script), &target)?;
+        // 这些脚本要直接被调用，权限不能靠 git 记录（Windows 检出时没有执行位）
+        make_executable(&target)?;
     }
     println!("backend: {}", backend.display());
     Ok(())
@@ -242,6 +242,18 @@ fn copy(source: &Path, target: &Path) -> Result<(), String> {
     fs::copy(source, target)
         .map(|_| ())
         .map_err(|e| format!("copy {} -> {}: {e}", source.display(), target.display()))
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn run_command(mut command: Command) -> Result<(), String> {

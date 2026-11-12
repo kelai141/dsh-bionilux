@@ -112,7 +112,7 @@ pub fn execute(spec: &ExecSpec<'_>) -> Result<(), String> {
 fn run_traced(exec_path: &CString, c_args: &[CString], c_env: &[CString]) -> ! {
     use nix::sys::ptrace::{self, Options};
     use nix::sys::signal::Signal;
-    use nix::sys::wait::{waitpid, WaitStatus};
+    use nix::sys::wait::{WaitStatus, waitpid};
     use nix::unistd::ForkResult;
 
     match unsafe { nix::unistd::fork() } {
