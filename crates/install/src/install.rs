@@ -303,8 +303,67 @@ pub fn remove_dir(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::manifest::Release;
+    use std::cell::RefCell;
 
     const REAL: &str = include_str!("../tests/fixtures/linux-release.json");
+    const BACKEND_OLD: &[u8] = include_bytes!("../tests/fixtures/backend-old.tar.xz");
+    const BACKEND_NEW: &[u8] = include_bytes!("../tests/fixtures/backend-new.tar.xz");
+    const ROOTFS: &[u8] = include_bytes!("../tests/fixtures/rootfs.tar.xz");
+    const NODE: &[u8] = include_bytes!("../tests/fixtures/node.tar.xz");
+    const NODE_BROKEN: &[u8] = include_bytes!("../tests/fixtures/node-broken.tar.xz");
+
+    /// 清单里的资产 URL 决定缓存文件名，所以夹具名必须与 URL 尾段一致。
+    fn asset_entry(name: &str, bytes: &[u8]) -> String {
+        format!(
+            r#"{{"url":"https://github.com/Endlessworld/dsh-bionilux/releases/download/v0.11.0/{name}","sha256":"{}","size":{},"unpackedSize":1024}}"#,
+            sha256_hex(bytes),
+            bytes.len()
+        )
+    }
+
+    fn release_for(backend: (&str, &[u8]), rootfs: (&str, &[u8]), node: (&str, &[u8])) -> Release {
+        let json = format!(
+            r#"{{"schemaVersion":1,"version":"0.11.0","runtimes":[{{"id":"test","label":"Test","architecture":"arm64","backend":"bionilux","backendAsset":{},"rootfsAsset":{},"nodeAsset":{}}}]}}"#,
+            asset_entry(backend.0, backend.1),
+            asset_entry(rootfs.0, rootfs.1),
+            asset_entry(node.0, node.1)
+        );
+        Release::parse(json.as_bytes()).unwrap()
+    }
+
+    /// 预置下载缓存：摘要命中后 `install` 不会碰网络。
+    fn seed_cache(files_dir: &Path, assets: &[(&str, &[u8])]) {
+        let cache = env_root(files_dir).join("downloads");
+        fs::create_dir_all(&cache).unwrap();
+        for (name, bytes) in assets {
+            fs::write(cache.join(name), bytes).unwrap();
+        }
+    }
+
+    fn install_with(
+        files_dir: &Path,
+        backend: (&str, &[u8]),
+        rootfs: (&str, &[u8]),
+        node: (&str, &[u8]),
+    ) -> Result<Record, String> {
+        seed_cache(files_dir, &[backend, rootfs, node]);
+        let release = release_for(backend, rootfs, node);
+        let runtime = release.runtime_for("aarch64").unwrap();
+        install(files_dir, runtime, "0.11.0", |_, _, _, _| {}, || false)
+    }
+
+    fn put(path: &Path, content: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -359,5 +418,169 @@ mod tests {
         let error = verify_layout(&root, runtime).unwrap_err();
         assert!(error.contains("node"), "{error}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_writes_the_slot_and_the_record() {
+        let files_dir = scratch("install-ok");
+        let record = install_with(
+            &files_dir,
+            ("backend-new.tar.xz", BACKEND_NEW),
+            ("rootfs.tar.xz", ROOTFS),
+            ("node.tar.xz", NODE),
+        )
+        .unwrap();
+
+        let slot = Slot::new(&files_dir, "test");
+        assert_eq!(fs::read_to_string(slot.launcher()).unwrap(), "new");
+        assert!(slot.preload().is_file());
+        assert!(slot.rootfs.join("bin/bash").is_file());
+        assert!(slot.node.join("bin/node").is_file());
+        // 装完要补上解析器配置：缺了它 apt 在 guest 里解析不了仓库域名
+        assert!(slot.rootfs.join("etc/resolv.conf").is_file());
+
+        let saved: Record =
+            serde_json::from_str(&fs::read_to_string(slot.record_path()).unwrap()).unwrap();
+        assert_eq!(saved.runtime_id, "test");
+        assert_eq!(saved.release_version, "0.11.0");
+        assert_eq!(saved.architecture, "arm64");
+        assert_eq!(saved.assets.len(), 3);
+        assert_eq!(record.assets, saved.assets);
+        let _ = fs::remove_dir_all(&files_dir);
+    }
+
+    #[test]
+    fn a_failed_self_check_keeps_the_previous_runtime() {
+        let files_dir = scratch("verify-fail");
+        install_with(
+            &files_dir,
+            ("backend-old.tar.xz", BACKEND_OLD),
+            ("rootfs.tar.xz", ROOTFS),
+            ("node.tar.xz", NODE),
+        )
+        .unwrap();
+        let slot = Slot::new(&files_dir, "test");
+
+        let error = install_with(
+            &files_dir,
+            ("backend-new.tar.xz", BACKEND_NEW),
+            ("rootfs.tar.xz", ROOTFS),
+            ("node-broken.tar.xz", NODE_BROKEN),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("node"), "{error}");
+        // 旧 runtime 一个字节都没动
+        assert_eq!(fs::read_to_string(slot.launcher()).unwrap(), "old");
+        assert!(slot.rootfs.join("bin/bash").is_file());
+        // 失败只丢暂存目录
+        assert!(!env_root(&files_dir).join(".staging-test").exists());
+        let _ = fs::remove_dir_all(&files_dir);
+    }
+
+    #[test]
+    fn cleanup_staging_removes_leftovers_but_keeps_the_slot() {
+        let files_dir = scratch("cleanup");
+        let env = env_root(&files_dir);
+        put(&env.join(".staging-test/backend/bin/bionilux"), "x");
+        put(&env.join("test.old/bin/bionilux"), "x");
+        put(&env.join("test/bin/bionilux"), "old");
+        put(&env.join("downloads/backend-old.tar.xz"), "x");
+
+        cleanup_staging(&files_dir);
+
+        assert!(!env.join(".staging-test").exists());
+        assert!(!env.join("test.old").exists());
+        assert!(env.join("test/bin/bionilux").is_file());
+        assert!(env.join("downloads/backend-old.tar.xz").is_file());
+        let _ = fs::remove_dir_all(&files_dir);
+    }
+
+    #[test]
+    fn a_matching_download_is_reused_instead_of_refetched() {
+        let files_dir = scratch("cache-hit");
+        let assets = [
+            ("backend-new.tar.xz", BACKEND_NEW),
+            ("rootfs.tar.xz", ROOTFS),
+            ("node.tar.xz", NODE),
+        ];
+        seed_cache(&files_dir, &assets);
+        let release = release_for(assets[0], assets[1], assets[2]);
+        let runtime = release.runtime_for("aarch64").unwrap();
+        let phases = RefCell::new(Vec::new());
+
+        install(
+            &files_dir,
+            runtime,
+            "0.11.0",
+            |phase, _, _, _| phases.borrow_mut().push(phase),
+            || false,
+        )
+        .unwrap();
+
+        // 摘要命中就不该再走下载（真走下载会去打 github.com）
+        assert_eq!(
+            *phases.borrow(),
+            vec![
+                Phase::Extracting,
+                Phase::Extracting,
+                Phase::Extracting,
+                Phase::Verifying,
+                Phase::Activating
+            ]
+        );
+        let _ = fs::remove_dir_all(&files_dir);
+    }
+
+    #[test]
+    fn activate_failure_reports_an_error_and_restores_the_old_slot() {
+        let files_dir = scratch("activate-fail");
+        let slot = Slot::new(&files_dir, "test");
+        put(&slot.launcher(), "old");
+        let missing_staging = env_root(&files_dir).join(".staging-test");
+        assert!(!missing_staging.exists());
+
+        let error = activate(missing_staging, &slot.root).unwrap_err();
+
+        assert!(error.contains("启用新 runtime 失败"), "{error}");
+        // 旧目录被换回原位，而不是留下一个空槽位
+        assert_eq!(fs::read_to_string(slot.launcher()).unwrap(), "old");
+        assert!(!slot.root.with_file_name("test.old").exists());
+        let _ = fs::remove_dir_all(&files_dir);
+    }
+
+    #[test]
+    fn reinstalling_the_same_slot_replaces_the_old_tree() {
+        let files_dir = scratch("reinstall");
+        install_with(
+            &files_dir,
+            ("backend-old.tar.xz", BACKEND_OLD),
+            ("rootfs.tar.xz", ROOTFS),
+            ("node.tar.xz", NODE),
+        )
+        .unwrap();
+        let slot = Slot::new(&files_dir, "test");
+        assert_eq!(fs::read_to_string(slot.launcher()).unwrap(), "old");
+
+        install_with(
+            &files_dir,
+            ("backend-new.tar.xz", BACKEND_NEW),
+            ("rootfs.tar.xz", ROOTFS),
+            ("node.tar.xz", NODE),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(slot.launcher()).unwrap(), "new");
+        // 不叠加：备份目录已清掉，环境目录下只剩缓存和当前槽位
+        let env = env_root(&files_dir);
+        assert!(!env.join("test.old").exists());
+        let mut names: Vec<String> = fs::read_dir(&env)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["downloads", "test"]);
+        let _ = fs::remove_dir_all(&files_dir);
     }
 }
