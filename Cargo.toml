@@ -1,7 +1,8 @@
 [package]
 name = "bionilux"
-version = "0.10.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -12,3 +13,11 @@ nix = { version = "0.31.3", features = ["process", "fs", "ptrace", "signal"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[workspace]
+members = ["crates/install", "xtask"]
+
+[workspace.package]
+version = "0.10.0"
+edition = "2024"
+license = "MIT"

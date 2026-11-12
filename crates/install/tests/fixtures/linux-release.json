@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "version": "0.10.0",
+  "minMobileVersion": "0.14.0",
+  "plugins": {
+    "bootstrap": {
+      "url": "https://github.com/Endlessworld/dsh-bionilux/releases/download/v0.10.0/linux-bootstrap-plugin.tar.xz",
+      "sha256": "1425c30cf9f71f869154c9e8375a6e591253adbb6bd29e6078cbff62b6346bdd",
+      "size": 29584,
+      "unpackedSize": 114403,
+      "pluginReleaseUrl": "https://github.com/Endlessworld/dsh-bionilux/releases/tag/v0.10.0"
+    },
+    "runtime": {
+      "url": "https://github.com/Endlessworld/dsh-bionilux/releases/download/v0.10.0/linux-runtime-plugin.tar.xz",
+      "sha256": "06e44ebdf653d399eb26efc2ee6dc2c408dd9d1794c619b209ea93476611d76b",
+      "size": 44984,
+      "unpackedSize": 192318,
+      "pluginReleaseUrl": "https://github.com/Endlessworld/dsh-bionilux/releases/tag/v0.10.0"
+    }
+  },
+  "runtimes": [
+    {
+      "id": "debian-minimal",
+      "label": "Debian 13 (trixie) for ARM64",
+      "architecture": "arm64",
+      "backend": "bionilux",
+      "backendAsset": {
+        "url": "https://github.com/Endlessworld/dsh-bionilux/releases/download/v0.10.0/bionilux-backend-aarch64.tar.xz",
+        "sha256": "a48710199605aa53a0b3c9820eabc5701a1972d2d21d3bd9561b5c7d74527f0f",
+        "size": 520276,
+        "unpackedSize": 1914603
+      },
+      "rootfsAsset": {
+        "url": "https://github.com/Endlessworld/dsh-bionilux/releases/download/v0.10.0/debian-minimal-aarch64.tar.xz",
+        "sha256": "98f2160e7a9d2cb681ae628adb2d6186402f206a39282b4804f8eb21f90d6f5f",
+        "size": 51202468,
+        "unpackedSize": 237792158
+      },
+      "nodeAsset": {
+        "url": "https://github.com/Endlessworld/dsh-bionilux/releases/download/v0.10.0/node-glibc-v24.22.0-linux-arm64.tar.xz",
+        "sha256": "4c66a354ed403c25c9a8fae2ca08f5c4981df1c10853fdede573031b4d37957e",
+        "size": 30618856,
+        "unpackedSize": 136081747
+      }
+    },
+    {
+      "id": "debian-minimal-x64",
+      "label": "Debian 13 (trixie) for x86_64",
+      "architecture": "x64",
+      "backend": "bionilux",
+      "backendAsset": {
+        "url": "https://github.com/Endlessworld/dsh-bionilux/releases/download/v0.10.0/bionilux-backend-x86_64.tar.xz",
+        "sha256": "35103e06648931f824b9e898369eceabbcf5db201b799e98c9578076056944d0",
+        "size": 562016,
+        "unpackedSize": 1934819
+      },
+      "rootfsAsset": {
+        "url": "https://github.com/Endlessworld/dsh-bionilux/releases/download/v0.10.0/debian-minimal-x86_64.tar.xz",
+        "sha256": "420dc8b48a5a0f5b9ab130da8a8a8c7be04fc6d79738065eb7b1dae211e3ea1d",
+        "size": 52722020,
+        "unpackedSize": 216696483
+      },
+      "nodeAsset": {
+        "url": "https://github.com/Endlessworld/dsh-bionilux/releases/download/v0.10.0/node-glibc-v24.22.0-linux-x64.tar.xz",
+        "sha256": "8d98881c5ff6da42f8ee408a9cd316008fffba6ce9bc7e359ddfa45bd578ad15",
+        "size": 31751512,
+        "unpackedSize": 139629635
+      }
+    }
+  ]
+}

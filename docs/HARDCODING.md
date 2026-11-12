@@ -99,7 +99,7 @@ PRESENT_ETC_OS-RELEASE=yes
 FAKE_ROOT=1
 ```
 
-**只有 `ROOTFS_ENABLED=1` 且 `ROOTFS_LOADER=yes` 时才注册 `linux_bash`**，
+**只有 `ROOTFS_ENABLED=1` 且 `ROOTFS_LOADER=yes` 时消费方才注册 Linux 工具**，
 否则不注册、也不破坏已有环境（见 CONTEXT.md 架构不变量）。
 
 ### 4.1 Android 上 loader 不能放在 app 数据目录

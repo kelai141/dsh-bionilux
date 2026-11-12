@@ -28,7 +28,7 @@ class MetadataTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        (self.root / "Cargo.toml").write_text('[package]\nname = "bionilux"\nversion = "0.5.0"\n')
+        (self.root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.5.0"\n')
 
     @patch.object(metadata.subprocess, "check_output", return_value=SHA + "\n")
     def test_debug_identity_and_release_identity(self, _git):

@@ -32,9 +32,9 @@ x86_64 模拟器上验证。
 ## 快速开始
 
 需要独立模拟器和免手配的 Agent 入口时，见
-[独立 Linux 使用说明](docs/INDEPENDENT_LINUX.md)。本地启动命令为
-`pwsh -NoProfile -File scripts/start-independent-linux.ps1`，Agent 使用
-`node scripts/linux-agent.mjs exec '<command>'`。
+[独立 Linux 使用说明](docs/INDEPENDENT_LINUX.md)。原启动脚本
+`scripts/start-independent-linux.ps1` 已随插件层删除；验证回落到
+`cargo test` + `tests/*.sh`。
 
 运行时安装在一个由应用持有的前缀下；`PREFIX/files/...` 布局是**推导**出来的，不是假定
 的。
@@ -43,10 +43,15 @@ x86_64 模拟器上验证。
 # 一次性 rootfs 准备：绝对符号链接、resolver、目录。
 sh scripts/prepare-rootfs.sh --rootfs /path/to/rootfs --dns "$DNS_SERVERS"
 
+# 构建 Android launcher + glibc preload（需要 NDK 与交叉 gcc）。
+cargo xtask build --abi aarch64
+# 从同一份 rootfs 提取 APK 用的 glibc loader（写入 <out>/<jni-abi>/）。
+cargo xtask loader --abi aarch64 --rootfs /path/to/rootfs --out .bionilux-loader
+
 export BIONILUX_ROOTFS=/path/to/rootfs
 bionilux /bin/bash -c 'cat /etc/os-release; apt-get update'
 
-# 健康检查：只有这里给出肯定答案时，插件才注册该工具。
+# 健康检查：只有这里给出肯定答案时，消费方应用才注册该工具。
 bionilux --print-config | grep -E 'ROOTFS_ENABLED|ROOTFS_LOADER'
 ```
 

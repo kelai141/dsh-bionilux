@@ -12,3 +12,14 @@
 - Windows / Android 交叉构建仍在宿主执行。不要把 Debian 的成功结果冒充 Android 设备验证。
 
 所有本地归档、编译产物和验证报告放入 `target/independent-linux/`，不要提交二进制或令牌。
+
+## 构建编排
+
+`cargo xtask` 是 launcher / preload / backend / APK loader 的统一入口：
+
+- `cargo xtask build --abi <aarch64|x86_64>`：构建 Android launcher 与 glibc preload 到 `target/release-assets/`。
+- `cargo xtask backend --abi <...>`：组装 `target/backend-<abi>/`。
+- `cargo xtask loader --abi <...> --rootfs <dir> --out <dir>`：从同一份 rootfs 提取 glibc loader。
+- `cargo xtask all --abi <...>`：build + backend。
+
+Windows 宿主不能编译 launcher（`nix` 是 Unix-only）；`cargo build -p bionilux-install` 与 `cargo test -p bionilux-install` 可在 Windows 运行。

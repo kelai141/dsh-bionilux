@@ -13,17 +13,17 @@ VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+
 
 
 def package_version(root):
-    """Read the version from Cargo.toml's [package] table."""
-    in_package = False
+    """Read the version from Cargo.toml's [workspace.package] table."""
+    in_table = False
     for line in (root / "Cargo.toml").read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped.startswith("["):
-            in_package = stripped == "[package]"
-        elif in_package:
+            in_table = stripped == "[workspace.package]"
+        elif in_table:
             key, _, value = stripped.partition("=")
             if key.strip() == "version":
                 return value.strip().strip('"')
-    raise ValueError("Cargo.toml [package] version is missing")
+    raise ValueError("Cargo.toml [workspace.package] version is missing")
 
 
 def identity(root, tag, run_id, attempt):
