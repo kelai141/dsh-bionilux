@@ -11,14 +11,24 @@
 #
 # Usage:
 #   prepare-android-rootfs.sh --rootfs DIR --launcher FILE --preload FILE
+#                             [--linker FILE]
 #
-# All three paths must be absolute.  The launcher runs guest commands with
+# All paths must be absolute.  The launcher runs guest commands with
 # BIONILUX_ROOTFS, BIONILUX_PRELOAD and BIONILUX_FAKE_ROOT=1.
+#
+# --linker runs the launcher through the system dynamic linker:
+#   FILE --rootfs DIR <cmd>   becomes   LINKER FILE --rootfs DIR <cmd>
+# This is required on Android when the launcher sits on the app data partition.
+# An app with targetSdk >= 29 may not execve that file directly -- the kernel
+# refuses and bionic reports it as "Permission denied" -- while executing the
+# system linker is allowed, and the linker then maps the launcher as a shared
+# object.  Without it, install fails at the first guest command.
 set -eu
 
 rootfs=
 launcher=
 preload=
+linker=
 
 die() {
     printf 'prepare-android-rootfs: %s\n' "$*" >&2
@@ -27,16 +37,17 @@ die() {
 
 while [ $# -gt 0 ]; do
     case $1 in
-        --rootfs|--launcher|--preload)
+        --rootfs|--launcher|--preload|--linker)
             [ $# -ge 2 ] && [ -n "$2" ] || die "$1 requires a value"
             case $1 in
                 --rootfs) rootfs=$2 ;;
                 --launcher) launcher=$2 ;;
                 --preload) preload=$2 ;;
+                --linker) linker=$2 ;;
             esac
             shift 2
             ;;
-        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -50,6 +61,10 @@ done
 [ -d "$rootfs" ] || die "rootfs is not a directory: $rootfs"
 [ -x "$launcher" ] || die "launcher is not executable: $launcher"
 [ -f "$preload" ] || die "preload library is missing: $preload"
+if [ -n "$linker" ]; then
+    case $linker in /*) ;; *) die "path must be absolute: $linker" ;; esac
+    [ -x "$linker" ] || die "linker is not executable: $linker"
+fi
 rootfs=${rootfs%/}
 [ -n "$rootfs" ] && [ "$rootfs" != / ] || die 'refusing to prepare the host root'
 
@@ -58,11 +73,21 @@ adapter=${BIONILUX_LDCONFIG_ADAPTER:-$here/ldconfig-android.sh}
 [ -f "$adapter" ] || die "adapter script is missing: $adapter"
 grep -q 'bionilux-ldconfig-adapter-v1' "$adapter" || die "not the ldconfig adapter: $adapter"
 
+# Runs the launcher, through the system linker when one was supplied.
+# Its own function so every call site keeps one argument order.
+run_launcher() {
+    if [ -n "$linker" ]; then
+        "$linker" "$launcher" "$@"
+    else
+        "$launcher" "$@"
+    fi
+}
+
 guest() {
     BIONILUX_ROOTFS=$rootfs \
     BIONILUX_PRELOAD=$preload \
     BIONILUX_FAKE_ROOT=1 \
-    "$launcher" --rootfs "$rootfs" "$@"
+    run_launcher --rootfs "$rootfs" "$@"
 }
 
 ldconfig=$rootfs/usr/sbin/ldconfig

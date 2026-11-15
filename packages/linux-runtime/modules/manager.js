@@ -1546,16 +1546,22 @@ export class LinuxRuntimeManager {
       throw new Error('Android backend is missing prepare-android-rootfs.sh; install matching runtime assets');
     }
     // The launcher is an ELF under the app data directory, and this app may not
-    // execve those (targetSdk >= 29; see _hostToolEnvironment). Route it through
-    // the system linker, which is how the shell app starts the same binary for
-    // the console. The script insists on a single executable file, so the
-    // linker form is written as a small wrapper next to the instance.
-    const launcher = await this._linkerWrappedLauncher(instance);
+    // execve those (targetSdk >= 29). The system linker may be executed, and it
+    // then maps the launcher as a shared object, so hand the script a linker to
+    // prefix every guest command with. Doing it here rather than wrapping the
+    // launcher in a shell script keeps one fewer generated file that can go
+    // stale or lose its mode between the staging directory and the final one.
+    const launcher = path.join(instance.backend, 'bin', 'bionilux');
+    const linker = process.platform === 'android'
+      ? ['/system/bin/linker64', '/system/bin/linker'].find(fileExists)
+      : undefined;
+    const linkerArgs = linker === undefined ? [] : ['--linker', linker];
     const prepared = normaliseCommandResult(await this._runManaged({
       file: HOST_SCRIPT_INTERPRETER,
       args: [compatibilityScript, '--rootfs', instance.rootfs,
         '--launcher', launcher,
-        '--preload', path.join(instance.backend, 'lib', 'libbionilux_preload.so')],
+        '--preload', path.join(instance.backend, 'lib', 'libbionilux_preload.so'),
+        ...linkerArgs],
       cwd: instance.root,
       env: hostEnvironment,
       timeout: 120_000,
@@ -1571,40 +1577,6 @@ export class LinuxRuntimeManager {
       throw new Error(`Android rootfs preparation failed (${prepared.exitCode}): ${prepared.stderr}`.trim() +
         `\n[launcher] ${evidence}`);
     }
-  }
-
-  /**
-   * Build a launcher path prepare-android-rootfs.sh can execute.
-   *
-   * The script wants a single executable file and runs it as
-   * `"$launcher" --rootfs DIR <guest command>`. It cannot express "run this ELF
-   * through the system linker", and this app may not execve an ELF under its own
-   * data directory (targetSdk >= 29), so the direct form fails with EACCES — the
-   * same refusal that breaks Termux binaries, reported by bionic as
-   * "Permission denied".
-   *
-   * /system/bin/linker64 <elf> has no such restriction: the kernel executes a
-   * system binary that then maps the app-data ELF as a shared object. That is
-   * also how the shell app starts bionilux for the console.
-   *
-   * Returns the launcher path unchanged when the platform is not Android (a
-   * POSIX host can exec the ELF directly, and adding a wrapper there would only
-   * add a failure mode).
-   */
-  async _linkerWrappedLauncher(instance) {
-    const launcher = path.join(instance.backend, 'bin', 'bionilux');
-    if (process.platform !== 'android') return launcher;
-    if (!fileExists(launcher)) return launcher;
-    const linker = ['/system/bin/linker64', '/system/bin/linker'].find(fileExists);
-    if (linker === undefined) return launcher;
-    const directory = path.join(instance.root, 'launcher');
-    await fs.mkdir(directory, { recursive: true });
-    const wrapper = path.join(directory, 'bionilux.sh');
-    // exec, not a subshell: the script sends signals to the launcher and expects
-    // its exit status, both of which must reach the real process.
-    await fs.writeFile(wrapper, `#!/system/bin/sh\nexec ${linker} ${launcher} "$@"\n`, { mode: 0o755 });
-    await fs.chmod(wrapper, 0o755);
-    return wrapper;
   }
 
   /**
