@@ -1627,6 +1627,16 @@ export class LinuxRuntimeManager {
   async _launcherEvidence(launcher, instance, environment) {
     const facts = []
     const record = (label, value) => facts.push(label + '=' + value)
+    // The domain decides whether an app-data ELF may be executed at all, and it
+    // is invisible from inside the child (every refusal looks like EACCES). The
+    // engine runs as untrusted_app_34 while `adb run-as` runs as runas_app, so a
+    // check that passes under run-as proves nothing about this process.
+    try {
+      record('domain', readFileSync('/proc/self/attr/current', 'utf8').trim())
+    } catch (error) {
+      record('domain', error.code ?? error.message)
+    }
+    record('uid', typeof process.getuid === 'function' ? process.getuid() : 'n/a')
     try {
       const stat = lstatSync(launcher)
       record('mode', (stat.mode & 0o777).toString(8))
