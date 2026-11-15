@@ -204,7 +204,7 @@ async function makeInstance({ resolv = null } = {}) {
   return instance;
 }
 
-test('host preparation receives --dns and the Termux loader path', async () => {
+test('host preparation receives --dns and a PATH without unrunnable Termux bins', async () => {
   const dataDir = tempDir();
   const runner = makeRunner();
   const manager = createManager({
@@ -213,19 +213,29 @@ test('host preparation receives --dns and the Termux loader path', async () => {
     dnsServers: ['10.0.2.3'],
     runCommand: runner.runCommand,
   });
-  // Deliberately leave process.env.LD_LIBRARY_PATH unset, and make sure an
-  // inherited value cannot make this pass by accident: the interesting case is
-  // exactly the real one, where the Android engine has no such variable.
+  // Two wrong versions of this test came before, so state what it pins:
   //
-  // The earlier version of this test set the variable and asserted it was
-  // forwarded, which asserted the bug: prepare-rootfs.sh then ran with no
-  // loader path on every real device, and every Termux binary it spawned died
-  // with libandroid-support.so not found (reported by bionic as
-  // "Permission denied").
-  const previousLoaderPath = process.env.LD_LIBRARY_PATH;
+  //  1. The original set process.env.LD_LIBRARY_PATH and asserted forwarding,
+  //     which asserted a path the engine never takes.
+  //  2. The next one derived a loader path from dataDir. That is the right
+  //     value for the variable, but the variable is irrelevant: an app with
+  //     targetSdk >= 29 cannot execve an ELF under its data directory at all,
+  //     so the kernel refuses before the dynamic linker runs. bionic reports
+  //     that refusal as "Permission denied".
+  //
+  // What actually keeps prepare-rootfs.sh working is not upgrading the tools but
+  // not replacing them: the Termux bin directory must stay off PATH so the
+  // Android system (toybox) tools are the ones resolved.
+  const previousPath = process.env.PATH;
+  const previousPrefix = process.env.PREFIX;
   delete process.env.LD_LIBRARY_PATH;
-  const termuxLib = path.join(dataDir, '..', '..', 'usr', 'lib');
-  await mkdir(termuxLib, { recursive: true });
+  // Mirrors production: the bootstrap passes dataDir = <files>/linux-environment/runtime,
+  // so <files>/usr is TWO levels up. Verified against a real device layout.
+  const prefix = path.join(dataDir, '..', '..', 'usr');
+  const termuxBin = path.join(prefix, 'bin');
+  await mkdir(termuxBin, { recursive: true });
+  process.env.PREFIX = prefix;
+  process.env.PATH = termuxBin + path.delimiter + '/system/bin';
   try {
     const instance = await makeInstance();
     await manager._prepareRootfs(instance);
@@ -233,11 +243,27 @@ test('host preparation receives --dns and the Termux loader path', async () => {
     const [spec] = runner.calls;
     assert.equal(spec.file, 'sh');
     assert.deepEqual(spec.args.slice(-2), ['--dns', '10.0.2.3']);
-    assert.equal(
-      spec.env.LD_LIBRARY_PATH,
-      termuxLib,
-      'the loader path must be derived from dataDir, not from an env var Android never sets',
+    const pathEntries = String(spec.env.PATH).split(path.delimiter);
+    assert.ok(
+      !pathEntries.includes(termuxBin),
+      'the Termux bin directory must be filtered out: its ELF files cannot be execve\'d by this app',
     );
+    assert.ok(
+      pathEntries.length > 0,
+      'the prep scripts need a non-empty PATH: without one no system tool resolves',
+    );
+    // Substring, not membership: a PATH assembled with a hardcoded ':' instead
+    // of path.delimiter glues entries together on Windows, and a membership
+    // check would then miss the Termux directory entirely.
+    for (const entry of pathEntries) {
+      assert.equal(
+        entry.includes(termuxBin),
+        false,
+        'no PATH entry may name the Termux bin directory: its ELF files cannot be execve-d by this app. ' +
+          JSON.stringify({ pathEntries, termuxBin }),
+      );
+    }
+    assert.ok(pathEntries.length > 0, 'the prep scripts need a non-empty PATH');
 
     const guest = manager._executionEnvironment(
       {
@@ -250,8 +276,10 @@ test('host preparation receives --dns and the Termux loader path', async () => {
     );
     assert.equal(guest.LD_LIBRARY_PATH, undefined, 'guest execute must stay clean');
   } finally {
-    if (previousLoaderPath === undefined) delete process.env.LD_LIBRARY_PATH;
-    else process.env.LD_LIBRARY_PATH = previousLoaderPath;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousPrefix === undefined) delete process.env.PREFIX;
+    else process.env.PREFIX = previousPrefix;
     await manager.dispose();
   }
 });

@@ -25,6 +25,11 @@ import { assertResolvConfWritable, inspectResolvConf, resolveDnsServers } from '
 const ACTIVE_SCHEMA_VERSION = 1;
 const METADATA_SCHEMA_VERSION = 1;
 const DEFAULT_GUEST_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+// Fallback for host child processes when no system PATH survives filtering.
+// Android always ships toybox here, and that is all the prep scripts need.
+// Joined with path.delimiter so the value stays one PATH entry per directory on
+// every platform the tests run on, not just Android.
+const DEFAULT_HOST_PATH = ['/system/bin', '/system/xbin'].join(path.delimiter);
 const SIGTERM_GRACE_MS = 2_000;
 const STOP_SETTLE_MS = 2_000;
 const FORCE_KILL_SETTLE_MS = 1_000;
@@ -699,48 +704,44 @@ function cleanHostEnvironment() {
 }
 
 /**
- * Absolute host directories whose `.so` files the Termux binaries need.
+ * Strip Termux bin directories from a PATH handed to a host child process.
  *
- * Why this cannot read `process.env.LD_LIBRARY_PATH`: the Android engine is
- * started by the shell app (Zygote/app_process), and its environment carries
- * only the system PATH — `LD_LIBRARY_PATH` is simply absent. The previous
- * `if (process.env.LD_LIBRARY_PATH)` therefore never fired on a real device,
- * and every Termux binary launched by prepare-rootfs.sh died in the dynamic
- * linker with `library "libandroid-support.so" not found`. Android's bionic
- * reports that failure as "Permission denied", which sent the investigation
- * after file modes for a long time.
+ * Why: an app with targetSdk >= 29 may not execve an ELF stored under its own
+ * data directory — only the APK's nativeLibraryDir holds executable files. The
+ * Termux tree in <files>/usr/bin is exactly such a data-directory tree, so every
+ * binary there fails with EACCES, which bionic surfaces as "Permission denied".
  *
- * The directories are derived from what the host does pass in, so this stays
- * correct on a device and on the host-side CI alike.
+ * prepare-rootfs.sh only needs POSIX tools the Android system PATH already
+ * provides (the toybox `find`/`sed`/`readlink` set), so leaving those entries on
+ * PATH replaces working binaries with unrunnable ones. Keeping the Termux lib
+ * directory on LD_LIBRARY_PATH helps nothing either: the kernel refuses before
+ * the dynamic linker is ever consulted.
  *
- * @param {string[]} extra - Additional absolute directories to append.
- * @returns {string[]} Directories that exist, in resolution order.
+ * The single deliberate exception is an explicit, executable copy in the app's
+ * nativeLibraryDir; the caller passes nothing else here.
+ *
+ * @param {string | undefined} value - PATH to filter.
+ * @param {string} dataDir - Manager data directory, used to locate the prefix.
+ * @returns {string} PATH without the unrunnable entries.
  */
-function hostLoaderDirectories({ dataDir, extra = [] } = {}) {
-  const candidates = []
-  // Termux layout: <prefix>/lib holds libandroid-support.so and friends.
+function withoutUnrunnableBinDirectories(value, dataDir) {
+  const termuxBins = []
   if (typeof process.env.PREFIX === 'string' && path.isAbsolute(process.env.PREFIX)) {
-    candidates.push(path.join(process.env.PREFIX, 'lib'))
+    termuxBins.push(path.join(process.env.PREFIX, 'bin'))
   }
-  // The DSH shell app ships the same tree as <files>/usr, and dataDir is
-  // <files>/linux-environment, so two levels up is the Termux prefix root.
-  // Taking it from dataDir matters: this is a value the host always supplies,
-  // while the environment variables above are absent on a real device.
+  // dataDir is <files>/linux-environment/runtime, so <files> is TWO levels up.
+  // Verified on a real device: two levels resolves to /data/data/<pkg>/files,
+  // one level resolves to a directory that does not exist.
   if (typeof dataDir === 'string' && path.isAbsolute(dataDir)) {
-    candidates.push(path.join(dataDir, '..', '..', 'usr', 'lib'))
+    termuxBins.push(path.join(dataDir, '..', '..', 'usr', 'bin'))
   }
-  for (const directory of extra) {
-    if (typeof directory === 'string' && path.isAbsolute(directory)) candidates.push(directory)
-  }
-  const kept = []
-  for (const directory of candidates) {
-    try {
-      if (statSync(directory).isDirectory() && !kept.includes(directory)) kept.push(directory)
-    } catch {
-      // A missing directory is not a failure: other candidates may still apply.
-    }
-  }
-  return kept
+  const blocked = termuxBins.map(entry => path.resolve(entry))
+  const entries = typeof value === 'string' && value !== '' ? value.split(path.delimiter) : []
+  const kept = entries.filter(entry => {
+    if (entry === '') return false
+    return !blocked.includes(path.resolve(entry))
+  })
+  return kept.length > 0 ? kept.join(path.delimiter) : DEFAULT_HOST_PATH
 }
 
 function executableFileExists(file) {
@@ -1372,56 +1373,35 @@ export class LinuxRuntimeManager {
   }
 
   /**
-   * Environment for running host-side Termux tools (prepare-rootfs.sh and the
-   * Android compatibility pre-pass).
+   * Environment for running the host-side preparation scripts.
    *
-   * Separate from cleanHostEnvironment() on purpose: those scripts shell out to
-   * Termux binaries, which are dynamically linked against libandroid-support.so
-   * and live next to the Termux layout, not on the Android system PATH. Without
-   * both LD_LIBRARY_PATH and a PATH entry pointing at that layout they fail
-   * before running a single line, and bionic reports the loader failure as
-   * "Permission denied".
+   * These scripts are POSIX shell and only need what the Android system PATH
+   * already provides (toybox `find`/`sed`/`readlink`/`dirname`/`tr`/`wc`...).
+   * They must NOT be handed the Termux layout:
+   *
+   *   - An app with targetSdk >= 29 may not execve an ELF stored under its data
+   *     directory; only the APK's nativeLibraryDir is executable. Termux itself
+   *     escapes this because it declares targetSdk 28, which is not something
+   *     this app can do.
+   *   - So `find` and friends in <prefix>/bin can never run here, no matter
+   *     what LD_LIBRARY_PATH says. bionic reports the refusal as
+   *     "Permission denied", which reads like a file-mode bug and sent earlier
+   *     investigations after the loader path. It is not a loader problem: the
+   *     kernel never reaches the loader.
+   *   - Putting <prefix>/bin first on PATH therefore does not upgrade the tools,
+   *     it replaces working system binaries with unrunnable ones.
+   *
+   * The scripts also call `sh` and a couple of guest helpers. Those are shell
+   * scripts inside the backend asset, resolved by absolute path, so they are
+   * unaffected by PATH.
    *
    * @returns {Record<string, string>} Environment safe to hand to _runManaged.
    */
   _hostToolEnvironment() {
     const environment = cleanHostEnvironment();
-    const directories = hostLoaderDirectories({
-      dataDir: this.dataDir,
-      // The glibc loader shipped in the APK's nativeLibraryDir is a documented
-      // capability of the host and must stay on the resolution path.
-      extra: this.nativeLibDir ? [this.nativeLibDir] : [],
-    });
-    if (directories.length > 0) environment.LD_LIBRARY_PATH = directories.join(':');
-    // Put the Termux bin directory first for the same reason: the scripts call
-    // find/sh/sed by name and the Android system ones are not interchangeable.
-    const binDirectories = []
-    if (typeof process.env.PREFIX === 'string' && path.isAbsolute(process.env.PREFIX)) {
-      binDirectories.push(path.join(process.env.PREFIX, 'bin'))
-    }
-    if (typeof this.dataDir === 'string' && path.isAbsolute(this.dataDir)) {
-      binDirectories.push(path.join(this.dataDir, '..', '..', 'usr', 'bin'))
-    }
-    if (binDirectories.length > 0) {
-      environment.PATH = binDirectories.join(':') +
-        (typeof environment.PATH === 'string' && environment.PATH !== '' ? ':' + environment.PATH : '')
-    }
-    // prepare-rootfs.sh runs under `set -eu` and reads $PREFIX directly, so a
-    // missing value is an immediate "PREFIX: parameter not set" abort. HOST_ENV_
-    // ALLOWLIST does not carry these, and Android engine processes do not set
-    // them, so derive the Termux prefix from dataDir like the loader path above.
-    if (typeof this.dataDir === 'string' && path.isAbsolute(this.dataDir)) {
-      const prefix = path.join(this.dataDir, '..', '..', 'usr')
-      try {
-        if (statSync(prefix).isDirectory()) {
-          environment.PREFIX = prefix
-          environment.HOME = process.env.HOME ?? path.join(this.dataDir, '..', '..', 'home')
-          environment.TMPDIR = path.join(prefix, 'tmp')
-        }
-      } catch {
-        // No Termux layout here: leave the script to its own defaults.
-      }
-    }
+    // Drop any Termux bin directory the caller may have put on PATH: those
+    // entries are unresolvable by this process's exec policy (see above).
+    environment.PATH = withoutUnrunnableBinDirectories(environment.PATH, this.dataDir);
     return environment;
   }
 
