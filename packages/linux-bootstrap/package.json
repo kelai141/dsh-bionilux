@@ -1,6 +1,6 @@
 {
   "name": "@dsh-android/linux-bootstrap",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "private": false,
   "type": "module",
   "description": "Bootstrap and settings plugin for the DSH Mobile Debian Linux runtime",
