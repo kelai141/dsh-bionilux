@@ -1,6 +1,6 @@
 {
   "name": "@dsh-android/linux-runtime",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "private": false,
   "type": "module",
   "description": "DSH Mobile Linux runtime plugin: Bionilux + Debian minimal rootfs install/execute lifecycle and the linux_bash tool",
