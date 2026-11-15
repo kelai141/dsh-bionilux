@@ -698,6 +698,51 @@ function cleanHostEnvironment() {
   return environment;
 }
 
+/**
+ * Absolute host directories whose `.so` files the Termux binaries need.
+ *
+ * Why this cannot read `process.env.LD_LIBRARY_PATH`: the Android engine is
+ * started by the shell app (Zygote/app_process), and its environment carries
+ * only the system PATH — `LD_LIBRARY_PATH` is simply absent. The previous
+ * `if (process.env.LD_LIBRARY_PATH)` therefore never fired on a real device,
+ * and every Termux binary launched by prepare-rootfs.sh died in the dynamic
+ * linker with `library "libandroid-support.so" not found`. Android's bionic
+ * reports that failure as "Permission denied", which sent the investigation
+ * after file modes for a long time.
+ *
+ * The directories are derived from what the host does pass in, so this stays
+ * correct on a device and on the host-side CI alike.
+ *
+ * @param {string[]} extra - Additional absolute directories to append.
+ * @returns {string[]} Directories that exist, in resolution order.
+ */
+function hostLoaderDirectories({ dataDir, extra = [] } = {}) {
+  const candidates = []
+  // Termux layout: <prefix>/lib holds libandroid-support.so and friends.
+  if (typeof process.env.PREFIX === 'string' && path.isAbsolute(process.env.PREFIX)) {
+    candidates.push(path.join(process.env.PREFIX, 'lib'))
+  }
+  // The DSH shell app ships the same tree as <files>/usr, and dataDir is
+  // <files>/linux-environment, so two levels up is the Termux prefix root.
+  // Taking it from dataDir matters: this is a value the host always supplies,
+  // while the environment variables above are absent on a real device.
+  if (typeof dataDir === 'string' && path.isAbsolute(dataDir)) {
+    candidates.push(path.join(dataDir, '..', '..', 'usr', 'lib'))
+  }
+  for (const directory of extra) {
+    if (typeof directory === 'string' && path.isAbsolute(directory)) candidates.push(directory)
+  }
+  const kept = []
+  for (const directory of candidates) {
+    try {
+      if (statSync(directory).isDirectory() && !kept.includes(directory)) kept.push(directory)
+    } catch {
+      // A missing directory is not a failure: other candidates may still apply.
+    }
+  }
+  return kept
+}
+
 function executableFileExists(file) {
   try {
     const stat = statSync(file);
@@ -1326,6 +1371,60 @@ export class LinuxRuntimeManager {
     await this._extract(archive, destination, kind);
   }
 
+  /**
+   * Environment for running host-side Termux tools (prepare-rootfs.sh and the
+   * Android compatibility pre-pass).
+   *
+   * Separate from cleanHostEnvironment() on purpose: those scripts shell out to
+   * Termux binaries, which are dynamically linked against libandroid-support.so
+   * and live next to the Termux layout, not on the Android system PATH. Without
+   * both LD_LIBRARY_PATH and a PATH entry pointing at that layout they fail
+   * before running a single line, and bionic reports the loader failure as
+   * "Permission denied".
+   *
+   * @returns {Record<string, string>} Environment safe to hand to _runManaged.
+   */
+  _hostToolEnvironment() {
+    const environment = cleanHostEnvironment();
+    const directories = hostLoaderDirectories({
+      dataDir: this.dataDir,
+      // The glibc loader shipped in the APK's nativeLibraryDir is a documented
+      // capability of the host and must stay on the resolution path.
+      extra: this.nativeLibDir ? [this.nativeLibDir] : [],
+    });
+    if (directories.length > 0) environment.LD_LIBRARY_PATH = directories.join(':');
+    // Put the Termux bin directory first for the same reason: the scripts call
+    // find/sh/sed by name and the Android system ones are not interchangeable.
+    const binDirectories = []
+    if (typeof process.env.PREFIX === 'string' && path.isAbsolute(process.env.PREFIX)) {
+      binDirectories.push(path.join(process.env.PREFIX, 'bin'))
+    }
+    if (typeof this.dataDir === 'string' && path.isAbsolute(this.dataDir)) {
+      binDirectories.push(path.join(this.dataDir, '..', '..', 'usr', 'bin'))
+    }
+    if (binDirectories.length > 0) {
+      environment.PATH = binDirectories.join(':') +
+        (typeof environment.PATH === 'string' && environment.PATH !== '' ? ':' + environment.PATH : '')
+    }
+    // prepare-rootfs.sh runs under `set -eu` and reads $PREFIX directly, so a
+    // missing value is an immediate "PREFIX: parameter not set" abort. HOST_ENV_
+    // ALLOWLIST does not carry these, and Android engine processes do not set
+    // them, so derive the Termux prefix from dataDir like the loader path above.
+    if (typeof this.dataDir === 'string' && path.isAbsolute(this.dataDir)) {
+      const prefix = path.join(this.dataDir, '..', '..', 'usr')
+      try {
+        if (statSync(prefix).isDirectory()) {
+          environment.PREFIX = prefix
+          environment.HOME = process.env.HOME ?? path.join(this.dataDir, '..', '..', 'home')
+          environment.TMPDIR = path.join(prefix, 'tmp')
+        }
+      } catch {
+        // No Termux layout here: leave the script to its own defaults.
+      }
+    }
+    return environment;
+  }
+
   async _runManaged(spec) {
     const controller = new AbortController();
     const relayAbort = () => controller.abort(spec.signal?.reason);
@@ -1442,8 +1541,7 @@ export class LinuxRuntimeManager {
     // Host preparation runs Termux tools, not guest programs. It needs the host
     // loader path (for example libandroid-glob) and must not reuse the guest's
     // clean environment. Guest execute remains cleanHostEnvironment-based.
-    const hostEnvironment = cleanHostEnvironment();
-    if (process.env.LD_LIBRARY_PATH) hostEnvironment.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH;
+    const hostEnvironment = this._hostToolEnvironment();
     const result = normaliseCommandResult(
       await this._runManaged({
         file: HOST_SCRIPT_INTERPRETER,
@@ -1462,8 +1560,7 @@ export class LinuxRuntimeManager {
   async _prepareAndroidRootfs(instance, signal) {
     if (process.platform !== 'android') return;
     await this._prepareHostPaths(instance.rootfs, [instance.rootfs]);
-    const hostEnvironment = cleanHostEnvironment();
-    if (process.env.LD_LIBRARY_PATH) hostEnvironment.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH;
+    const hostEnvironment = this._hostToolEnvironment();
     const compatibilityScript = path.join(instance.backend, 'scripts', 'prepare-android-rootfs.sh');
     if (!fileExists(compatibilityScript)) {
       throw new Error('Android backend is missing prepare-android-rootfs.sh; install matching runtime assets');

@@ -213,8 +213,19 @@ test('host preparation receives --dns and the Termux loader path', async () => {
     dnsServers: ['10.0.2.3'],
     runCommand: runner.runCommand,
   });
+  // Deliberately leave process.env.LD_LIBRARY_PATH unset, and make sure an
+  // inherited value cannot make this pass by accident: the interesting case is
+  // exactly the real one, where the Android engine has no such variable.
+  //
+  // The earlier version of this test set the variable and asserted it was
+  // forwarded, which asserted the bug: prepare-rootfs.sh then ran with no
+  // loader path on every real device, and every Termux binary it spawned died
+  // with libandroid-support.so not found (reported by bionic as
+  // "Permission denied").
   const previousLoaderPath = process.env.LD_LIBRARY_PATH;
-  process.env.LD_LIBRARY_PATH = '/data/data/com.termux/files/usr/lib';
+  delete process.env.LD_LIBRARY_PATH;
+  const termuxLib = path.join(dataDir, '..', '..', 'usr', 'lib');
+  await mkdir(termuxLib, { recursive: true });
   try {
     const instance = await makeInstance();
     await manager._prepareRootfs(instance);
@@ -222,7 +233,11 @@ test('host preparation receives --dns and the Termux loader path', async () => {
     const [spec] = runner.calls;
     assert.equal(spec.file, 'sh');
     assert.deepEqual(spec.args.slice(-2), ['--dns', '10.0.2.3']);
-    assert.equal(spec.env.LD_LIBRARY_PATH, '/data/data/com.termux/files/usr/lib');
+    assert.equal(
+      spec.env.LD_LIBRARY_PATH,
+      termuxLib,
+      'the loader path must be derived from dataDir, not from an env var Android never sets',
+    );
 
     const guest = manager._executionEnvironment(
       {
