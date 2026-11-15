@@ -1562,7 +1562,14 @@ export class LinuxRuntimeManager {
       signal,
     }));
     if (prepared.exitCode !== 0) {
-      throw new Error(`Android rootfs preparation failed (${prepared.exitCode}): ${prepared.stderr}`.trim());
+      // The indirect failure ("<launcher>: Permission denied") does not say why
+      // the execve was refused, and every candidate cause -- file mode, SELinux
+      // domain, noexec mount, missing interpreter -- produces the same sentence.
+      // Re-run the launcher alone and record the facts that separate them, so the
+      // next failure is diagnosable instead of guessed at.
+      const evidence = await this._launcherEvidence(launcher, instance, hostEnvironment);
+      throw new Error(`Android rootfs preparation failed (${prepared.exitCode}): ${prepared.stderr}`.trim() +
+        `\n[launcher] ${evidence}`);
     }
   }
 
@@ -1598,6 +1605,71 @@ export class LinuxRuntimeManager {
     await fs.writeFile(wrapper, `#!/system/bin/sh\nexec ${linker} ${launcher} "$@"\n`, { mode: 0o755 });
     await fs.chmod(wrapper, 0o755);
     return wrapper;
+  }
+
+  /**
+   * Collect the facts that distinguish the possible causes of an execve refusal.
+   *
+   * Every symptom of a refused launch looks identical from the caller
+   * ("Permission denied"), so report the inputs instead of a verdict:
+   *
+   *  - the launcher's own mode/uid/gid and whether its directory chain is
+   *    traversable (rules out a plain mode defect);
+   *  - whether the link target exists and is executable (rules out a dangling
+   *    wrapper);
+   *  - running the same file through `sh` and, when that is the wrapper, the
+   *    linker line it contains (separates "the script cannot be launched" from
+   *    "the linker cannot map the ELF").
+   *
+   * Best effort only: this runs on an already-failing path and must never turn
+   * one error into two.
+   */
+  async _launcherEvidence(launcher, instance, environment) {
+    const facts = []
+    const record = (label, value) => facts.push(label + '=' + value)
+    try {
+      const stat = lstatSync(launcher)
+      record('mode', (stat.mode & 0o777).toString(8))
+      record('uid', stat.uid)
+      record('gid', stat.gid)
+      record('isFile', stat.isFile())
+      record('isLink', stat.isSymbolicLink())
+      record('size', stat.size)
+    } catch (error) {
+      record('lstat', error.code ?? error.message)
+    }
+    for (const directory of [instance.root, path.dirname(launcher)]) {
+      try {
+        const stat = lstatSync(directory)
+        record('dir:' + path.basename(directory), (stat.mode & 0o777).toString(8))
+      } catch (error) {
+        record('dir:' + path.basename(directory), error.code ?? error.message)
+      }
+    }
+    try {
+      record('content', JSON.stringify(readFileSync(launcher, 'utf8').slice(0, 200)))
+    } catch (error) {
+      record('content', error.code ?? error.message)
+    }
+    const attempt = async (label, file, args) => {
+      try {
+        const result = normaliseCommandResult(await this._runManaged({
+          file, args, cwd: instance.root, env: environment, timeout: 20_000,
+        }))
+        record(label, 'exit' + result.exitCode + ':' +
+          (firstLine(result.stderr) || firstLine(result.stdout) || 'silent'))
+      } catch (error) {
+        record(label, 'throw:' + (error.code ?? error.message))
+      }
+    }
+    // Same file, same env, launched by the same interpreter the script uses.
+    await attempt('viaSh', HOST_SCRIPT_INTERPRETER, [launcher, '--version'])
+    await attempt('direct', launcher, ['--version'])
+    const linker = ['/system/bin/linker64', '/system/bin/linker'].find(fileExists)
+    if (linker !== undefined) {
+      await attempt('linker', linker, [path.join(instance.backend, 'bin', 'bionilux'), '--version'])
+    }
+    return facts.join(' ')
   }
 
   async _ensureSharedNode(runtime, staging, activeRecord) {
