@@ -1402,6 +1402,13 @@ export class LinuxRuntimeManager {
     // Drop any Termux bin directory the caller may have put on PATH: those
     // entries are unresolvable by this process's exec policy (see above).
     environment.PATH = withoutUnrunnableBinDirectories(environment.PATH, this.dataDir);
+    // Guest programs are glibc binaries whose interpreter is /lib/ld-linux-*.so,
+    // and the launcher starts them by execve, so that interpreter must itself be
+    // executable. The rootfs copy never is (app_data_file), which is why the
+    // launcher prefers a copy under the APK native library directory when told
+    // where to look. Without this the first guest command fails with
+    // "execve failed: EACCES ... /rootfs/lib/ld-linux-aarch64.so.1".
+    if (this.nativeLibDir) environment.BIONILUX_NATIVE_LIB_DIR = this.nativeLibDir;
     return environment;
   }
 
