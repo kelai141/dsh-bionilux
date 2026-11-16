@@ -214,6 +214,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-${{ matrix.architecture }}
@@ -351,6 +354,14 @@ jobs:
           # >= 29 cannot execve its own data directory, so the copy the guest
           # runs has to live where SELinux labels it apk_data_file.
           sudo install -m 755 "$rootfs$DEBIAN_LOADER" \
+            "$stage/bionilux-loader-$ARCH.so"
+          # Android's app seccomp filter traps the two system calls glibc makes
+          # while it initialises, and the loader makes both itself before it
+          # maps anything the guest could hook with LD_PRELOAD. The instruction
+          # site is therefore the only place that can answer -ENOSYS; a loader
+          # shipped unpatched makes every guest die with a bare "Bad system call"
+          # (measured on vivo V2425A, Android 17, targetSdk 34).
+          sudo env "PATH=$PATH" node scripts/patch-android-glibc.mjs \
             "$stage/bionilux-loader-$ARCH.so"
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links --verify
