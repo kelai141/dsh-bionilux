@@ -21,6 +21,7 @@ import { defaultRuntimeIdForArch, resolveHostArchitecture, selectRuntime } from 
 import { assertOfficialAssetUrl, isAllowedAssetOrigin } from './asset-installer.js';
 import { ProcessScope } from './process-scope.js';
 import { assertResolvConfWritable, inspectResolvConf, resolveDnsServers } from './dns-config.js';
+import { ensureGuestLibcSeccompPatch } from './libc-seccomp-patch.js';
 
 const ACTIVE_SCHEMA_VERSION = 1;
 const METADATA_SCHEMA_VERSION = 1;
@@ -1546,6 +1547,16 @@ export class LinuxRuntimeManager {
 
   async _prepareAndroidRootfs(instance, signal) {
     if (process.platform !== 'android') return;
+    // Before any guest program runs: Android's app seccomp filter traps the two
+    // system calls glibc makes during libc init, and a guest dies with a bare
+    // SIGSYS before a preload hook can install a handler, so the instruction
+    // sites inside the guest's libc have to answer -ENOSYS themselves. A libc
+    // whose code does not contain them is a hard failure here: continuing would
+    // only turn it into the same signal at the first guest command.
+    const libcPatch = await ensureGuestLibcSeccompPatch(instance.rootfs, { architecture: this.arch });
+    if (libcPatch.status === 'unsupported') {
+      throw new Error('guest libc seccomp patch failed: ' + libcPatch.reason);
+    }
     await this._prepareHostPaths(instance.rootfs, [instance.rootfs]);
     const hostEnvironment = this._hostToolEnvironment();
     const compatibilityScript = path.join(instance.backend, 'scripts', 'prepare-android-rootfs.sh');
