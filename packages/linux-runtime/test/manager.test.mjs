@@ -1,7 +1,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, readdir, readlink, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { existsSync, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1720,6 +1720,253 @@ test('cold execute recovers once and a failed startup recovery can be retried', 
     assert.equal(manager.status().healthy, true);
     assert.equal(existsSync(tombstone), false);
     assert.equal(manager._reconciled, true);
+  } finally {
+    await manager.dispose();
+  }
+});
+
+test('install upgrade preserves guest /root and /home without copying system trees', async () => {
+  const dataDir = tempDir();
+  const v1 = makeManifest({
+    version: '1.0.0',
+    rootfsFiles: {
+      ...ARCHIVE_FILES.rootfs,
+      'root/.bashrc': '# default v1\n',
+      'etc/os-release': 'VERSION_ID="1"\n',
+      'usr/share/marker': 'v1-usr\n',
+      'var/lib/dpkg/status': 'Package: old\n',
+    },
+  });
+  const v2 = makeManifest({
+    version: '2.0.0',
+    rootfsFiles: {
+      ...ARCHIVE_FILES.rootfs,
+      'root/.bashrc': '# default v2\n',
+      'root/.profile': '# v2 profile\n',
+      'etc/os-release': 'VERSION_ID="2"\n',
+      'usr/share/marker': 'v2-usr\n',
+      'var/lib/dpkg/status': 'Package: new\n',
+    },
+  });
+
+  const { manager } = makeManager(v1, { dataDir });
+  try {
+    const first = await manager.install(v1.manifest);
+    const oldRootfs = first.paths.rootfs;
+    await writeFile(path.join(oldRootfs, 'root', '.bashrc'), '# user custom\n');
+    await writeFile(path.join(oldRootfs, 'root', '.gitconfig'), '[user]\n\tname = alice\n');
+    await mkdir(path.join(oldRootfs, 'root', 'bin'), { recursive: true });
+    const toolPath = path.join(oldRootfs, 'root', 'bin', 'hello.sh');
+    await writeFile(toolPath, '#!/bin/sh\necho hi\n');
+    await chmod(toolPath, 0o755);
+    const fixedTime = new Date('2025-01-02T03:04:05.000Z');
+    await utimes(toolPath, fixedTime, fixedTime);
+
+    await mkdir(path.join(oldRootfs, 'home', 'alice', '.config'), { recursive: true });
+    await writeFile(path.join(oldRootfs, 'home', 'alice', '.config', 'app.json'), '{"ok":true}\n');
+    await writeFile(path.join(oldRootfs, 'etc', 'custom-old'), 'must-not-copy\n');
+    await mkdir(path.join(oldRootfs, 'var', 'lib', 'dpkg'), { recursive: true });
+    await writeFile(path.join(oldRootfs, 'var', 'lib', 'dpkg', 'old-only'), 'must-not-copy\n');
+
+    manager.downloadAsset = makeIo(v2).downloadAsset;
+    manager.extractArchive = makeIo(v2).extractArchive;
+    const upgraded = await manager.install(v2.manifest);
+    const newRootfs = upgraded.paths.rootfs;
+
+    assert.equal(await readFile(path.join(newRootfs, 'root', '.bashrc'), 'utf8'), '# user custom\n');
+    assert.equal(await readFile(path.join(newRootfs, 'root', '.profile'), 'utf8'), '# v2 profile\n');
+    assert.equal(await readFile(path.join(newRootfs, 'root', '.gitconfig'), 'utf8'), '[user]\n\tname = alice\n');
+    assert.equal(await readFile(path.join(newRootfs, 'root', 'bin', 'hello.sh'), 'utf8'), '#!/bin/sh\necho hi\n');
+    const toolStat = await stat(path.join(newRootfs, 'root', 'bin', 'hello.sh'));
+    assert.equal(toolStat.mode & 0o777, 0o755);
+    assert.equal(Math.trunc(toolStat.mtimeMs / 1000), Math.trunc(fixedTime.getTime() / 1000));
+    assert.equal(await readFile(path.join(newRootfs, 'home', 'alice', '.config', 'app.json'), 'utf8'), '{"ok":true}\n');
+
+    // System trees always come from the new rootfs, never copied from the old instance.
+    assert.equal(await readFile(path.join(newRootfs, 'etc', 'os-release'), 'utf8'), 'VERSION_ID="2"\n');
+    assert.equal(await readFile(path.join(newRootfs, 'usr', 'share', 'marker'), 'utf8'), 'v2-usr\n');
+    assert.equal(await readFile(path.join(newRootfs, 'var', 'lib', 'dpkg', 'status'), 'utf8'), 'Package: new\n');
+    assert.equal(existsSync(path.join(newRootfs, 'etc', 'custom-old')), false);
+    assert.equal(existsSync(path.join(newRootfs, 'var', 'lib', 'dpkg', 'old-only')), false);
+  } finally {
+    await manager.dispose();
+  }
+});
+
+test('reinstall resets guest /root and /home by default, while options can override both methods', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest({
+    rootfsFiles: {
+      ...ARCHIVE_FILES.rootfs,
+      'root/.bashrc': '# fresh\n',
+      'home/.keep': 'fresh\n',
+    },
+  });
+  const { manager } = makeManager(fixture, { dataDir });
+  try {
+    const first = await manager.install(fixture.manifest);
+    await writeFile(path.join(first.paths.rootfs, 'root', '.bashrc'), '# edited\n');
+    await writeFile(path.join(first.paths.rootfs, 'root', 'notes.txt'), 'keep\n');
+    await mkdir(path.join(first.paths.rootfs, 'home', 'dev'), { recursive: true });
+    await writeFile(path.join(first.paths.rootfs, 'home', 'dev', 'data.txt'), 'keep\n');
+
+    const preserved = await manager.reinstall(fixture.manifest, undefined, { preserveGuestHome: true });
+    assert.equal(await readFile(path.join(preserved.paths.rootfs, 'root', 'notes.txt'), 'utf8'), 'keep\n');
+    assert.equal(await readFile(path.join(preserved.paths.rootfs, 'home', 'dev', 'data.txt'), 'utf8'), 'keep\n');
+
+    const reset = await manager.reinstall(fixture.manifest);
+    assert.equal(await readFile(path.join(reset.paths.rootfs, 'root', '.bashrc'), 'utf8'), '# fresh\n');
+    assert.equal(existsSync(path.join(reset.paths.rootfs, 'root', 'notes.txt')), false);
+    assert.equal(existsSync(path.join(reset.paths.rootfs, 'home', 'dev')), false);
+
+    await writeFile(path.join(reset.paths.rootfs, 'root', 'ephemeral.txt'), 'drop-me\n');
+    const cleanUpgrade = await manager.install(fixture.manifest, undefined, { preserveGuestHome: false });
+    assert.equal(existsSync(path.join(cleanUpgrade.paths.rootfs, 'root', 'ephemeral.txt')), false);
+  } finally {
+    await manager.dispose();
+  }
+});
+
+test('guest home preservation keeps symlinks as symlinks without escaping rootfs and skips special files', async () => {
+  const dataDir = tempDir();
+  const outsideDir = tempDir();
+  await mkdir(outsideDir, { recursive: true });
+  await writeFile(path.join(outsideDir, 'secret.txt'), 'outside-secret\n');
+  const fixture = makeManifest({
+    rootfsFiles: {
+      ...ARCHIVE_FILES.rootfs,
+      'root/.keep': 'v1\n',
+    },
+  });
+  const { manager } = makeManager(fixture, { dataDir });
+  try {
+    const first = await manager.install(fixture.manifest);
+    const oldRoot = path.join(first.paths.rootfs, 'root');
+    const oldHome = path.join(first.paths.rootfs, 'home');
+    await mkdir(oldHome, { recursive: true });
+
+    await writeFile(path.join(oldRoot, 'real.txt'), 'real\n');
+    await symlink('real.txt', path.join(oldRoot, 'rel-link'));
+    await symlink(outsideDir, path.join(oldRoot, 'escape-dir-link'));
+    await symlink('../../../../../etc/passwd', path.join(oldRoot, 'escape-rel-link'));
+    // Replace /home with a symlink pointing outside rootfs: must be ignored, never followed.
+    await rm(oldHome, { recursive: true, force: true });
+    await symlink(outsideDir, oldHome);
+
+    // Create a FIFO when mkfifo is available to verify special files are skipped.
+    const { execFileSync } = await import('node:child_process');
+    let fifoCreated = false;
+    try {
+      execFileSync('mkfifo', [path.join(oldRoot, 'pipe.fifo')]);
+      fifoCreated = true;
+    } catch {
+      // mkfifo is unavailable on Windows hosts.
+    }
+
+    const second = await manager.install(fixture.manifest);
+    const newRoot = path.join(second.paths.rootfs, 'root');
+    const newHome = path.join(second.paths.rootfs, 'home');
+
+    assert.equal((await lstat(path.join(newRoot, 'rel-link'))).isSymbolicLink(), true);
+    assert.equal(await readlink(path.join(newRoot, 'rel-link')), 'real.txt');
+    assert.equal((await lstat(path.join(newRoot, 'escape-dir-link'))).isSymbolicLink(), true);
+    assert.equal((await lstat(path.join(newRoot, 'escape-dir-link'))).isDirectory(), false);
+    assert.equal(await readlink(path.join(newRoot, 'escape-dir-link')), outsideDir);
+    assert.equal(existsSync(path.join(newRoot, 'escape-dir-link', 'secret.txt')), true);
+    assert.equal((await lstat(path.join(newRoot, 'escape-rel-link'))).isSymbolicLink(), true);
+    assert.equal(await readlink(path.join(newRoot, 'escape-rel-link')), '../../../../../etc/passwd');
+    assert.equal(existsSync(path.join(newHome, 'secret.txt')), false, 'top-level symlinked /home must not be dereferenced');
+    if (fifoCreated) {
+      assert.equal(existsSync(path.join(newRoot, 'pipe.fifo')), false, 'FIFO must be skipped');
+    }
+  } finally {
+    await manager.dispose();
+  }
+});
+
+test('failed upgrade staging leaves previous instance guest /root and /home untouched', async () => {
+  const dataDir = tempDir();
+  const fixture = makeManifest({
+    rootfsFiles: {
+      ...ARCHIVE_FILES.rootfs,
+      'root/.bashrc': '# initial\n',
+    },
+  });
+  const { manager } = makeManager(fixture, { dataDir });
+  try {
+    const before = await manager.install(fixture.manifest);
+    await writeFile(path.join(before.paths.rootfs, 'root', 'important.txt'), 'precious\n');
+    await mkdir(path.join(before.paths.rootfs, 'home', 'user'), { recursive: true });
+    await writeFile(path.join(before.paths.rootfs, 'home', 'user', 'work.txt'), 'precious-home\n');
+
+    const run = manager.runCommand;
+    manager.runCommand = (spec) => isProbe(spec)
+      ? Promise.resolve({ exitCode: 127, stderr: 'probe failed' })
+      : run(spec);
+
+    await assert.rejects(manager.install(fixture.manifest), /staged runtime does not run/);
+    assert.equal(await readFile(path.join(before.paths.rootfs, 'root', 'important.txt'), 'utf8'), 'precious\n');
+    assert.equal(await readFile(path.join(before.paths.rootfs, 'home', 'user', 'work.txt'), 'utf8'), 'precious-home\n');
+    assert.deepEqual(await readdir(manager._paths().instances), [before.instanceId]);
+  } finally {
+    await manager.dispose();
+  }
+});
+
+test('guest home preservation safely replaces skeleton symlinks, read-only files and type conflicts', async () => {
+  const dataDir = tempDir();
+  const outsideDir = tempDir();
+  await mkdir(outsideDir, { recursive: true });
+  const outsideTarget = path.join(outsideDir, 'skeleton-target.txt');
+  await writeFile(outsideTarget, 'untouched-outside\n');
+
+  const v1 = makeManifest({ version: '1.0.0' });
+  const v2 = makeManifest({
+    version: '2.0.0',
+    rootfsFiles: {
+      ...ARCHIVE_FILES.rootfs,
+      'root/ro.txt': 'skeleton-ro\n',
+      'root/slot': 'skeleton-file\n',
+      'root/as-dir/placeholder': 'skeleton-dir\n',
+    },
+  });
+
+  const { manager } = makeManager(v1, { dataDir });
+  try {
+    const first = await manager.install(v1.manifest);
+    const oldRoot = path.join(first.paths.rootfs, 'root');
+    await mkdir(oldRoot, { recursive: true });
+    await writeFile(path.join(oldRoot, '.bashrc'), '# user bashrc\n');
+    await writeFile(path.join(oldRoot, 'ro.txt'), 'user-overwrites-ro\n');
+    await mkdir(path.join(oldRoot, 'slot'), { recursive: true });
+    await writeFile(path.join(oldRoot, 'slot', 'nested.txt'), 'user-dir-replaces-file\n');
+    await writeFile(path.join(oldRoot, 'as-dir'), 'user-file-replaces-dir\n');
+
+    const baseIo = makeIo(v2, {
+      onExtract: async (kind, destination) => {
+        if (kind !== 'rootfs') return;
+        await mkdir(path.join(destination, 'root'), { recursive: true });
+        await symlink(outsideTarget, path.join(destination, 'root', '.bashrc'));
+      },
+    });
+    const originalExtract = baseIo.extractArchive;
+    manager.downloadAsset = baseIo.downloadAsset;
+    manager.extractArchive = async (archive, destination, opts) => {
+      await originalExtract(archive, destination, opts);
+      if (opts?.kind === 'rootfs') {
+        await chmod(path.join(destination, 'root', 'ro.txt'), 0o444);
+      }
+    };
+
+    const upgraded = await manager.install(v2.manifest);
+    const newRoot = path.join(upgraded.paths.rootfs, 'root');
+    assert.equal((await lstat(path.join(newRoot, '.bashrc'))).isSymbolicLink(), false);
+    assert.equal(await readFile(path.join(newRoot, '.bashrc'), 'utf8'), '# user bashrc\n');
+    assert.equal(await readFile(outsideTarget, 'utf8'), 'untouched-outside\n');
+    assert.equal(await readFile(path.join(newRoot, 'ro.txt'), 'utf8'), 'user-overwrites-ro\n');
+    assert.equal(await readFile(path.join(newRoot, 'slot', 'nested.txt'), 'utf8'), 'user-dir-replaces-file\n');
+    assert.equal((await lstat(path.join(newRoot, 'as-dir'))).isFile(), true);
+    assert.equal(await readFile(path.join(newRoot, 'as-dir'), 'utf8'), 'user-file-replaces-dir\n');
   } finally {
     await manager.dispose();
   }
