@@ -22,6 +22,7 @@ import { assertOfficialAssetUrl, isAllowedAssetOrigin } from './asset-installer.
 import { ProcessScope } from './process-scope.js';
 import { assertResolvConfWritable, inspectResolvConf, resolveDnsServers } from './dns-config.js';
 import { ensureGuestLibcSeccompPatch } from './libc-seccomp-patch.js';
+import { ensureGuestStaticSeccompPatch } from './static-seccomp-patch.js';
 
 const ACTIVE_SCHEMA_VERSION = 1;
 const METADATA_SCHEMA_VERSION = 1;
@@ -1556,6 +1557,17 @@ export class LinuxRuntimeManager {
     const libcPatch = await ensureGuestLibcSeccompPatch(instance.rootfs, { architecture: this.arch });
     if (libcPatch.status === 'unsupported') {
       throw new Error('guest libc seccomp patch failed: ' + libcPatch.reason);
+    }
+    // A statically linked program loads neither the loader stub nor the preload
+    // library: its calls are inlined in its own text and can only be answered by
+    // rewriting the file. A file that cannot be rewritten would keep dying at
+    // its first trapped call, so report it instead of continuing silently.
+    const staticPatch = await ensureGuestStaticSeccompPatch(instance.rootfs, { architecture: this.arch });
+    if (staticPatch.status === 'failed') {
+      throw new Error(
+        'guest static program seccomp patch failed: ' +
+        staticPatch.failures.map((failure) => failure.path + ': ' + failure.reason).join('; '),
+      );
     }
     await this._prepareHostPaths(instance.rootfs, [instance.rootfs]);
     const hostEnvironment = this._hostToolEnvironment();
