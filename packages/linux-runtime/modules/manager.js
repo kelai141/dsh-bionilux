@@ -626,6 +626,84 @@ async function removeTree(target) {
   await fs.rm(target, { recursive: true, force: true });
 }
 
+const GUEST_HOME_DIRECTORIES = Object.freeze(['root', 'home']);
+
+async function lstatOrNull(target) {
+  try {
+    return await fs.lstat(target);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/**
+ * Copy a guest home directory tree into the staged rootfs without following
+ * symlinks or copying special files (FIFOs, sockets, devices).
+ */
+async function copyPreservedHomeTree(sourceRoot, targetRoot) {
+  const sourceBaseStat = await lstatOrNull(sourceRoot);
+  if (!sourceBaseStat || !sourceBaseStat.isDirectory()) return;
+
+  const clearTargetEntry = async (dstEntry) => {
+    const dstEntryStat = await lstatOrNull(dstEntry);
+    if (dstEntryStat?.isDirectory()) await removeTree(dstEntry);
+    else if (dstEntryStat) await fs.unlink(dstEntry);
+  };
+
+  const copyDir = async (srcDir, dstDir, srcStat) => {
+    const existingDst = await lstatOrNull(dstDir);
+    if (existingDst) {
+      if (existingDst.isSymbolicLink() || !existingDst.isDirectory()) {
+        if (dstDir === targetRoot) {
+          throw new Error(`refusing to preserve guest home through non-directory target: ${dstDir}`);
+        }
+        await fs.unlink(dstDir);
+        await fs.mkdir(dstDir, { mode: 0o755 });
+      } else {
+        await fs.chmod(dstDir, (existingDst.mode & 0o7777) | 0o700).catch(() => undefined);
+      }
+    } else {
+      await fs.mkdir(dstDir, { mode: 0o755 });
+    }
+
+    const entries = await fs.readdir(srcDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const srcEntry = path.join(srcDir, entry.name);
+      const dstEntry = path.join(dstDir, entry.name);
+      if (!pathIsWithin(sourceRoot, srcEntry) || !pathIsWithin(targetRoot, dstEntry)) {
+        throw new Error(`guest home path escapes rootfs boundary: ${entry.name}`);
+      }
+      const entryStat = await fs.lstat(srcEntry);
+      if (entryStat.isDirectory()) {
+        await copyDir(srcEntry, dstEntry, entryStat);
+        continue;
+      }
+      if (entryStat.isSymbolicLink()) {
+        const linkTarget = await fs.readlink(srcEntry);
+        await clearTargetEntry(dstEntry);
+        await fs.symlink(linkTarget, dstEntry);
+        if (typeof fs.lutimes === 'function') {
+          await fs.lutimes(dstEntry, entryStat.atime, entryStat.mtime).catch(() => undefined);
+        }
+        continue;
+      }
+      if (entryStat.isFile()) {
+        await clearTargetEntry(dstEntry);
+        await fs.copyFile(srcEntry, dstEntry);
+        await fs.chmod(dstEntry, entryStat.mode & 0o7777);
+        await fs.utimes(dstEntry, entryStat.atime, entryStat.mtime);
+      }
+      // Non-regular special files (FIFOs, sockets, devices) are skipped.
+    }
+
+    await fs.utimes(dstDir, srcStat.atime, srcStat.mtime);
+    await fs.chmod(dstDir, srcStat.mode & 0o7777);
+  };
+
+  await copyDir(sourceRoot, targetRoot, sourceBaseStat);
+}
+
 async function writeFileAtomic(target, contents) {
   const directory = path.dirname(target);
   const temporary = path.join(directory, `.${path.basename(target)}.${makeId('tmp')}`);
@@ -1802,6 +1880,17 @@ export class LinuxRuntimeManager {
     return false;
   }
 
+  async _preserveGuestHome(previousRootfs, targetRootfs) {
+    for (const dirName of GUEST_HOME_DIRECTORIES) {
+      const source = path.join(previousRootfs, dirName);
+      const target = path.join(targetRootfs, dirName);
+      if (!pathIsWithin(previousRootfs, source) || !pathIsWithin(targetRootfs, target)) {
+        throw new Error(`guest home directory escapes rootfs: ${dirName}`);
+      }
+      await copyPreservedHomeTree(source, target);
+    }
+  }
+
   /**
    * Install (or replace) the active runtime instance.
    *
@@ -1810,11 +1899,12 @@ export class LinuxRuntimeManager {
    * then is the active record atomically replaced. A failure leaves the
    * previously active instance untouched.
    */
-  async install(manifest, runtimeId = defaultRuntimeIdForArch(this.arch)) {
-    return this._exclusive(() => this._installLocked(manifest, runtimeId));
+  async install(manifest, runtimeId = defaultRuntimeIdForArch(this.arch), options = {}) {
+    const preserveGuestHome = options?.preserveGuestHome !== false;
+    return this._exclusive(() => this._installLocked(manifest, runtimeId, { preserveGuestHome }));
   }
 
-  async _installLocked(manifest, runtimeId) {
+  async _installLocked(manifest, runtimeId, { preserveGuestHome = true } = {}) {
     if (this.disposed) throw new Error('manager is disposed');
     const selection = selectRuntime(manifest, runtimeId, this.arch);
     await this._ensureDirectories();
@@ -1853,6 +1943,10 @@ export class LinuxRuntimeManager {
       );
       await this._prepareRootfs(instance);
       await this._prepareHostPaths(instance.rootfs, [nodeResult.node]);
+      if (previous && preserveGuestHome) {
+        const previousRootfs = this._instancePaths(previous.instanceId).rootfs;
+        await this._preserveGuestHome(previousRootfs, instance.rootfs);
+      }
       const record = {
         schemaVersion: ACTIVE_SCHEMA_VERSION,
         instanceId,
@@ -1917,8 +2011,9 @@ export class LinuxRuntimeManager {
     }
   }
 
-  async reinstall(manifest, runtimeId = defaultRuntimeIdForArch(this.arch)) {
-    return this.install(manifest, runtimeId);
+  async reinstall(manifest, runtimeId = defaultRuntimeIdForArch(this.arch), options = {}) {
+    const preserveGuestHome = options?.preserveGuestHome === true;
+    return this.install(manifest, runtimeId, { preserveGuestHome });
   }
 
   async uninstall() {
