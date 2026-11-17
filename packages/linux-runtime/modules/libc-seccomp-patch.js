@@ -3,13 +3,21 @@
 // An app process with targetSdk >= 29 inherits Android's seccomp filter for the
 // untrusted_app domain: an allowlist built from bionic's own needs whose default
 // action is SECCOMP_RET_TRAP, so a system call bionic never makes kills the
-// process with SIGSYS ("Bad system call"). glibc issues two of those during
-// start-up, inside __libc_early_init -- before any constructor of an LD_PRELOAD
-// hook can install a handler, which is why a preload-side SIGSYS handler cannot
-// save the process:
+// process with SIGSYS ("Bad system call"). glibc issues two of those so early
+// that no code of an LD_PRELOAD hook has run yet, which is why a preload-side
+// SIGSYS handler cannot save the process. They do not come from libc's own
+// initialisation: the loader makes them for the first thread while setting up
+// TLS (init_tls -> __tls_init_tp in sysdeps/nptl/dl-tls_init_tp.c, before any
+// relocation), and libc repeats set_robust_list for every thread it starts
+// (nptl/pthread_create.c, start_thread):
 //
-//   set_robust_list  nptl registers the robust-futex list of the first thread.
+//   set_robust_list  nptl registers the robust-futex list of the current thread.
 //   rseq             restartable sequences (glibc >= 2.35).
+//
+// The per-thread site cannot be left to a SIGSYS handler even in principle:
+// start_thread blocks every signal before it calls these, and a trapped system
+// call while SIGSYS is blocked is fatal -- the kernel resets the handler to the
+// default action and kills the thread.
 //
 // Both are best-effort, so answering -ENOSYS is exactly what a kernel without
 // those features would do. The calls are inlined `svc` instructions in the

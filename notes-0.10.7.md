@@ -5,18 +5,22 @@
 - 修复 arm64 真机上 Linux 环境在「准备 rootfs」阶段以 `Bad system call` 失败的问题。
   根因：Android 对 targetSdk >= 29 的应用进程使用 untrusted_app 的 seccomp 白名单，
   默认动作是 TRAP —— 白名单之外的系统调用会被内核用 SIGSYS 杀掉。bionic 从不调用
-  `set_robust_list`(99) 与 `rseq`(293)，两者因此不在白名单里；而 glibc 在 libc 初始化
-  阶段（`__libc_early_init`，早于任何 LD_PRELOAD 构造函数）就会发出它们。
+  `set_robust_list`(99) 与 `rseq`(293)，两者因此不在白名单里；而 glibc 的 loader 在
+  为第一个线程做 TLS 初始化时会发出它们（`init_tls` → `__tls_init_tp`，早于任何重定位，
+  也早于任何 LD_PRELOAD 代码），libc 在每创建一个线程时还会再发一次 `set_robust_list`。
 - 在 APK 内承担链接器角色的 glibc loader 现在于构建期打补丁：这两处 `svc #0` 改写为
   `movn x0, #37`（即 `-ENOSYS`），不再进入内核。实测这两个是启动阶段仅有的被拦调用。
 - 安装（prepare）阶段会用同一规则给 guest 的 `libc.so.6` 打补丁。glibc 里这两处调用
   不止一处（新线程创建也会用到），而 rootfs 里的 libc 来自 Debian 包、构建期碰不到，
   所以放在设备侧执行：按摘要记账、可重复执行（幂等）；重新安装/更新 Linux 环境时会重打。
   匹配不到预期指令时直接报错，不静默放过。
-- 为什么不能靠 LD_PRELOAD 里的 SIGSYS 处理器：这两个调用发生在依赖构造函数之前，
-  预载库的构造函数还没运行，进程已经被信号杀掉了（真机与本地 glibc 2.39/2.41 均复现）。
+- 为什么不能靠 LD_PRELOAD 里的 SIGSYS 处理器：这两个调用发生在 loader 的 TLS 初始化里，
+  比预载库的 ifunc resolver 和构造函数都早，预载库还没跑第一行代码，进程就已经被杀
+  （真机与本地 glibc 2.39/2.41 均复现）。新线程那一条更绕不过：`start_thread` 在调用前
+  把全部信号 block，而 SIGSYS 被 block 时内核把处置复位为默认并直接杀线程。
 - 局限：静态链接的 guest 不经过这两处调用点，未覆盖；x86_64 guest 不打补丁
-  （Android 模拟器镜像允许这两个调用，且指令编码不同）。
+  （Android 模拟器镜像允许这两个调用，且指令编码不同）。应用域还拦着 `unshare`/
+  `keyctl`/`setgroups` 等其它调用，本补丁不覆盖它们，踩到仍是 `Bad system call`。
 
 ## 真机证据（vivo V2425A / Android 17 / targetSdk 34）
 
