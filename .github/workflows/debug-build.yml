@@ -168,6 +168,8 @@ jobs:
         timeout-minutes: 18
         run: |
           bash scripts/ci-install-packages.sh gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+      - name: SIGSYS entry stub injector and handler tests
+        run: node --test scripts/inject-sigsys-stub.test.mjs
       - name: Required AArch64 glibc QEMU regressions (not Android)
         run: bash tests/aarch64.sh
 
@@ -363,6 +365,20 @@ jobs:
           # (measured on vivo V2425A, Android 17, targetSdk 34).
           sudo env "PATH=$PATH" node scripts/patch-android-glibc.mjs \
             "$stage/bionilux-loader-$ARCH.so"
+          # That instruction patch covers only the two calls glibc makes while
+          # signals are still blocked. Everything else the app seccomp filter
+          # traps (unshare, mount, keyctl, io_uring_setup, bpf, SysV IPC, ...)
+          # would still kill the guest on the spot, with no chance to degrade.
+          # The entry stub runs before the first rtld instruction and answers a
+          # trapped call with -ENOSYS from there on. x86_64 loaders are skipped
+          # here by design: the emulator images answer those calls themselves
+          # and the stub encoding is AArch64 only.
+          sudo env "PATH=$PATH" node scripts/inject-sigsys-stub.mjs \
+            "$stage/bionilux-loader-$ARCH.so"
+          # Structural gate: e_entry, PT_LOAD[0] and the stub's own magic must
+          # still match, so a loader without the stub cannot reach a release.
+          sudo env "PATH=$PATH" node scripts/inject-sigsys-stub.mjs \
+            "$stage/bionilux-loader-$ARCH.so" --check
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links --verify
           sudo tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \

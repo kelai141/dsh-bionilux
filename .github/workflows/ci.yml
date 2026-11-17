@@ -86,6 +86,10 @@ jobs:
         run: npm ci --prefix packages/linux-runtime --ignore-scripts --no-audit --no-fund
       - name: plugin package tests
         run: node --test packages/linux-bootstrap/test/*.test.mjs packages/linux-runtime/test/*.test.mjs
+      - name: SIGSYS entry stub injector tests
+        # The handler harness inside this suite needs aarch64-linux-gnu-gcc and
+        # qemu-aarch64-static and reports itself as skipped when they are absent.
+        run: node --test scripts/inject-sigsys-stub.test.mjs
       - name: the bootstrap and runtime manifest validators agree
         run: |
           node --input-type=module -e '
