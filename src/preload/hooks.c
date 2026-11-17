@@ -3551,9 +3551,389 @@ struct group *getgrgid(gid_t gid) {
 
 #pragma GCC diagnostic pop
 
+// ── SIGSYS guard ───────────────────────────────────────────────────
+// The loader entry stub installs a process-wide SIGSYS handler before the
+// dynamic loader executes its first instruction, so a syscall that Android's
+// seccomp policy answers with SECCOMP_RET_TRAP becomes -ENOSYS instead of a
+// fatal signal. Two guest actions defeat that, and both are reachable from
+// ordinary programs:
+//
+//   * putting SIGSYS in the blocked set. A synchronous signal that is blocked
+//     kills the thread; the handler is never entered (observed: exit 159).
+//   * installing another SIGSYS disposition. The stub's handler is replaced,
+//     so nothing fills in -ENOSYS and the process dies again.
+//
+// The guard keeps the runtime handler installed and makes the guest believe
+// its own calls took effect. SIGSYS is silently dropped from every blocked
+// set, and sigaction()/signal() calls for SIGSYS are recorded but not
+// installed; the recorded action is what the guest sees as its own, so oldact
+// stays POSIX-correct. A delivery the runtime does not own -- si_code other
+// than SYS_SECCOMP, or a tag from a seccomp filter the guest installed itself
+// in si_errno -- is chained to the guest's last handler.
+//
+// Arming is deliberately conditional. The stub publishes its handler address
+// in BIONILUX_SIGSYS_STUB (a fixed-width hexadecimal placeholder the launcher
+// can seed, so the stub can overwrite it in place), and the probe below
+// compares it with what sigaction(SIGSYS, NULL, &old) reports. When the
+// variable is absent or still zero -- a preload run outside the stub, or a
+// launcher that does not seed it -- a handler that is already installed before
+// this library is initialized is treated as the upstream handler instead. In
+// this runtime that can only be the entry stub, because the stub runs before
+// the dynamic loader and every other object's constructors run after this one.
+// Without either signal, the hooks below forward unchanged, so processes that
+// never see the stub keep exactly their previous behavior.
+
+// si_code for a syscall stopped by a seccomp filter that returned
+// SECCOMP_RET_TRAP. The kernel defines it as SYS_SECCOMP; libc headers expose
+// it as an enumerator, so name it here instead of relying on the header.
+#define BN_SIGSYS_CODE_SECCOMP 1
+// The stub's published handler address. Written in place by the stub, read
+// once while this library initializes.
+#define BN_SIGSYS_STUB_MARKER "BIONILUX_SIGSYS_STUB"
+
+struct bn_sigsys_action {
+    unsigned seq;
+    struct sigaction act;
+};
+
+static pthread_mutex_t bn_sigsys_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct bn_sigsys_action bn_sigsys_guest = {0, {.sa_handler = SIG_DFL}};
+static struct sigaction bn_sigsys_upstream;
+static struct sigaction bn_sigsys_installed;
+static int bn_sigsys_armed;
+static int bn_sigsys_busy;
+static int (*bn_sigsys_do_sigaction)(int, const struct sigaction *, struct sigaction *);
+static int (*bn_sigsys_do_sigmask)(int, const sigset_t *, sigset_t *);
+
+static int bn_sigsys_on(void) {
+    return __atomic_load_n(&bn_sigsys_armed, __ATOMIC_ACQUIRE);
+}
+
+// Read the guest-visible SIGSYS action. Writers publish through a sequence
+// counter because the signal handler cannot take the writer's lock.
+static void bn_sigsys_guest_read(struct sigaction *out) {
+    for (int attempt = 0; attempt < 64; attempt++) {
+        unsigned seq = __atomic_load_n(&bn_sigsys_guest.seq, __ATOMIC_ACQUIRE);
+        if (seq & 1u) continue;
+        *out = bn_sigsys_guest.act;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&bn_sigsys_guest.seq, __ATOMIC_RELAXED) == seq) return;
+    }
+    // A concurrent writer kept the copy torn; reporting the default action is
+    // the only safe answer.
+    memset(out, 0, sizeof *out);
+}
+
+// Caller holds bn_sigsys_lock.
+static void bn_sigsys_guest_write(const struct sigaction *act) {
+    __atomic_fetch_add(&bn_sigsys_guest.seq, 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    bn_sigsys_guest.act = *act;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_fetch_add(&bn_sigsys_guest.seq, 1, __ATOMIC_RELAXED);
+}
+
+// Reproduce the kernel's handling of an uncaught synchronous SIGSYS: the
+// disposition is reset to the default and the signal is raised again, which
+// terminates the process the way the runtime would have without the guard.
+static void bn_sigsys_default(int sig) {
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    if (bn_sigsys_do_sigaction) bn_sigsys_do_sigaction(sig, &dfl, NULL);
+    raise(sig);
+}
+
+static int bn_sigsys_ours(const siginfo_t *si) {
+    return si && si->si_code == BN_SIGSYS_CODE_SECCOMP && si->si_errno == 0;
+}
+
+// Delay the guest's mask for the duration of its handler, the way the kernel
+// would have applied act->sa_mask. Signal-mask syscalls are async-signal-safe.
+static void bn_sigsys_call_guest(const struct sigaction *guest, int sig,
+                                 siginfo_t *si, void *uc) {
+    sigset_t saved;
+    int masked = bn_sigsys_do_sigmask &&
+                 bn_sigsys_do_sigmask(SIG_BLOCK, &guest->sa_mask, &saved) == 0;
+    if (guest->sa_flags & SA_SIGINFO) guest->sa_sigaction(sig, si, uc);
+    else guest->sa_handler(sig);
+    if (masked) bn_sigsys_do_sigmask(SIG_SETMASK, &saved, NULL);
+}
+
+static void bn_sigsys_handler(int sig, siginfo_t *si, void *uc) {
+    if (bn_sigsys_ours(si)) {
+        // The runtime owns this one: hand it to the entry stub's handler,
+        // which fills in the syscall result and returns.
+        const struct sigaction *up = &bn_sigsys_upstream;
+        if (up->sa_handler != SIG_DFL && up->sa_handler != SIG_IGN) {
+            if (up->sa_flags & SA_SIGINFO) up->sa_sigaction(sig, si, uc);
+            else up->sa_handler(sig);
+            return;
+        }
+    }
+    struct sigaction guest;
+    bn_sigsys_guest_read(&guest);
+    if (guest.sa_handler == SIG_DFL) { bn_sigsys_default(sig); return; }
+    if (guest.sa_handler == SIG_IGN) {
+        // The kernel forces the default action for a signal it generated
+        // itself, and ignores only signals another process sent.
+        if (si && si->si_code > 0) { bn_sigsys_default(sig); return; }
+        return;
+    }
+    bn_sigsys_call_guest(&guest, sig, si, uc);
+}
+
+static int bn_sigsys_install(void) {
+    struct sigaction act;
+    memset(&act, 0, sizeof act);
+    act.sa_sigaction = bn_sigsys_handler;
+    act.sa_flags = SA_SIGINFO;
+    sigemptyset(&act.sa_mask);
+    bn_sigsys_installed = act;
+    if (bn_sigsys_do_sigaction(SIGSYS, &act, NULL) != 0) {
+        DBG("SIGSYS: cannot install the guard handler: %s\n", strerror(errno));
+        return -1;
+    }
+    __atomic_store_n(&bn_sigsys_armed, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+// Record the guest's requested action and keep the runtime handler installed.
+// Returns 0 and fills oldact with the guest-visible previous action.
+static int bn_sigsys_set_action(const struct sigaction *act,
+                                struct sigaction *oldact) {
+    // Recording an action must not disturb what the guest sees in errno;
+    // dlsym(), the mutex and the bookkeeping below can all change it.
+    int saved = errno;
+    if (!act) { // query only
+        if (oldact) bn_sigsys_guest_read(oldact);
+        errno = saved;
+        return 0;
+    }
+    if (act->sa_handler != SIG_DFL && act->sa_handler != SIG_IGN &&
+        (act->sa_flags & (SA_RESETHAND | SA_NODEFER))) {
+        // The kernel would reset the disposition (or leave the signal blocked)
+        // after the first delivery; those semantics cannot be emulated while a
+        // chain handler stays installed, so refuse instead of silently
+        // changing behavior.
+        DBG("SIGSYS: refusing SA_RESETHAND/SA_NODEFER for %p\n",
+            (void *)act->sa_handler);
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&bn_sigsys_lock);
+    struct sigaction previous;
+    bn_sigsys_guest_read(&previous);
+    // A guest that bypassed these hooks (raw rt_sigaction) may have replaced
+    // the runtime handler; put it back before recording the new action.
+    struct sigaction current;
+    if (bn_sigsys_do_sigaction(SIGSYS, NULL, &current) == 0 &&
+        current.sa_sigaction != bn_sigsys_handler)
+        bn_sigsys_do_sigaction(SIGSYS, &bn_sigsys_installed, NULL);
+    bn_sigsys_guest_write(act);
+    pthread_mutex_unlock(&bn_sigsys_lock);
+    if (oldact) *oldact = previous;
+    errno = saved;
+    return 0;
+}
+
+// Drop SIGSYS from a set the guest is about to install as its blocked set.
+static int bn_sigsys_mask(int how, const sigset_t *set, sigset_t *oldset) {
+    if (!set || (how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK))
+        return bn_sigsys_do_sigmask(how, set, oldset);
+    int saved = errno;
+    sigset_t filtered = *set;
+    int member = sigismember(set, SIGSYS) == 1;
+    if (how == SIG_UNBLOCK) {
+        // SIGSYS must end up unblocked even if the caller did not name it.
+        if (!member) sigaddset(&filtered, SIGSYS);
+    } else if (member) {
+        sigdelset(&filtered, SIGSYS);
+    }
+    int rc = bn_sigsys_do_sigmask(how, &filtered, oldset);
+    if (rc == 0) errno = saved;
+    return rc;
+}
+
+static int bn_sigsys_init(void) {
+    if (bn_sigsys_busy || bn_sigsys_on()) return bn_sigsys_on();
+    bn_sigsys_busy = 1;
+    int armed = 0;
+    // Documented escape hatch: BIONILUX_SIGSYS_GUARD=0 keeps the guard out of
+    // the process so a single runtime can be compared against the unguarded
+    // behavior without rebuilding the library.
+    const char *disabled = getenv("BIONILUX_SIGSYS_GUARD");
+    if (disabled && !strcmp(disabled, "0")) {
+        DBG("SIGSYS: guard disabled by BIONILUX_SIGSYS_GUARD=0\n");
+        bn_sigsys_busy = 0;
+        return 0;
+    }
+    REAL(bn_sigsys_do_sigaction, "sigaction");
+    REAL(bn_sigsys_do_sigmask, "pthread_sigmask");
+    if (!bn_sigsys_do_sigaction || !bn_sigsys_do_sigmask) goto out;
+
+    struct sigaction old;
+    memset(&old, 0, sizeof old);
+    if (bn_sigsys_do_sigaction(SIGSYS, NULL, &old) != 0) goto out;
+    // Nothing armed the signal before this library initialized; there is no
+    // runtime handler to preserve and the guard must stay out of the way.
+    if (old.sa_handler == SIG_DFL || old.sa_handler == SIG_IGN) goto out;
+
+    // Preferred evidence: the stub's own published handler address.
+    const char *marker = getenv(BN_SIGSYS_STUB_MARKER);
+    unsigned long published = 0;
+    if (marker && *marker) published = strtoul(marker, NULL, 16);
+    if (published && (void *)published != (void *)old.sa_sigaction) {
+        DBG("SIGSYS: stub marker %p does not match the installed handler %p; "
+            "leaving SIGSYS alone\n", (void *)published, (void *)old.sa_sigaction);
+        goto out;
+    }
+    if (!published)
+        DBG("SIGSYS: no stub marker; treating the pre-init handler %p as the "
+            "entry stub\n", (void *)old.sa_sigaction);
+    bn_sigsys_upstream = old;
+    if (bn_sigsys_install() == 0) {
+        armed = 1;
+        DBG("SIGSYS: guard armed, upstream=%p%s\n", (void *)old.sa_sigaction,
+            published ? " (marker)" : "");
+    }
+out:
+    bn_sigsys_busy = 0;
+    return armed;
+}
+
+int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact) {
+    typedef int (*fn_t)(int, const struct sigaction *, struct sigaction *);
+    static _Thread_local fn_t real; REAL(real, "sigaction");
+    if (!real) { errno = ENOSYS; return -1; }
+    if (sig != SIGSYS || !bn_sigsys_on()) return real(sig, act, oldact);
+    return bn_sigsys_set_action(act, oldact);
+}
+
+sighandler_t signal(int sig, sighandler_t handler) {
+    typedef sighandler_t (*fn_t)(int, sighandler_t);
+    static _Thread_local fn_t real; REAL(real, "signal");
+    if (!real) { errno = ENOSYS; return SIG_ERR; }
+    if (sig != SIGSYS || !bn_sigsys_on()) return real(sig, handler);
+    struct sigaction act;
+    memset(&act, 0, sizeof act);
+    act.sa_handler = handler;
+    act.sa_flags = SA_RESTART;
+    sigemptyset(&act.sa_mask);
+    struct sigaction old;
+    if (bn_sigsys_set_action(&act, &old) != 0) return SIG_ERR;
+    return old.sa_handler;
+}
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
+    typedef int (*fn_t)(int, const sigset_t *, sigset_t *);
+    static _Thread_local fn_t real; REAL(real, "sigprocmask");
+    if (!real) { errno = ENOSYS; return -1; }
+    if (!bn_sigsys_on()) return real(how, set, oldset);
+    return bn_sigsys_mask(how, set, oldset);
+}
+
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset) {
+    typedef int (*fn_t)(int, const sigset_t *, sigset_t *);
+    static _Thread_local fn_t real; REAL(real, "pthread_sigmask");
+    if (!real) return ENOSYS;
+    if (!bn_sigsys_on()) return real(how, set, oldset);
+    return bn_sigsys_mask(how, set, oldset);
+}
+
+// glibc exports __libc_sigaction as an internal alias; a caller that reaches
+// the symbol must get the same guarded behavior.
+int __libc_sigaction(int sig, const struct sigaction *act,
+                     struct sigaction *oldact) {
+    return sigaction(sig, act, oldact);
+}
+
+// glibc does not export rt_sigaction()/rt_sigprocmask(); the kernel entry
+// points are the syscalls. A guest that links its own provider of those names
+// would otherwise reach the kernel without passing this guard, so translate
+// the kernel ABI here and forward. The layouts below are the kernel's, not
+// glibc's: handler, flags, restorer, one 64-bit mask word.
+struct bn_kernel_sigaction {
+    union {
+        void (*handler)(int);
+        void (*action)(int, siginfo_t *, void *);
+    } handler;
+    unsigned long flags;
+    void (*restorer)(void);
+    unsigned long mask;
+};
+
+#define BN_SIGSYS_BIT (1UL << (SIGSYS - 1))
+
+static int bn_sigsys_raw_syscall(long nr, long a1, long a2, long a3, long a4) {
+    return (int)syscall(nr, a1, a2, a3, a4);
+}
+
+static void bn_sigsys_from_kernel(const struct bn_kernel_sigaction *k,
+                                  struct sigaction *out) {
+    memset(out, 0, sizeof *out);
+    out->sa_handler = k->handler.handler;
+    if (k->flags & SA_SIGINFO) out->sa_sigaction = k->handler.action;
+    out->sa_flags = (int)k->flags;
+    memcpy(&out->sa_mask, &k->mask, sizeof k->mask);
+}
+
+static void bn_sigsys_to_kernel(const struct sigaction *act,
+                                struct bn_kernel_sigaction *k) {
+    memset(k, 0, sizeof *k);
+    k->handler.handler = act->sa_handler;
+    if (act->sa_flags & SA_SIGINFO) k->handler.action = act->sa_sigaction;
+    k->flags = (unsigned long)act->sa_flags;
+    memcpy(&k->mask, &act->sa_mask, sizeof k->mask);
+}
+
+int rt_sigaction(int sig, const struct bn_kernel_sigaction *act,
+                 struct bn_kernel_sigaction *oldact, size_t sigsetsize) {
+    // Anything that is not the guarded signal, or a mask the kernel would
+    // reject, is forwarded byte for byte.
+    if (!bn_sigsys_on() || sig != SIGSYS || sigsetsize != sizeof(unsigned long))
+        return bn_sigsys_raw_syscall(SYS_rt_sigaction, sig, (long)(uintptr_t)act,
+                                     (long)(uintptr_t)oldact, (long)sigsetsize);
+    int saved = errno;
+    struct sigaction local, previous;
+    if (act) bn_sigsys_from_kernel(act, &local);
+    memset(&previous, 0, sizeof previous);
+    if (bn_sigsys_set_action(act ? &local : NULL, &previous) != 0) return -1;
+    if (oldact) bn_sigsys_to_kernel(&previous, oldact);
+    errno = saved;
+    return 0;
+}
+
+int rt_sigprocmask(int how, const void *set, void *oldset, size_t sigsetsize) {
+    if (!bn_sigsys_on() || !set || sigsetsize != sizeof(unsigned long) ||
+        (how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK))
+        return bn_sigsys_raw_syscall(SYS_rt_sigprocmask, how,
+                                     (long)(uintptr_t)set,
+                                     (long)(uintptr_t)oldset, (long)sigsetsize);
+    int saved = errno;
+    unsigned long filtered;
+    memcpy(&filtered, set, sizeof filtered);
+    if (how == SIG_UNBLOCK) filtered |= BN_SIGSYS_BIT;
+    else filtered &= ~BN_SIGSYS_BIT;
+    int rc = bn_sigsys_raw_syscall(SYS_rt_sigprocmask, how,
+                                   (long)(uintptr_t)&filtered,
+                                   (long)(uintptr_t)oldset, (long)sigsetsize);
+    if (rc == 0) errno = saved;
+    return rc;
+}
+
 #include "compat_syscall.inc.c"
 #include "compat_python.inc.c"
 #include "compat_glob.inc.c"
+
+// Install the guard during this library's initialization. The priority makes
+// it the first initializer in this object, so nothing else here can observe an
+// unguarded SIGSYS. The entry stub installed its handler even earlier, which
+// is what the probe compares against; the order between preload objects is the
+// loader's to choose, but every constructor runs after the stub.
+__attribute__((constructor(101))) static void bn_sigsys_init_early(void) {
+    (void)bn_sigsys_init();
+}
 
 __attribute__((constructor)) static void on_init(void) {
     for (size_t i = 0; i < sizeof bn_context / sizeof bn_context[0]; i++) {
