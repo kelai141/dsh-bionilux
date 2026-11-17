@@ -322,6 +322,310 @@ static void check_search(void) {
     puts("DNS search NXDOMAIN continuation, config refresh and bounded options: OK");
 }
 
+// ── SIGSYS guard ───────────────────────────────────────────────────
+// The entry stub installs its SIGSYS handler before this library initializes,
+// so the guard is exercised by installing one the same way (through the real
+// sigaction, never through the hook under test) and then letting
+// bn_sigsys_init() probe it. Real seccomp deliveries cannot be produced here;
+// tests/sigsys_guard.sh covers them end to end.
+static volatile int sigsys_upstream_calls;
+static siginfo_t sigsys_upstream_si;
+static volatile int sigsys_guest_calls;
+static volatile int sigsys_guest_code;
+static volatile int sigsys_guest_errno;
+static volatile int sigsys_simple_calls;
+
+static void sigsys_upstream_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)uc;
+    sigsys_upstream_calls++;
+    if (si) sigsys_upstream_si = *si;
+}
+
+static void sigsys_guest_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)uc;
+    sigsys_guest_calls++;
+    sigsys_guest_code = si ? si->si_code : -1;
+    sigsys_guest_errno = si ? si->si_errno : -1;
+}
+
+static void sigsys_simple_handler(int sig) {
+    (void)sig;
+    sigsys_simple_calls++;
+}
+
+typedef int (*bn_test_action_fn)(int, const struct sigaction *, struct sigaction *);
+typedef int (*bn_test_mask_fn)(int, const sigset_t *, sigset_t *);
+
+static bn_test_action_fn bn_test_action;
+static bn_test_mask_fn bn_test_mask;
+
+static void bn_test_real(void) {
+    if (bn_test_action) return;
+    bn_test_action = dlsym(RTLD_NEXT, "sigaction");
+    bn_test_mask = dlsym(RTLD_NEXT, "sigprocmask");
+    assert(bn_test_action && bn_test_mask);
+}
+
+// The guard's own view of the kernel disposition, never the hook under test.
+static void bn_test_sigaction(int sig, const struct sigaction *act,
+                              struct sigaction *oldact) {
+    bn_test_real();
+    assert(bn_test_action(sig, act, oldact) == 0);
+}
+
+static void bn_test_blocked(int sig, int blocked) {
+    sigset_t current;
+    bn_test_real();
+    assert(bn_test_mask(0, NULL, &current) == 0);
+    assert((sigismember(&current, sig) == 1) == blocked);
+}
+
+// Put the process back to "no runtime handler is installed".
+static void sigsys_disengage(void) {
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    bn_test_sigaction(SIGSYS, &dfl, NULL);
+    __atomic_store_n(&bn_sigsys_armed, 0, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&bn_sigsys_lock);
+    struct sigaction zero;
+    memset(&zero, 0, sizeof zero);
+    bn_sigsys_guest_write(&zero);
+    pthread_mutex_unlock(&bn_sigsys_lock);
+    memset(&bn_sigsys_upstream, 0, sizeof bn_sigsys_upstream);
+    unsetenv("BIONILUX_SIGSYS_STUB");
+}
+
+static void sigsys_install_stub(void) {
+    struct sigaction act;
+    memset(&act, 0, sizeof act);
+    act.sa_sigaction = sigsys_upstream_handler;
+    act.sa_flags = SA_SIGINFO;
+    sigemptyset(&act.sa_mask);
+    bn_test_sigaction(SIGSYS, &act, NULL);
+}
+
+static void check_sigsys_guard(void) {
+    // Without an entry stub there is no handler and nothing to preserve.
+    sigsys_disengage();
+    assert(bn_sigsys_init() == 0);
+    assert(!bn_sigsys_on());
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGSYS);
+    assert(!sigprocmask(SIG_BLOCK, &set, NULL));
+    bn_test_blocked(SIGSYS, 1);
+    assert(!sigprocmask(SIG_UNBLOCK, &set, NULL));
+    bn_test_blocked(SIGSYS, 0);
+
+    // The published marker is authoritative: a wrong address vetoes the guard
+    // even though a handler is installed.
+    sigsys_install_stub();
+    assert(!setenv("BIONILUX_SIGSYS_STUB", "deadbeef", 1));
+    assert(bn_sigsys_init() == 0);
+    assert(!bn_sigsys_on());
+
+    // A matching marker arms the guard.
+    char marker[32];
+    snprintf(marker, sizeof marker, "%lx", (unsigned long)(void *)sigsys_upstream_handler);
+    assert(!setenv("BIONILUX_SIGSYS_STUB", marker, 1));
+    assert(bn_sigsys_init() == 1);
+    assert(bn_sigsys_on());
+
+    // SIGSYS can never enter the blocked set, everything else can, and the
+    // reported previous mask is the real one.
+    sigset_t previous;
+    memset(&previous, 0, sizeof previous);
+    sigset_t mixed;
+    sigemptyset(&mixed);
+    sigaddset(&mixed, SIGSYS);
+    sigaddset(&mixed, SIGUSR1);
+    assert(!sigprocmask(SIG_BLOCK, &mixed, &previous));
+    assert(sigismember(&previous, SIGSYS) == 0);
+    assert(sigismember(&previous, SIGUSR1) == 0);
+    bn_test_blocked(SIGSYS, 0);
+    bn_test_blocked(SIGUSR1, 1);
+    assert(!sigprocmask(SIG_UNBLOCK, &mixed, NULL));
+
+    // SIG_UNBLOCK strips the signal even when the caller did not name it.
+    sigset_t raw;
+    sigemptyset(&raw);
+    sigaddset(&raw, SIGSYS);
+    assert(syscall(SYS_rt_sigprocmask, SIG_BLOCK, &raw, NULL, 8) == 0);
+    bn_test_blocked(SIGSYS, 1);
+    sigset_t other;
+    sigemptyset(&other);
+    sigaddset(&other, SIGUSR2);
+    assert(!pthread_sigmask(SIG_UNBLOCK, &other, NULL));
+    bn_test_blocked(SIGSYS, 0);
+
+    // The guest's action is recorded and reported as its previous action,
+    // while the kernel keeps the guard handler.
+    struct sigaction guest, old, query;
+    memset(&guest, 0, sizeof guest);
+    guest.sa_sigaction = sigsys_guest_handler;
+    guest.sa_flags = SA_SIGINFO;
+    sigemptyset(&guest.sa_mask);
+    memset(&old, 0, sizeof old);
+    assert(!sigaction(SIGSYS, &guest, &old));
+    assert(old.sa_handler == SIG_DFL);
+    memset(&query, 0, sizeof query);
+    assert(!sigaction(SIGSYS, NULL, &query));
+    assert(query.sa_sigaction == sigsys_guest_handler);
+    bn_test_sigaction(SIGSYS, NULL, &query);
+    assert(query.sa_sigaction == bn_sigsys_handler);
+    memset(&old, 0, sizeof old);
+    assert(!sigaction(SIGSYS, &guest, &old));
+    assert(old.sa_sigaction == sigsys_guest_handler);
+
+    // Actions the chain cannot reproduce are refused instead of silently
+    // changing their semantics.
+    struct sigaction refused = guest;
+    refused.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    errno = 0;
+    assert(sigaction(SIGSYS, &refused, NULL) == -1 && errno == EINVAL);
+    refused.sa_flags = SA_SIGINFO | SA_NODEFER;
+    errno = 0;
+    assert(sigaction(SIGSYS, &refused, NULL) == -1 && errno == EINVAL);
+    memset(&query, 0, sizeof query);
+    assert(!sigaction(SIGSYS, NULL, &query));
+    assert(query.sa_sigaction == sigsys_guest_handler);
+
+    // The kernel-ABI entry points are guarded too, so a guest that links its
+    // own provider of rt_sigaction()/rt_sigprocmask() cannot bypass the guard.
+    struct sigaction baseline;
+    memset(&baseline, 0, sizeof baseline);
+    baseline.sa_handler = SIG_DFL;
+    assert(!sigaction(SIGSYS, &baseline, NULL));
+    struct bn_kernel_sigaction kact, kold;
+    memset(&kact, 0, sizeof kact);
+    kact.handler.action = sigsys_guest_handler;
+    kact.flags = SA_SIGINFO;
+    memset(&kold, 0, sizeof kold);
+    assert(!rt_sigaction(SIGSYS, &kact, &kold, sizeof(unsigned long)));
+    assert(kold.handler.handler == SIG_DFL);
+    memset(&kold, 0, sizeof kold);
+    assert(!rt_sigaction(SIGSYS, NULL, &kold, sizeof(unsigned long)));
+    assert(kold.flags & SA_SIGINFO);
+    assert(kold.handler.action == kact.handler.action);
+    // The kernel disposition stays the guard handler even through that path.
+    memset(&kact, 0, sizeof kact);
+    kact.handler.handler = SIG_DFL;
+    assert(!rt_sigaction(SIGSYS, &kact, NULL, sizeof(unsigned long)));
+    memset(&query, 0, sizeof query);
+    bn_test_sigaction(SIGSYS, NULL, &query);
+    assert(query.sa_sigaction == bn_sigsys_handler);
+    errno = 0;
+    assert(rt_sigaction(SIGSYS, NULL, &kold, 0) == -1 && errno == EINVAL);
+    // Restore the guest handler for the delivery checks below.
+    assert(!sigaction(SIGSYS, &guest, NULL));
+
+    // The same holds for the kernel's mask entry point.
+    unsigned long sysmask = BN_SIGSYS_BIT, sysmask_previous = 0;
+    assert(!rt_sigprocmask(SIG_BLOCK, &sysmask, &sysmask_previous, sizeof sysmask));
+    unsigned long kernel_mask = 0;
+    assert(syscall(SYS_rt_sigprocmask, 0, NULL, &kernel_mask, sizeof kernel_mask) == 0);
+    assert((kernel_mask & BN_SIGSYS_BIT) == 0);
+    // Block it behind the guard's back; SIG_UNBLOCK still has to clear it.
+    assert(syscall(SYS_rt_sigprocmask, SIG_BLOCK, &sysmask, NULL, sizeof sysmask) == 0);
+    kernel_mask = 0;
+    assert(syscall(SYS_rt_sigprocmask, 0, NULL, &kernel_mask, sizeof kernel_mask) == 0);
+    assert((kernel_mask & BN_SIGSYS_BIT) != 0);
+    unsigned long unrelated = 0;
+    assert(!rt_sigprocmask(SIG_UNBLOCK, &unrelated, NULL, sizeof unrelated));
+    kernel_mask = 0;
+    assert(syscall(SYS_rt_sigprocmask, 0, NULL, &kernel_mask, sizeof kernel_mask) == 0);
+    assert((kernel_mask & BN_SIGSYS_BIT) == 0);
+
+    // The internal glibc alias is routed through the same guard.
+    assert(!__libc_sigaction(SIGSYS, &guest, NULL));
+
+    // A delivery the runtime did not generate is chained to the guest action.
+    sigsys_guest_calls = 0;
+    sigsys_guest_code = 99;
+    raise(SIGSYS);
+    assert(sigsys_guest_calls == 1);
+    assert(sigsys_guest_code == SI_TKILL);
+
+    // A genuine seccomp delivery goes to the entry stub's handler.
+    siginfo_t seccomp;
+    memset(&seccomp, 0, sizeof seccomp);
+    seccomp.si_signo = SIGSYS;
+    seccomp.si_code = BN_SIGSYS_CODE_SECCOMP;
+    seccomp.si_errno = 0;
+    sigsys_upstream_calls = 0;
+    bn_sigsys_handler(SIGSYS, &seccomp, NULL);
+    assert(sigsys_upstream_calls == 1);
+    assert(sigsys_upstream_si.si_code == BN_SIGSYS_CODE_SECCOMP);
+
+    // A tagged notification belongs to a seccomp filter the guest installed.
+    sigsys_guest_calls = 0;
+    sigsys_guest_errno = -1;
+    seccomp.si_errno = 0x77;
+    bn_sigsys_handler(SIGSYS, &seccomp, NULL);
+    assert(sigsys_guest_calls == 1 && sigsys_guest_errno == 0x77);
+    assert(sigsys_upstream_calls == 1);
+
+    // An ignored signal stays ignored, but a kernel-generated one falls back
+    // to the default action the way the kernel forces it.
+    struct sigaction ignored;
+    memset(&ignored, 0, sizeof ignored);
+    ignored.sa_handler = SIG_IGN;
+    assert(!sigaction(SIGSYS, &ignored, NULL));
+    raise(SIGSYS);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (!pid) {
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof dfl);
+        dfl.sa_handler = SIG_DFL;
+        (void)sigaction(SIGSYS, &dfl, NULL);
+        raise(SIGSYS);
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS);
+
+    // signal() records and chains like sigaction() does.
+    sigsys_simple_calls = 0;
+    assert(signal(SIGSYS, sigsys_simple_handler) == SIG_IGN);
+    raise(SIGSYS);
+    assert(sigsys_simple_calls == 1);
+
+    // The documented escape hatch keeps the guard out of the process.
+    sigsys_disengage();
+    sigsys_install_stub();
+    assert(!setenv("BIONILUX_SIGSYS_GUARD", "0", 1));
+    assert(bn_sigsys_init() == 0);
+    assert(!bn_sigsys_on());
+    unsetenv("BIONILUX_SIGSYS_GUARD");
+
+    // Not taken over: forwarding must be unchanged, so the guest's block and
+    // disposition take effect for real.
+    sigsys_disengage();
+    assert(!sigprocmask(SIG_BLOCK, &set, NULL));
+    bn_test_blocked(SIGSYS, 1);
+    assert(!sigprocmask(SIG_UNBLOCK, &set, NULL));
+    assert(!sigaction(SIGSYS, &guest, NULL));
+    memset(&query, 0, sizeof query);
+    bn_test_sigaction(SIGSYS, NULL, &query);
+    assert(query.sa_sigaction == sigsys_guest_handler);
+    // Not armed, the kernel-ABI wrapper forwards unchanged as well.
+    unsigned long plain_mask = BN_SIGSYS_BIT;
+    unsigned long plain_kernel_mask = 0;
+    assert(!rt_sigprocmask(SIG_BLOCK, &plain_mask, NULL, sizeof plain_mask));
+    assert(syscall(SYS_rt_sigprocmask, 0, NULL, &plain_kernel_mask,
+                   sizeof plain_kernel_mask) == 0);
+    assert((plain_kernel_mask & BN_SIGSYS_BIT) != 0);
+    assert(!rt_sigprocmask(SIG_UNBLOCK, &plain_mask, NULL, sizeof plain_mask));
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    bn_test_sigaction(SIGSYS, &dfl, NULL);
+    puts("SIGSYS guard blocks masking, preserves dispositions and chains: OK");
+}
+
 int main(void) {
     check_tcp_deadline();
     check_path_overflow();
@@ -366,5 +670,6 @@ int main(void) {
     assert((char *)av[4] >= (char *)av && (char *)av[4] < (char *)av + 256);
     free(av); free(ev);
     puts("reroute owns resolved target: OK");
+    check_sigsys_guard();
     return 0;
 }
