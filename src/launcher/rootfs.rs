@@ -135,6 +135,30 @@ impl Rootfs {
         physical.to_string()
     }
 
+    /// Creates the ancestors of every passthrough inside the rootfs.
+    ///
+    /// A passthrough is reachable at its own host path and nothing above it: with
+    /// `--host-path /data/user/0/app/rt/node`, `/data`, `/data/user`, ... do not exist in the
+    /// guest. Code that walks a path one component at a time — `realpath()`, and through it
+    /// node's module resolution — therefore fails on the first missing ancestor and never reaches
+    /// the mount: `node` runs, while `npm` dies with `ENOENT ... lstat '/data'`. Empty
+    /// directories in the rootfs give that walk somewhere to go; the mount's own path stays a
+    /// passthrough, so the guest still reads the host content there.
+    ///
+    /// Failures are ignored on purpose: a rootfs that refuses the write costs the guest only the
+    /// component walk, and never the launch itself.
+    pub fn create_host_ancestors(&self) {
+        let Some(root) = &self.root else {
+            return;
+        };
+        for dir in &self.host_dirs {
+            let Some(parent) = dir.parent() else {
+                continue;
+            };
+            let _ = std::fs::create_dir_all(join_root(root, &parent.to_string_lossy()));
+        }
+    }
+
     /// `true` when `dir` is the guest root or a directory inside it.
     pub fn contains(&self, dir: &Path) -> bool {
         self.root.as_ref().is_some_and(|r| dir.starts_with(r))
@@ -263,6 +287,35 @@ mod tests {
 
     fn root(rf: &Rootfs) -> String {
         rf.root.as_ref().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn host_path_ancestors_are_created_so_a_component_walk_reaches_the_mount() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rootfs");
+        fs::create_dir_all(&root).unwrap();
+        let rf = Rootfs {
+            root: Some(root.clone()),
+            host_dirs: vec![PathBuf::from("/data/user/0/app/rt/node")],
+            lenient: false,
+        };
+        rf.create_host_ancestors();
+        for dir in [
+            "data",
+            "data/user",
+            "data/user/0",
+            "data/user/0/app",
+            "data/user/0/app/rt",
+        ] {
+            assert!(
+                root.join(dir).is_dir(),
+                "{dir} must exist as an empty directory in the rootfs"
+            );
+        }
+        // The mount point itself must still be the passthrough: creating it inside the rootfs
+        // would answer with an empty directory instead of the host content.
+        assert!(!root.join("data/user/0/app/rt/node").exists());
+        assert!(rf.passthrough("/data/user/0/app/rt/node"));
     }
 
     #[test]

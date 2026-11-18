@@ -234,6 +234,10 @@ fn main() {
         return;
     }
 
+    // Component walks (`realpath`, and node's module resolution through it) must be able to reach
+    // a passthrough from `/`; see `Rootfs::create_host_ancestors`.
+    rootfs.create_host_ancestors();
+
     let Some(binary) = cli.command.first().cloned() else {
         Cli::command().print_help().ok();
         println!();
