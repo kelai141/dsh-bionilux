@@ -1697,9 +1697,7 @@ export class LinuxRuntimeManager {
    *    traversable (rules out a plain mode defect);
    *  - whether the link target exists and is executable (rules out a dangling
    *    wrapper);
-   *  - running the same file through `sh` and, when that is the wrapper, the
-   *    linker line it contains (separates "the script cannot be launched" from
-   *    "the linker cannot map the ELF").
+   *  - launching the binary directly and through the Android system linker.
    *
    * Best effort only: this runs on an already-failing path and must never turn
    * one error into two.
@@ -1736,11 +1734,6 @@ export class LinuxRuntimeManager {
         record('dir:' + path.basename(directory), error.code ?? error.message)
       }
     }
-    try {
-      record('content', JSON.stringify(readFileSync(launcher, 'utf8').slice(0, 200)))
-    } catch (error) {
-      record('content', error.code ?? error.message)
-    }
     const attempt = async (label, file, args) => {
       try {
         const result = normaliseCommandResult(await this._runManaged({
@@ -1752,8 +1745,6 @@ export class LinuxRuntimeManager {
         record(label, 'throw:' + (error.code ?? error.message))
       }
     }
-    // Same file, same env, launched by the same interpreter the script uses.
-    await attempt('viaSh', HOST_SCRIPT_INTERPRETER, [launcher, '--version'])
     await attempt('direct', launcher, ['--version'])
     const linker = ['/system/bin/linker64', '/system/bin/linker'].find(fileExists)
     if (linker !== undefined) {
