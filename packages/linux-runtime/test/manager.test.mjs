@@ -1064,6 +1064,27 @@ test('the native library directory reaches the launcher environment', () => {
   });
 });
 
+test('only arm64 activations use Box64 bundled with the selected backend', async () => {
+  const backend = path.join(tempDir(), 'backend');
+  const bin = path.join(backend, 'bin');
+  const box64 = path.join(bin, 'box64-glibc');
+  const paths = { backend, rootfs: '/guest-root', node: '/shared-node' };
+  const cwd = { guestCwd: '/', hostPaths: [] };
+  const arm64 = createManager({ dataDir: tempDir(), arch: 'arm64' });
+  const x64 = createManager({ dataDir: tempDir(), arch: 'x64' });
+  try {
+    assert.equal(arm64._executionEnvironment(paths, cwd).BIONILUX_BOX64, undefined);
+    await mkdir(bin, { recursive: true });
+    await writeFile(box64, makeElf('arm64'), { mode: 0o755 });
+    const environment = arm64._executionEnvironment(paths, cwd);
+    assert.equal(environment.BIONILUX_BOX64, box64);
+    assert.ok(environment.BIONILUX_HOST_PATHS.includes(path.join(backend, 'lib', 'box64-x86_64')));
+    assert.equal(x64._executionEnvironment(paths, cwd).BIONILUX_BOX64, undefined);
+  } finally {
+    await Promise.all([arm64.dispose(), x64.dispose()]);
+  }
+});
+
 test('spawnCommand escalates a guest session that ignores SIGTERM', { skip: process.platform === 'win32' }, async () => {
   const handle = spawnCommand({
     file: process.execPath,

@@ -18,6 +18,7 @@ import sys
 import tarfile
 
 MACHINES = {"aarch64": 183, "x86_64": 62}
+BOX64_GUEST_LIBGCC = PurePosixPath("lib/box64-x86_64/libgcc_s.so.1")
 
 
 def inspect_elf(stream, size, name, policy="android", page_size=16384, machine=None):
@@ -83,9 +84,10 @@ def inspect_elf(stream, size, name, policy="android", page_size=16384, machine=N
     return record
 
 
-def scan_path(path, policy, page_size, machine):
+def scan_path(path, policy, page_size, machine, *, box64_backend=False):
     """Scan regular files by magic, including extensionless binaries and .node."""
     records = []
+    box64_libgcc_seen = False
 
     def inspect(stream, size, name):
         record = inspect_elf(stream, size, name, policy, page_size, machine)
@@ -112,6 +114,18 @@ def scan_path(path, policy, page_size, machine):
                 pure = PurePosixPath(member.name)
                 if pure.is_absolute() or ".." in pure.parts:
                     raise ValueError(f"unsafe archive member: {member.name}")
+                if box64_backend and pure == BOX64_GUEST_LIBGCC:
+                    if box64_libgcc_seen or not member.isfile():
+                        raise ValueError(f"invalid or duplicate Box64 library in {path}: {member.name}")
+                    with archive.extractfile(member) as stream:
+                        record = inspect_elf(stream, member.size, f"{path}!{member.name}",
+                                             "guest", 4096, MACHINES["x86_64"])
+                    if record is None:
+                        raise ValueError(f"Box64 library is not a runtime ELF: {path}!{member.name}")
+                    record["box64_emulated_page_size"] = 4096
+                    records.append(record)
+                    box64_libgcc_seen = True
+                    continue
                 if member.isfile():
                     with archive.extractfile(member) as stream:
                         inspect(stream, member.size, f"{path}!{member.name}")
@@ -120,6 +134,8 @@ def scan_path(path, policy, page_size, machine):
             inspect(stream, path.stat().st_size, str(path))
     if not records:
         raise ValueError(f"no runtime ELF objects found in {path}")
+    if box64_backend and not box64_libgcc_seen:
+        raise ValueError(f"missing Box64 library in {path}: {BOX64_GUEST_LIBGCC}")
     return records
 
 
@@ -130,13 +146,19 @@ def main(argv=None):
     parser.add_argument("--page-size", type=int, default=16384)
     parser.add_argument("--machine", choices=tuple(MACHINES))
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--box64-backend", type=Path,
+                        help="validate the ARM64 archive's single emulated x86-64 libgcc separately")
     args = parser.parse_args(argv)
     if args.page_size < 4096 or args.page_size & (args.page_size - 1):
         parser.error("--page-size must be a power of two >= 4096")
+    if args.box64_backend is not None and (args.box64_backend not in args.paths or
+                                         args.policy != "guest" or args.machine != "aarch64"):
+        parser.error("--box64-backend must name an input to the ARM64 guest scan")
     records, errors = [], []
     for path in args.paths:
         try:
-            records.extend(scan_path(path, args.policy, args.page_size, MACHINES.get(args.machine)))
+            records.extend(scan_path(path, args.policy, args.page_size, MACHINES.get(args.machine),
+                                     box64_backend=path == args.box64_backend))
         except (OSError, ValueError, tarfile.TarError) as error:
             errors.append(str(error))
     failed = sum(bool(record["errors"]) for record in records)

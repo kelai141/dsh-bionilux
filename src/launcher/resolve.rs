@@ -354,22 +354,8 @@ fn find_loader_with(cfg: &Config, rootfs: &Rootfs, interp: &str, arch: Arch) -> 
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| arch.loader_name().to_string());
 
-    // An app process on targetSdk >= 29 may not execve anything it owns:
-    // SELinux grants execute_no_trans on apk_data_file but not on
-    // app_data_file or appdomain_tmpfs. When the host app ships the loader in
-    // its native library directory, that copy has to win over the rootfs one,
-    // which can only be mapped, never executed.
-    if let Some(dir) = &cfg.native_lib_dir {
-        for candidate in [
-            dir.join("libbionilux-loader.so"),
-            dir.join(format!("lib{name}.so")),
-            dir.join(name.as_str()),
-        ] {
-            if candidate.exists() {
-                debug!("loader from native library dir: {}", candidate.display());
-                return Some(candidate);
-            }
-        }
+    if let Some(candidate) = find_apk_loader(cfg, &name) {
+        return Some(candidate);
     }
     if rootfs.enabled() {
         let mut candidates = vec![interp.to_string()];
@@ -391,19 +377,43 @@ fn find_loader_with(cfg: &Config, rootfs: &Rootfs, interp: &str, arch: Arch) -> 
     alt.exists().then_some(alt)
 }
 
+fn find_apk_loader(cfg: &Config, name: &str) -> Option<PathBuf> {
+    // An app process on targetSdk >= 29 may not execve anything it owns:
+    // SELinux grants execute_no_trans on apk_data_file but not on
+    // app_data_file or appdomain_tmpfs. When the host app ships the loader in
+    // its native library directory, that copy has to win over the rootfs one,
+    // which can only be mapped, never executed.
+    if let Some(dir) = &cfg.native_lib_dir {
+        for candidate in [
+            dir.join("libbionilux-loader.so"),
+            dir.join(format!("lib{name}.so")),
+            dir.join(name),
+        ] {
+            if candidate.exists() {
+                debug!("loader from native library dir: {}", candidate.display());
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 fn find_host_loader(cfg: &Config, interp: &str, arch: Arch) -> Option<PathBuf> {
     if let Some(path) = &cfg.loader
         && path.exists()
     {
         return Some(path.clone());
     }
-    if Path::new(interp).exists() {
-        return Some(PathBuf::from(interp));
-    }
     let name = Path::new(interp)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| arch.loader_name().to_string());
+    if let Some(candidate) = find_apk_loader(cfg, &name) {
+        return Some(candidate);
+    }
+    if Path::new(interp).exists() {
+        return Some(PathBuf::from(interp));
+    }
     if let Some(runtime) = &cfg.runtime_dir {
         let candidate = runtime.join("lib").join(&name);
         if candidate.exists() {
@@ -1263,6 +1273,7 @@ mod tests {
         }
         let loader = runtime.join("lib/ld-linux-aarch64.so.1");
         std::fs::write(&loader, b"host-loader-fixture").unwrap();
+        cfg.native_lib_dir = None;
         assert_eq!(
             find_host_loader(
                 &cfg,
@@ -1270,6 +1281,15 @@ mod tests {
                 Arch::Aarch64
             ),
             Some(loader)
+        );
+        let native = tmp.path().join("apk-native");
+        std::fs::create_dir(&native).unwrap();
+        let apk_loader = native.join("libbionilux-loader.so");
+        std::fs::write(&apk_loader, b"apk-loader-fixture").unwrap();
+        cfg.native_lib_dir = Some(native);
+        assert_eq!(
+            find_host_loader(&cfg, "/lib/ld-linux-aarch64.so.1", Arch::Aarch64),
+            Some(apk_loader)
         );
         let paths = execution_library_path(&cfg, Arch::X86_64, Arch::Aarch64);
         assert!(paths.contains(&runtime.join("lib").display().to_string()));

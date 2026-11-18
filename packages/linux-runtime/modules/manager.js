@@ -2128,6 +2128,13 @@ export class LinuxRuntimeManager {
     const environment = cleanHostEnvironment();
     const nodeBin = path.join(paths.node, 'bin');
     const hostPaths = [paths.node, ...cwdInfo.hostPaths];
+    if (this.arch === 'arm64' && paths.backend) {
+      const bundledBox64 = path.join(paths.backend, 'bin', 'box64-glibc');
+      if (fileExists(bundledBox64)) {
+        environment.BIONILUX_BOX64 = bundledBox64;
+        hostPaths.push(bundledBox64, path.join(paths.backend, 'lib', 'box64-x86_64'));
+      }
+    }
     for (const directory of [...hostPaths]) {
       try { hostPaths.push(realpathSync(directory)); } catch { /* Missing paths fail when executed. */ }
     }

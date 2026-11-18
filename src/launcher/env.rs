@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::path::Path;
 
 use crate::launcher::config::{self, Arch, Config, env_keys};
 use crate::launcher::rootfs::Rootfs;
@@ -245,7 +246,22 @@ pub fn effective_value(overrides: &[(String, String)], key: &str) -> Option<Stri
 fn configure_box64(vars: &mut HashMap<String, String>, cfg: &Config, target: Arch, host: Arch) {
     if target == Arch::X86_64 && host == Arch::Aarch64 {
         vars.insert("BOX64_UNAME".into(), "x86_64".into());
-        let guest_libraries = crate::launcher::resolve::library_path(cfg, target);
+        // Keep emulator diagnostics out of daemon stdout protocols such as aapt2.
+        vars.entry("BOX64_LOG".into()).or_insert_with(|| "0".into());
+        vars.entry("BOX64_NOBANNER".into())
+            .or_insert_with(|| "1".into());
+        let mut guest_libraries = crate::launcher::resolve::library_path(cfg, target);
+        if let Some(backend) = cfg
+            .box64
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+        {
+            let bundled = backend.join("lib/box64-x86_64");
+            if bundled.is_dir() {
+                guest_libraries.push(bundled.to_string_lossy().into_owned());
+            }
+        }
         if !guest_libraries.is_empty() {
             vars.entry("BOX64_LD_LIBRARY_PATH".into())
                 .or_insert_with(|| guest_libraries.join(":"));
@@ -538,18 +554,29 @@ mod tests {
         let mut cfg = Config::from_env().unwrap();
         cfg.rootfs = Some(tmp.path().to_path_buf());
         std::fs::create_dir_all(tmp.path().join("lib/x86_64-linux-gnu")).unwrap();
+        cfg.box64 = Some(tmp.path().join("backend/bin/box64-glibc"));
+        let bundled = tmp.path().join("backend/lib/box64-x86_64");
+        std::fs::create_dir_all(&bundled).unwrap();
         let mut vars = HashMap::new();
         configure_box64(&mut vars, &cfg, Arch::X86_64, Arch::Aarch64);
         assert_eq!(vars["BOX64_UNAME"], "x86_64");
+        assert_eq!(vars["BOX64_LOG"], "0");
+        assert_eq!(vars["BOX64_NOBANNER"], "1");
         assert_eq!(
             vars["BOX64_LD_LIBRARY_PATH"],
-            crate::launcher::resolve::library_path(&cfg, Arch::X86_64).join(":")
+            format!(
+                "{}:{}",
+                crate::launcher::resolve::library_path(&cfg, Arch::X86_64).join(":"),
+                bundled.display()
+            )
         );
         vars.insert("BOX64_LD_LIBRARY_PATH".into(), "/custom/x86/libs".into());
         vars.insert("BOX64_LD_PRELOAD".into(), "custom-x86-preload.so".into());
+        vars.insert("BOX64_LOG".into(), "2".into());
         configure_box64(&mut vars, &cfg, Arch::X86_64, Arch::Aarch64);
         assert_eq!(vars["BOX64_LD_LIBRARY_PATH"], "/custom/x86/libs");
         assert_eq!(vars["BOX64_LD_PRELOAD"], "custom-x86-preload.so");
+        assert_eq!(vars["BOX64_LOG"], "2");
     }
 
     #[test]
