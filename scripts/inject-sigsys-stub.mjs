@@ -11,17 +11,18 @@
 // the build rewrites those two instruction sites to -ENOSYS
 // (scripts/patch-android-glibc.mjs). Everything else the filter denies
 // (unshare, mount, keyctl, io_uring_setup, bpf, SysV IPC, ...) would still kill
-// the process on the spot. The stub installed here runs before the first rtld
-// instruction: it unblocks SIGSYS, installs a handler that answers a trapped
-// call with -ENOSYS, restores the entry registers and branches back to the
-// loader's real entry point. See scripts/stub/sigsys_stub_aarch64.S.
+// the process on the spot. Before rtld initialization, the stub installs a
+// handler and unblocks SIGSYS. The handler answers a trapped
+// call with -ENOSYS, restores the entry registers and resumes the loader's
+// startup. See scripts/stub/sigsys_stub_aarch64.S.
 //
 // What is rewritten: exactly three fields plus the zero padding the stub is
 // copied into.
-//   e_entry              -> the cave address (the stub's first byte)
+//   _start + 4           -> direct branch to the cave (BTI stays in place)
 //   PT_LOAD[0].p_filesz  -> cave + stub length
 //   PT_LOAD[0].p_memsz   -> cave + stub length
-// Nothing is moved and no size is added: the cave is zero padding already
+// e_entry stays unchanged: glibc compares AT_ENTRY with _start to detect
+// direct invocation. Nothing is moved or resized: the cave is zero padding
 // present in the file between the read-only segment and the next segment, so
 // the segment is only extended to cover it.
 //
@@ -34,7 +35,7 @@
 // --json prints one line:
 //   {status, file, entry, cave, originalEntry, stubBytes, loaderSha256}
 // status: injected | already | skipped | unsupported
-//   entry          e_entry after the step (the cave address when injected)
+//   entry          e_entry after the step (the original loader entry)
 //   cave           file offset and address the stub lives at
 //   originalEntry  e_entry before the step, i.e. the known loader entry
 //                  (null when it could not be determined)
@@ -64,7 +65,7 @@ const E_PHNUM = 0x38;
 const P_FILESZ = 32;
 const P_MEMSZ = 40;
 
-/* Loaders this tool knows how to repoint. The entry address identifies the
+/* Loaders this tool knows how to patch. The entry address identifies the
  * glibc build, and every structural assumption below was measured on that
  * exact file, so an entry that is not listed is a hard failure rather than a
  * silent skip. Add a row only together with its source. */
@@ -90,7 +91,7 @@ const KNOWN_ENTRIES = [
  * scripts/inject-sigsys-stub.test.mjs rebuilds the source when a cross
  * assembler is installed and fails if the bytes here differ. */
 const STUB_HEX = `
-  5f2403d51f2003d5ffc301d1e00700a9e20f01a9e41702a9e61f03a9e82704a9e4020010850080d2e41705a9ff7f06a9
+  5f2403d51d0080d2ffc301d1e00700a9e20f01a9e41702a9e61f03a9e82704a9e4020010850080d2e41705a9ff7f06a9
   e1430191e00380d2020080d2030180d2c81080d2010000d4810b0010200080d2020080d2030180d2e81080d2010000d4
   e00740a9e20f41a9e41742a9e61f43a9e82744a9ffc30191000000145f2403d5410400b4220400b4230840b97f040071
   e1030054230440b9a3030035437c40f944060010450180d2868440f8df0003eba0000054a50400f181ffff54a3048092
@@ -103,12 +104,17 @@ const STUB_HEX = `
 `;
 const STUB = Buffer.from(STUB_HEX.replace(/\s+/g, ''), 'hex');
 /* "b ." at the end of the entry path: the injector rewrites this word with the
- * branch back to the original e_entry. If the source drifts, the assertion on
- * this word fails instead of shipping a stub that loops forever. */
+ * branch back to the first undisplaced startup instruction. Checking this
+ * word prevents a source change from turning the branch into a loop. */
 const STUB_BRANCH_OFFSET = 0x78;
 const STUB_BRANCH_PLACEHOLDER = 0x14000000;
 const STUB_BRANCH_OPCODE = 0x14000000;
-/* The first two instructions (bti c; nop) double as the injected marker. */
+const BTI_C = 0xd503245f;
+const CLEAR_FRAME_POINTER = 0xd280001d;
+const CLEAR_LINK_REGISTER = 0xd280001e;
+const ENTRY_HOOK_OFFSET = 4;
+const ENTRY_RESUME_OFFSET = 8;
+/* The BTI and replayed frame-pointer reset double as the injected marker. */
 const STUB_MAGIC = STUB.subarray(0, 8);
 /* Handler entry inside the blob; the unit test calls it as a plain function. */
 const STUB_HANDLER_OFFSET = 0x7c;
@@ -171,8 +177,16 @@ const runtimeAddress = (primary, fileOffset) => primary.vaddr + fileOffset - pri
 
 const isZeroRegion = (buffer, start, end) => buffer.subarray(start, end).every((byte) => byte === 0);
 
-/* The blob as written for a given cave address: the assembled stub with its
- * trailing placeholder branch rewritten into "b <original entry>". */
+function branchInstruction(primary, at, target) {
+  const displacement = target - runtimeAddress(primary, at);
+  if (displacement % 4 !== 0 || displacement < -0x8000000 || displacement >= 0x8000000) {
+    throw new Refusal('stub branch displacement is out of range (' + displacement + ')');
+  }
+  return (STUB_BRANCH_OPCODE | ((displacement >> 2) & 0x03ffffff)) >>> 0;
+}
+
+/* The blob as written for a given cave address, with a branch that resumes
+ * after the already-executed BTI and frame-pointer reset. */
 function stubFor(primary, cave, originalEntry) {
   if (STUB.readUInt32LE(STUB_BRANCH_OFFSET) !== STUB_BRANCH_PLACEHOLDER) {
     throw new Refusal(
@@ -182,12 +196,8 @@ function stubFor(primary, cave, originalEntry) {
   }
   const blob = Buffer.from(STUB);
   const branchAt = cave + STUB_BRANCH_OFFSET;
-  const displacement = originalEntry - runtimeAddress(primary, branchAt);
-  if (displacement % 4 !== 0 || displacement < -0x8000000 || displacement >= 0x8000000) {
-    throw new Refusal('branch from the cave back to e_entry is out of range (' + displacement + ')');
-  }
   blob.writeUInt32LE(
-    (STUB_BRANCH_OPCODE | ((displacement >> 2) & 0x03ffffff)) >>> 0,
+    branchInstruction(primary, branchAt, originalEntry + ENTRY_RESUME_OFFSET),
     STUB_BRANCH_OFFSET,
   );
   return blob;
@@ -233,22 +243,34 @@ function plan(buffer) {
   /* "the first following PT_LOAD start": the closest segment start after the
    * read-only one, which bounds the zero padding the stub is copied into. */
   const nextStart = loads.slice(1).reduce((lowest, load) => Math.min(lowest, load.offset), Infinity);
+  if (nextStart > buffer.length || primary.filesz > nextStart) {
+    throw new Refusal('PT_LOAD[0] or the gap before the next segment is outside the file or overlaps');
+  }
   const known = KNOWN_ENTRIES.find((candidate) => candidate.entry === header.entry);
-  if (known === undefined) return alreadyInjected(buffer, header, primary, nextStart);
+  if (known === undefined) {
+    throw new Refusal('e_entry 0x' + header.entry.toString(16) +
+      ' is not a known loader entry; supply the original loader if it was previously repointed');
+  }
+  if (header.entry + ENTRY_RESUME_OFFSET + 4 > primary.filesz ||
+      buffer.readUInt32LE(header.entry) !== BTI_C ||
+      buffer.readUInt32LE(header.entry + ENTRY_RESUME_OFFSET) !== CLEAR_LINK_REGISTER) {
+    throw new Refusal('loader has an unexpected entry prologue');
+  }
+  const hook = header.entry + ENTRY_HOOK_OFFSET;
+  const word = buffer.readUInt32LE(hook);
+  if ((word & 0xfc000000) === STUB_BRANCH_OPCODE) {
+    return alreadyInjected(buffer, header, primary, nextStart, branchTarget(primary, buffer, hook));
+  }
+  if (word !== CLEAR_FRAME_POINTER) throw new Refusal('loader has an unexpected frame-pointer reset');
   return { kind: 'inject', header, primary, nextStart, known };
 }
 
-function alreadyInjected(buffer, header, primary, nextStart) {
-  const cave = header.entry;
-  const unknown = new Refusal(
-    'e_entry 0x' + cave.toString(16) + ' is not a known loader entry and does not start the stub; ' +
-      'known entries: ' + KNOWN_ENTRIES.map((candidate) => '0x' + candidate.entry.toString(16)).join(', '),
-  );
-  if (cave % 8 !== 0 || cave < 8 || cave + STUB.length > buffer.length) throw unknown;
-  if (buffer.compare(STUB_MAGIC, 0, STUB_MAGIC.length, cave, cave + STUB_MAGIC.length) !== 0) {
-    throw unknown;
-  }
+function alreadyInjected(buffer, header, primary, nextStart, cave) {
   const end = cave + STUB.length;
+  if (cave % 8 !== 0 || cave < header.entry + ENTRY_RESUME_OFFSET + 4 || end > buffer.length ||
+      buffer.compare(STUB_MAGIC, 0, STUB_MAGIC.length, cave, cave + STUB_MAGIC.length) !== 0) {
+    throw new Refusal('loader entry branch does not point to a valid entry stub');
+  }
   if (primary.filesz !== end || primary.memsz !== end) {
     throw new Refusal(
       'entry stub is present at 0x' + cave.toString(16) + ' but PT_LOAD[0] covers 0x' +
@@ -261,21 +283,21 @@ function alreadyInjected(buffer, header, primary, nextStart) {
       'entry stub at 0x' + cave.toString(16) + ' overlaps the next PT_LOAD at 0x' + nextStart.toString(16),
     );
   }
-  const originalEntry = branchTarget(primary, buffer, cave + STUB_BRANCH_OFFSET);
-  if (!KNOWN_ENTRIES.some((candidate) => candidate.entry === originalEntry)) {
+  const resume = branchTarget(primary, buffer, cave + STUB_BRANCH_OFFSET);
+  if (resume !== header.entry + ENTRY_RESUME_OFFSET) {
     throw new Refusal(
-      'entry stub at 0x' + cave.toString(16) + ' branches to 0x' + originalEntry.toString(16) +
-        ', which is not a known loader entry',
+      'entry stub at 0x' + cave.toString(16) + ' branches to an unexpected resume address 0x' +
+        resume.toString(16),
     );
   }
-  const expected = stubFor(primary, cave, originalEntry);
+  const expected = stubFor(primary, cave, header.entry);
   if (buffer.compare(expected, 0, expected.length, cave, end) !== 0) {
     throw new Refusal('entry stub at 0x' + cave.toString(16) + ' does not match this tool\'s blob');
   }
   if (!isZeroRegion(buffer, end, nextStart)) {
     throw new Refusal('padding after the entry stub at 0x' + end.toString(16) + ' is not zero');
   }
-  return { kind: 'already', header, primary, cave, originalEntry };
+  return { kind: 'already', header, primary, cave, originalEntry: header.entry };
 }
 
 function inject(buffer, decision) {
@@ -304,7 +326,8 @@ function inject(buffer, decision) {
   const blob = stubFor(primary, cave, originalEntry);
   const out = Buffer.from(buffer);
   blob.copy(out, cave);
-  out.writeBigUInt64LE(BigInt(runtimeAddress(primary, cave)), E_ENTRY);
+  const hook = originalEntry + ENTRY_HOOK_OFFSET;
+  out.writeUInt32LE(branchInstruction(primary, hook, runtimeAddress(primary, cave)), hook);
   const end = BigInt(cave + STUB.length);
   out.writeBigUInt64LE(end, primary.headerOffset + P_FILESZ);
   out.writeBigUInt64LE(end, primary.headerOffset + P_MEMSZ);
@@ -362,7 +385,7 @@ async function main(argv) {
       return report(
         'already',
         {
-          entry: decision.cave,
+          entry: decision.originalEntry,
           cave: decision.cave,
           originalEntry: decision.originalEntry,
           stubBytes: STUB.length,
@@ -384,7 +407,7 @@ async function main(argv) {
     return report(
       'injected',
       {
-        entry: result.cave,
+        entry: result.originalEntry,
         cave: result.cave,
         originalEntry: result.originalEntry,
         stubBytes: STUB.length,
@@ -392,8 +415,7 @@ async function main(argv) {
       },
       0,
       'injected SIGSYS entry stub at 0x' + result.cave.toString(16) + ' (' + STUB.length +
-        ' bytes), e_entry 0x' + result.originalEntry.toString(16) + ' -> 0x' +
-        result.cave.toString(16) + ', PT_LOAD[0] filesz/memsz 0x' +
+        ' bytes), kept e_entry 0x' + result.originalEntry.toString(16) + ', PT_LOAD[0] filesz/memsz 0x' +
         (result.cave + STUB.length).toString(16),
     );
   } catch (error) {

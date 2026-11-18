@@ -369,16 +369,20 @@ jobs:
           # signals are still blocked. Everything else the app seccomp filter
           # traps (unshare, mount, keyctl, io_uring_setup, bpf, SysV IPC, ...)
           # would still kill the guest on the spot, with no chance to degrade.
-          # The entry stub runs before the first rtld instruction and answers a
+          # The entry stub runs before rtld initialization and answers a
           # trapped call with -ENOSYS from there on. x86_64 loaders are skipped
           # here by design: the emulator images answer those calls themselves
           # and the stub encoding is AArch64 only.
           sudo env "PATH=$PATH" node scripts/inject-sigsys-stub.mjs \
             "$stage/bionilux-loader-$ARCH.so"
-          # Structural gate: e_entry, PT_LOAD[0] and the stub's own magic must
-          # still match, so a loader without the stub cannot reach a release.
+          # Validate the original entry address, both branches and the code cave.
           sudo env "PATH=$PATH" node scripts/inject-sigsys-stub.mjs \
             "$stage/bionilux-loader-$ARCH.so" --check
+          if [ "$ARCH" = aarch64 ]; then
+            # Direct invocation must recognize the loader as the program.
+            # An e_entry rewrite passed structural checks but crashed here.
+            qemu-aarch64-static "$stage/bionilux-loader-$ARCH.so" --version
+          fi
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links
           sudo sh scripts/prepare-rootfs.sh --rootfs "$rootfs" --relative-links --verify
           sudo tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \

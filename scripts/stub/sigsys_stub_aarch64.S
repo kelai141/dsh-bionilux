@@ -14,21 +14,22 @@
  * keyctl, io_uring_setup, bpf, SysV IPC - would still kill the process on the
  * spot, with no chance to degrade.
  *
- * This stub is injected at e_entry of the loader (the first instruction the
- * kernel runs in the new process, before any rtld code) by
- * scripts/inject-sigsys-stub.mjs. It installs a SIGSYS handler, then unblocks
- * SIGSYS, then branches to the real entry point. From that point on any TRAPped
+ * The loader's original e_entry is retained because glibc compares AT_ENTRY
+ * with _start to recognize direct invocation. The injector keeps the BTI pad
+ * at _start and replaces the following frame-pointer reset with a branch to
+ * this stub. The stub replays the reset, installs a SIGSYS handler, then unblocks
+ * SIGSYS and branches to the rest of the loader's entry path. Any trapped
  * call returns an error the guest can handle instead of killing the thread.
  *
  * Blob layout (one contiguous .text blob; the injector copies it into the
- * loader's code cave and repoints e_entry):
+ * loader's executable code cave and branches to it from _start + 4):
  *
- *   0x000  entry        bti c + nop                       <- 8-byte magic
+ *   0x000  entry        bti c + mov x29, #0               <- 8-byte magic
  *   0x008  save x0..x9 on the stack
  *   0x020  rt_sigaction(SIGSYS, {handler, SA_SIGINFO, 0, 0})
  *   0x048  rt_sigprocmask(SIG_UNBLOCK, {SIGSYS})     <- handler already in place
  *   0x060  restore x0..x9, drop the frame
- *   0x078  b <original e_entry>                           <- injector rewrites
+ *   0x078  b <original e_entry + 8>                       <- injector rewrites
  *   0x07c  handler                                        <- STUB_HANDLER_OFFSET
  *   0x168  ten synthetic-success syscall numbers (80 bytes)
  *   0x1b8  the SIGSYS sigset handed to rt_sigprocmask
@@ -39,8 +40,8 @@
  * at 0x000, 0x078 and 0x07c, so a source edit that moves them fails the build
  * instead of producing a stub with a stale entry point.
  *
- * The 8-byte magic is the first two instructions: bti c (0xd503245f) then nop
- * (0xd503201f), so the little-endian bytes are 5f 24 03 d5 1f 20 03 d5. The
+ * The 8-byte magic is bti c (0xd503245f) then mov x29, #0 (0xd280001d),
+ * so the little-endian bytes are 5f 24 03 d5 1d 00 80 d2. The
  * injector uses it to recognise an already-injected loader, and it is real code
  * on a BTI-aware kernel (a HINT NOP everywhere else). The loader this targets
  * carries GNU_PROPERTY AArch64 feature: BTI, PAC, so the stub starts with
@@ -49,7 +50,7 @@
  * The one instruction the injector rewrites is the placeholder "b ." at
  * STUB_BRANCH_OFFSET (0x78). It must stay "b ." (0x14000000) in this source;
  * the injector asserts that word and replaces it with the PC-relative branch to
- * the original e_entry, computed for the address the stub is injected at.
+ * the first undisplaced instruction of the original entry path.
  *
  * Registers, stack and signal frame contracts (measured on aarch64 glibc 2.41
  * and the trixie loader; the kernel's rt_sigframe and glibc ucontext_t share a
@@ -100,11 +101,11 @@
     .text
 
 /* ------------------------------------------------------------------------ */
-/* Entry path. e_entry of the injected loader points here.                   */
+/* Entry path. The branch after the loader's BTI pad points here.            */
 /* ------------------------------------------------------------------------ */
 bionilux_sigsys_stub:
     bti     c                       /* 0xd503245f: BTI landing pad; NOP pre-8.5  */
-    nop                             /* 0xd503201f: completes the 8-byte magic    */
+    mov     x29, #0                 /* Replay the displaced loader instruction. */
     sub     sp, sp, #112            /* 80 bytes of registers + 32 for ksa */
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
@@ -144,9 +145,8 @@ bionilux_sigsys_stub:
     mov     x8, #135                /* rt_sigprocmask */
     svc     #0
 
-    /* (3) Put the entry registers back and hand over to the real entry point
-     * with a direct branch: BTI does not gate direct branches, and rtld's first
-     * instruction stays exactly where the linker put it. */
+    /* (3) Restore the entry registers and resume at _start + 8. The landing
+     * pad and frame-pointer reset have already run. */
     ldp     x0, x1, [sp, #0]
     ldp     x2, x3, [sp, #16]
     ldp     x4, x5, [sp, #32]

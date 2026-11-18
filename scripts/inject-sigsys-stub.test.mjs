@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -76,8 +76,10 @@ function buildLoader(options = {}) {
   };
   writeLoad(0, load0);
   writeLoad(1, next);
-  if (load0.filesz > entry && entry + 4 <= buffer.length) {
+  if (entry + 12 <= load0.filesz && entry + 12 <= buffer.length) {
     buffer.writeUInt32LE(0xd503245f, entry); // bti c, like rtld's first instruction
+    buffer.writeUInt32LE(0xd280001d, entry + 4); // mov x29, #0
+    buffer.writeUInt32LE(0xd280001e, entry + 8); // mov x30, #0
   }
   if (options.dirtyGapAt !== undefined) buffer[options.dirtyGapAt] = 0x7f;
   return buffer;
@@ -132,7 +134,7 @@ function decodeAdr(word, address) {
 
 test('the entry path installs the handler and only then unblocks SIGSYS', () => {
   assert.equal(STUB.readUInt32LE(0), 0xd503245f, 'blob must start with bti c (magic word 0)');
-  assert.equal(STUB.readUInt32LE(4), 0xd503201f, 'blob must start with bti c + nop (magic word 1)');
+  assert.equal(STUB.readUInt32LE(4), 0xd280001d, 'replay the displaced frame-pointer reset');
   assert.equal(STUB.readUInt32LE(2 * 4), 0xd101c3ff, 'entry path reserves 112 bytes (sub sp, sp, #112)');
   assert.equal(STUB.readUInt32LE(STUB_BRANCH_OFFSET), 0x14000000, 'branch placeholder "b ." moved');
   assert.equal(STUB.readUInt32LE(STUB_HANDLER_OFFSET), 0xd503245f, 'handler must start with bti c');
@@ -218,7 +220,7 @@ test('re-assembling the stub source reproduces the embedded bytes', {
   assert.ok(assembled.equals(STUB), 'assembled stub differs from STUB_HEX; regenerate it');
 });
 
-test('injects at the cave, repoints e_entry and extends PT_LOAD[0]', async (t) => {
+test('injects at the cave without changing the loader entry address', async (t) => {
   const { file } = await withTempFile(t, buildLoader());
   const before = await readFile(file);
   const result = cli(file, '--json');
@@ -226,24 +228,28 @@ test('injects at the cave, repoints e_entry and extends PT_LOAD[0]', async (t) =
   const report = json(result);
   assert.equal(report.status, 'injected');
   assert.equal(report.cave, LOAD0_END, 'cave is the first byte after PT_LOAD[0]');
-  assert.equal(report.entry, LOAD0_END, 'e_entry now points at the cave');
+  assert.equal(report.entry, KNOWN_ENTRY, 'glibc requires AT_ENTRY to retain _start');
   assert.equal(report.originalEntry, KNOWN_ENTRY);
   assert.equal(report.stubBytes, STUB.length);
   const after = await readFile(file);
-  assert.equal(after.readBigUInt64LE(0x18), BigInt(LOAD0_END), 'e_entry field');
+  assert.equal(after.readBigUInt64LE(0x18), BigInt(KNOWN_ENTRY), 'e_entry field');
   const phdr0 = 64;
   assert.equal(after.readBigUInt64LE(phdr0 + 32), BigInt(LOAD0_END + STUB.length), 'p_filesz');
   assert.equal(after.readBigUInt64LE(phdr0 + 40), BigInt(LOAD0_END + STUB.length), 'p_memsz');
   // The cave holds the magic plus the stub with its branch patched back.
-  assert.equal(after.subarray(LOAD0_END, LOAD0_END + 8).toString('hex'), '5f2403d51f2003d5');
+  assert.equal(after.subarray(LOAD0_END, LOAD0_END + 8).toString('hex'), '5f2403d51d0080d2');
+  const hook = KNOWN_ENTRY + 4;
+  const entryBranch = after.readUInt32LE(hook);
+  assert.equal(entryBranch & 0xfc000000, 0x14000000);
+  assert.equal(hook + (((entryBranch & 0x03ffffff) << 6) >> 6) * 4, LOAD0_END);
   const branch = after.readUInt32LE(LOAD0_END + STUB_BRANCH_OFFSET);
   assert.equal(branch & 0xfc000000, 0x14000000);
   const displacement = ((branch & 0x03ffffff) << 6) >> 6;
-  assert.equal(LOAD0_END + STUB_BRANCH_OFFSET + displacement * 4, KNOWN_ENTRY, 'branch target');
-  // Only the header, PT_LOAD[0] and the cave change; nothing else moves.
+  assert.equal(LOAD0_END + STUB_BRANCH_OFFSET + displacement * 4, KNOWN_ENTRY + 8, 'branch target');
+  // Only the entry instruction, PT_LOAD[0] and the cave change.
   const expected = Buffer.from(before);
   after.copy(expected, LOAD0_END, LOAD0_END, LOAD0_END + STUB.length);
-  expected.writeBigUInt64LE(BigInt(LOAD0_END), 0x18);
+  expected.writeUInt32LE(entryBranch, hook);
   expected.writeBigUInt64LE(BigInt(LOAD0_END + STUB.length), phdr0 + 32);
   expected.writeBigUInt64LE(BigInt(LOAD0_END + STUB.length), phdr0 + 40);
   assert.ok(after.equals(expected), 'injection touched bytes outside the documented fields');
@@ -298,6 +304,16 @@ test('refuses an unknown e_entry instead of skipping it', async (t) => {
   assert.equal(report.status, 'unsupported');
   assert.match(report.reason, /not a known loader entry/);
   assert.ok((await readFile(file)).equals(before), 'a refused loader was modified');
+});
+
+test('refuses to replace an unexpected entry instruction', async (t) => {
+  const loader = buildLoader();
+  loader.writeUInt32LE(0xd503201f, KNOWN_ENTRY + 4);
+  const { file } = await withTempFile(t, loader);
+  const result = cli(file, '--json');
+  assert.equal(result.status, 2);
+  assert.match(json(result).reason, /unexpected frame-pointer reset/);
+  assert.ok((await readFile(file)).equals(loader));
 });
 
 test('refuses a cave that is not zero-filled', async (t) => {
@@ -461,19 +477,25 @@ test('a real Debian loader, when BIONILUX_TEST_LOADER points at one', {
   const report = json(injected);
   assert.equal(report.status, 'injected');
   assert.ok(KNOWN_ENTRIES.some((candidate) => candidate.entry === report.originalEntry));
-  assert.equal(report.cave, report.entry, 'the stub starts at the new e_entry');
+  assert.equal(report.entry, report.originalEntry, 'e_entry must still point to _start');
   assert.equal(cli(file, '--check').status, 0);
   assert.equal(json(cli(file, '--json')).status, 'already');
   const bytes = await readFile(file);
-  assert.equal(bytes.subarray(report.cave, report.cave + 8).toString('hex'), '5f2403d51f2003d5');
-  assert.equal(bytes.readBigUInt64LE(0x18), BigInt(report.cave));
+  assert.equal(bytes.subarray(report.cave, report.cave + 8).toString('hex'), '5f2403d51d0080d2');
+  assert.equal(bytes.readBigUInt64LE(0x18), BigInt(report.originalEntry));
+  await chmod(file, 0o755);
+  const version = NATIVE_AARCH64
+    ? execFileSync(file, ['--version'], { encoding: 'utf8' })
+    : execFileSync('qemu-aarch64-static', [file, '--version'], { encoding: 'utf8' });
+  assert.match(version, /^ld\.so \(Debian GLIBC/m);
 });
 
-test('the injector never ships a blob without the magic at its entry', async (t) => {
+test('the injector never ships a blob without the magic at the cave', async (t) => {
   const { file } = await withTempFile(t, buildLoader());
-  assert.equal(cli(file).status, 0);
+  const result = cli(file, '--json');
+  assert.equal(result.status, 0, result.stderr);
   const bytes = await readFile(file);
-  const entry = Number(bytes.readBigUInt64LE(0x18));
-  assert.deepEqual([...bytes.subarray(entry, entry + 8)], [...STUB.subarray(0, 8)]);
+  const { cave } = json(result);
+  assert.deepEqual([...bytes.subarray(cave, cave + 8)], [...STUB.subarray(0, 8)]);
   assert.equal(STUB_HEX.replace(/\s+/g, '').length, STUB.length * 2, 'STUB_HEX is the blob, in hex');
 });
