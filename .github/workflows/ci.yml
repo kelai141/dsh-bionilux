@@ -167,6 +167,7 @@ jobs:
         run: |
           bash tests/preload_paths.sh
           bash tests/runtime.sh
+          bash tests/sigsys_guard.sh
           bash tests/ubsan.sh
           bash tests/make.sh
           bash tests/prepare_rootfs.sh
