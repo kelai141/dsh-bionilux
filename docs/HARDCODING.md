@@ -21,7 +21,7 @@
 | `BIONILUX_LOADER` | 显式指定 loader | 从 rootfs 内查找 |
 | `BIONILUX_NATIVE_LIB_DIR` | APK 的 `nativeLibraryDir`；其内的 loader 优先于 rootfs | 空 |
 | `BIONILUX_PRELOAD` | 显式指定 preload 库 | rootfs `/usr/lib/bionilux/` → 可执行文件同级 → runtime |
-| `BIONILUX_BOX64` | 跨架构时的 box64 | `$BIONILUX_PREFIX/bionilux/box64-glibc` |
+| `BIONILUX_BOX64` | 跨架构时的 Box64 | DSH 的 ARM64 后端附带 `bin/box64-glibc`，独立安装使用 `$BIONILUX_PREFIX/bionilux/box64-glibc` |
 
 ### 2.2 guest 身份与环境
 

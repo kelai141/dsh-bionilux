@@ -240,7 +240,7 @@ jobs:
           set -euo pipefail
           packages="binutils build-essential bison debootstrap debian-archive-keyring gawk gnupg xz-utils"
           if [[ "$CROSS_ARCH" == "true" ]]; then
-            packages="$packages gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static binfmt-support"
+            packages="$packages gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static binfmt-support cmake unzip"
           fi
           bash scripts/ci-install-packages.sh $packages
           bash scripts/prepare-debian-keyring.sh "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg"
@@ -287,6 +287,9 @@ jobs:
           install -m 755 scripts/prepare-rootfs.sh "$backend/scripts/prepare-rootfs.sh"
           install -m 755 scripts/prepare-android-rootfs.sh scripts/ldconfig-android.sh "$backend/scripts/"
           bash scripts/build-dynamic-ldconfig.sh "$ARCH" "$backend/bin/ldconfig" "$GITHUB_WORKSPACE/target"
+          if [[ "$ARCH" == aarch64 ]]; then
+            bash scripts/build-box64.sh "$backend"
+          fi
           tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
             -cJf "$stage/bionilux-backend-$ARCH.tar.xz" -C "$backend" bin lib scripts
           file "$stage/bionilux-$ARCH" "$stage/libbionilux_preload-$ARCH.so"
@@ -313,7 +316,7 @@ jobs:
           gpgv --keyring "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" "$snapshot_release"
           sudo timeout --signal=TERM --kill-after=30s 1500s debootstrap --arch="$DEBIAN_ARCHITECTURE" --foreign --variant=minbase \
             --keyring="$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" \
-            --include=apt,bash,ca-certificates,debian-archive-keyring,libstdc++6 \
+            --include=apt,bash,ca-certificates,curl,debian-archive-keyring,libstdc++6,unzip \
             --components=main "$DEBIAN_SUITE" "$rootfs" "$DEBIAN_SNAPSHOT"
           if [[ "$CROSS_ARCH" == "true" ]]; then
             sudo install -m 755 /usr/bin/qemu-aarch64-static "$rootfs/usr/bin/qemu-aarch64-static"
@@ -329,7 +332,7 @@ jobs:
           sudo timeout --signal=TERM --kill-after=30s 1500s chroot "$rootfs" /debootstrap/debootstrap --second-stage
           test "$(sudo chroot "$rootfs" dpkg --print-architecture)" = "$DEBIAN_ARCHITECTURE"
           grep -q '^VERSION_CODENAME=trixie$' "$rootfs/etc/os-release"
-          for program in bash apt-get dpkg dpkg-divert find grep readlink sed; do
+          for program in bash apt-get curl dpkg dpkg-divert find grep readlink sed unzip; do
             elf="$rootfs/usr/bin/$program"
             test -x "$elf"
             readelf -lW "$elf" | awk '$1 == "INTERP" { matched = 1 } END { exit !matched }' || {
@@ -348,6 +351,9 @@ jobs:
           "${qemu[@]}" "$guest_loader" --library-path "$guest_libs" "$ldconfig" \
             -p -C "$rootfs/etc/ld.so.cache" > "$GITHUB_WORKSPACE/target/debian-cache-$ARCH.txt"
           grep -q 'libc.so.6' "$GITHUB_WORKSPACE/target/debian-cache-$ARCH.txt"
+          if [[ "$ARCH" == aarch64 ]]; then
+            bash tests/box64_aapt2.sh "$GITHUB_WORKSPACE/target/backend-$ARCH" "$rootfs"
+          fi
           if [[ "$CROSS_ARCH" == "true" ]]; then
             sudo rm -f "$rootfs/usr/bin/qemu-aarch64-static"
           fi
