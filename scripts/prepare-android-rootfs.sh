@@ -11,7 +11,7 @@
 #
 # Usage:
 #   prepare-android-rootfs.sh --rootfs DIR --launcher FILE --preload FILE
-#                             [--linker FILE]
+#                             [--linker FILE] [--ldconfig-helper FILE]
 #
 # All paths must be absolute.  The launcher runs guest commands with
 # BIONILUX_ROOTFS, BIONILUX_PRELOAD and BIONILUX_FAKE_ROOT=1.
@@ -29,6 +29,7 @@ rootfs=
 launcher=
 preload=
 linker=
+ldconfig_helper=
 
 die() {
     printf 'prepare-android-rootfs: %s\n' "$*" >&2
@@ -37,13 +38,14 @@ die() {
 
 while [ $# -gt 0 ]; do
     case $1 in
-        --rootfs|--launcher|--preload|--linker)
+        --rootfs|--launcher|--preload|--linker|--ldconfig-helper)
             [ $# -ge 2 ] && [ -n "$2" ] || die "$1 requires a value"
             case $1 in
                 --rootfs) rootfs=$2 ;;
                 --launcher) launcher=$2 ;;
                 --preload) preload=$2 ;;
                 --linker) linker=$2 ;;
+                --ldconfig-helper) ldconfig_helper=$2 ;;
             esac
             shift 2
             ;;
@@ -64,6 +66,10 @@ done
 if [ -n "$linker" ]; then
     case $linker in /*) ;; *) die "path must be absolute: $linker" ;; esac
     [ -x "$linker" ] || die "linker is not executable: $linker"
+fi
+if [ -n "$ldconfig_helper" ]; then
+    case $ldconfig_helper in /*) ;; *) die "ldconfig helper path must be absolute: $ldconfig_helper" ;; esac
+    [ -f "$ldconfig_helper" ] && [ -x "$ldconfig_helper" ] || die 'ldconfig helper is missing or not executable'
 fi
 rootfs=${rootfs%/}
 [ -n "$rootfs" ] && [ "$rootfs" != / ] || die 'refusing to prepare the host root'
@@ -123,13 +129,30 @@ else
 fi
 [ -x "$distrib" ] || die "missing $distrib after diversion"
 
+ldconfig_guest=/usr/sbin/ldconfig.distrib
+if [ -n "$ldconfig_helper" ]; then
+    # Retain the dpkg diversion. Package updates own ldconfig.distrib and may
+    # replace it with another static ELF. The runtime owns this separate helper.
+    ldconfig_guest=/usr/libexec/bionilux/ldconfig
+    helper_dir=$rootfs/usr/libexec/bionilux
+    mkdir -p "$helper_dir" || die 'cannot create the ldconfig helper directory'
+    physical_root=$(cd "$rootfs" && pwd -P) || die 'cannot resolve the guest root'
+    [ "$(cd "$helper_dir" && pwd -P)" = "$physical_root/usr/libexec/bionilux" ] || die 'ldconfig helper directory must not traverse symlinks'
+    [ ! -d "$rootfs$ldconfig_guest" ] || die 'ldconfig helper destination is a directory'
+    tmp_helper=$(mktemp "$helper_dir/.ldconfig.XXXXXX") || die 'cannot stage the ldconfig helper'
+    if ! cp "$ldconfig_helper" "$tmp_helper" || ! chmod 0755 "$tmp_helper" || ! mv -f "$tmp_helper" "$rootfs$ldconfig_guest"; then
+        rm -f "$tmp_helper"
+        die 'cannot install the ldconfig helper'
+    fi
+fi
+
 tmp=$rootfs/usr/sbin/.ldconfig.adapter.$$
 rm -f "$tmp"
 cp "$adapter" "$tmp" || die 'cannot copy the adapter'
 chmod 0755 "$tmp" || die 'cannot make the adapter executable'
 mv -f "$tmp" "$ldconfig" || { rm -f "$tmp"; die 'cannot install the adapter'; }
 
-guest /usr/sbin/ldconfig.distrib --version >/dev/null || die "the diverted ldconfig failed (exit $?)"
+guest "$ldconfig_guest" --version >/dev/null || die "ldconfig backend failed (exit $?)"
 
 # Build the cache now.  Package triggers rebuild it later; doing it here proves
 # the adapter works on this rootfs and leaves a usable cache after install.
