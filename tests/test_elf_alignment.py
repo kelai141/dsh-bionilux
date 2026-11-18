@@ -146,6 +146,31 @@ class InventoryTests(unittest.TestCase):
         (self.root / "usr/lib/libc.so.6").write_bytes(elf())
         self.assertEqual(len(checker.scan_path(self.root, "guest", 16384, 62)), 1)
 
+    def test_box64_validates_only_its_named_x86_library_as_emulated(self):
+        name = str(checker.BOX64_GUEST_LIBGCC)
+        amd64 = elf(segments=[(0, 4096, 256, 256, 4096)])
+        arm64 = elf(machine=183)
+        members = [("bin/box64-glibc", arm64), (f"./{name}", amd64)]
+        archive = self.archive("backend.tar.xz", [*members, ("bin/wrong-arch", amd64)])
+        records = checker.scan_path(archive, "guest", 16384, 183, box64_backend=True)
+        self.assertEqual(records[0]["errors"], [])
+        self.assertEqual(records[1]["errors"], [])
+        self.assertEqual(records[1]["box64_emulated_page_size"], 4096)
+        self.assertTrue(any("machine" in error for error in records[2]["errors"]))
+        records = checker.scan_path(archive, "guest", 16384, 183)
+        self.assertTrue(any("machine" in error for error in records[1]["errors"]))
+
+    def test_box64_library_must_exist_once_and_match_guest_architecture(self):
+        name = str(checker.BOX64_GUEST_LIBGCC)
+        main = [("bin/box64-glibc", elf(machine=183))]
+        for members in (main, [*main, (name, elf()), (f"./{name}", elf())]):
+            path = self.archive("invalid.tar.xz", members)
+            with self.assertRaises(ValueError):
+                checker.scan_path(path, "guest", 16384, 183, box64_backend=True)
+        path = self.archive("wrong.tar.xz", [*main, (name, elf(machine=183))])
+        records = checker.scan_path(path, "guest", 16384, 183, box64_backend=True)
+        self.assertTrue(any("machine" in error for error in records[1]["errors"]))
+
     def test_unsafe_archive_paths_are_not_extracted_or_accepted(self):
         for leaf in ("/escape", "../escape"):
             with self.subTest(leaf=leaf), self.assertRaises(ValueError):

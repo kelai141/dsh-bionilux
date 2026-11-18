@@ -488,9 +488,14 @@ jobs:
           # Low p_align alone is not a glibc failure: segment congruence is checked
           # for APK loader, rootfs, Node and backend at the target kernel page size.
           # ARM64 must pass 16KB; x86_64 only targets 4KB Android emulator kernels.
+          box64_options=()
+          if [[ "$ARCH" == aarch64 ]]; then
+            box64_options=(--box64-backend "$stage/bionilux-backend-$ARCH.tar.xz")
+          fi
           python3 scripts/check_elf_alignment.py --policy guest --machine "$ARCH" \
             --page-size "$GUEST_PAGE_SIZE" \
             --report "$reports/runtime-$ARCH.json" \
+            "${box64_options[@]}" \
             "$stage/bionilux-loader-$ARCH.so" \
             "$stage/bionilux-backend-$ARCH.tar.xz" \
             "$stage/debian-minimal-$ARCH.tar.xz" \
