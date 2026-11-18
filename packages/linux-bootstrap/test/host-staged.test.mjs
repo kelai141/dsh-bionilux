@@ -70,7 +70,8 @@ const runtimeManager = {
 }
 
 function harness({ dataDir = path.join(root, `staged-${Math.random().toString(16).slice(2)}`), requireStagedBundle = false, hostStagingRoot } = {}) {
-  const calls = { downloads: 0 }
+  const calls = { downloads: 0, latest: 0 }
+  const upstream = { manifest: manifest() }
   const service = createMobileBootstrap({
     dataDir,
     arch: 'arm64',
@@ -89,14 +90,22 @@ function harness({ dataDir = path.join(root, `staged-${Math.random().toString(16
       await mkdir(path.join(destination, 'lib'), { recursive: true })
       await writeFile(path.join(destination, 'lib', 'index.js'), entrySource)
     },
-    fetchImpl: async (url) => (url.includes('api.github.com')
-      ? response({
-        tag_name: tag,
-        assets: [{ name: 'linux-release.json', size: Buffer.byteLength(JSON.stringify(manifest())), digest: null, browser_download_url: `${releaseUrl}/linux-release.json` }],
+    fetchImpl: async (url) => {
+      if (!url.includes('api.github.com')) return response(upstream.manifest, url)
+      calls.latest += 1
+      const current = upstream.manifest
+      const currentTag = 'v' + current.version
+      return response({
+        tag_name: currentTag,
+        assets: [{
+          name: 'linux-release.json',
+          size: Buffer.byteLength(JSON.stringify(current)),
+          browser_download_url: releaseUrl.replace(tag, currentTag) + '/linux-release.json',
+        }],
       }, url)
-      : response(manifest(), url)),
+    },
   })
-  return { service, calls, dataDir }
+  return { service, calls, dataDir, upstream }
 }
 
 /** Write the layout the host publishes: `<dataDir>/staging/<sha256>/{asset.tar.xz,unpacked/}`. */
@@ -136,6 +145,20 @@ test('a staged archive that does not match the manifest fails closed and is not 
   await value.service.ready
   await assert.rejects(install(value.service), /Host-staged archive does not match the release manifest/)
   assert.equal(value.calls.downloads, 0, 'tampering must not be papered over by a silent re-download')
+})
+
+test('a staged install stays on its checked release if a newer release appears', async () => {
+  const value = harness({ requireStagedBundle: true })
+  await value.service.checkForUpdates({ source: 'manual' })
+  await stageBundle(value.dataDir)
+  const newer = JSON.parse(JSON.stringify(manifest()).replaceAll(version, '2.0.1'))
+  newer.plugins.runtime.sha256 = 'a'.repeat(64)
+  value.upstream.manifest = newer
+
+  const installed = await install(value.service)
+  assert.equal(installed.version, version)
+  assert.equal(value.calls.latest, 1)
+  assert.equal(value.calls.downloads, 0)
 })
 
 test('a staged unpacked tree of the wrong size fails closed', async () => {
