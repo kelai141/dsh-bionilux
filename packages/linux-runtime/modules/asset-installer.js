@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, promises as fs, existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { validateAsset } from './manifest.js';
 
 const ALLOWED_REDIRECT_HOSTS = new Set([
@@ -79,42 +80,80 @@ async function verifyFile(asset, file) {
   return stat.size;
 }
 
-async function fetchAsset(fetchImpl, asset, destination) {
-  const response = await fetchImpl(asset.url, { redirect: 'follow' });
-  if (!response?.ok) {
-    throw new Error(`asset download failed: HTTP ${response?.status ?? 'unknown'}`);
-  }
-  if (response.url && !isAllowedAssetOrigin(response.url)) {
-    throw new Error('asset download redirected away from the official GitHub release origin');
-  }
-  const file = await fs.open(destination, 'wx');
-  const hash = createHash('sha256');
-  let size = 0;
+class InterruptedDownload extends Error {}
+
+async function* responseChunks(response) {
   try {
     if (response.body && typeof response.body[Symbol.asyncIterator] === 'function') {
-      for await (const chunk of response.body) {
-        const buffer = Buffer.from(chunk);
-        if (size + buffer.length > asset.size) {
-          throw new Error(`asset exceeded declared size: expected ${asset.size}`);
-        }
-        hash.update(buffer);
-        size += buffer.length;
-        await file.write(buffer);
-      }
+      yield* response.body;
     } else {
-      const buffer = Buffer.from(await response.arrayBuffer());
-      if (buffer.length > asset.size) {
-        throw new Error(`asset exceeded declared size: expected ${asset.size}`);
+      yield await response.arrayBuffer();
+    }
+  } catch (cause) {
+    throw new InterruptedDownload('asset response was interrupted', { cause });
+  }
+}
+
+async function fetchAsset(fetchImpl, asset, destination) {
+  const file = await fs.open(destination, 'wx');
+  const attempts = 3;
+  let size = 0;
+  try {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const request = { redirect: 'follow' };
+        if (size > 0) request.headers = { Range: `bytes=${size}-`, 'Accept-Encoding': 'identity' };
+        let response;
+        try {
+          response = await fetchImpl(asset.url, request);
+        } catch (cause) {
+          throw new InterruptedDownload('asset request was interrupted', { cause });
+        }
+        const status = response?.status;
+        if (!response?.ok) {
+          await response?.body?.cancel?.();
+          const message = `asset download failed: HTTP ${status ?? 'unknown'}`;
+          if (status === 408 || status === 429 || status >= 500) throw new InterruptedDownload(message);
+          throw new Error(message);
+        }
+        if (response.url && !isAllowedAssetOrigin(response.url)) {
+          await response.body?.cancel?.();
+          throw new Error('asset download redirected away from the official GitHub release origin');
+        }
+        if (status === 206) {
+          const range = response.headers?.get('content-range');
+          if (size === 0 || range !== `bytes ${size}-${asset.size - 1}/${asset.size}`) {
+            await response.body?.cancel?.();
+            throw new Error('asset download returned an unexpected Content-Range');
+          }
+        } else if (size > 0) {
+          await file.truncate(0);
+          size = 0;
+        }
+        for await (const chunk of responseChunks(response)) {
+          const buffer = Buffer.from(chunk);
+          if (size + buffer.length > asset.size) {
+            throw new Error(`asset exceeded declared size: expected ${asset.size}`);
+          }
+          for (let offset = 0; offset < buffer.length;) {
+            const { bytesWritten } = await file.write(buffer, offset, buffer.length - offset, size);
+            if (bytesWritten === 0) throw new Error('asset file stopped accepting writes');
+            offset += bytesWritten;
+            size += bytesWritten;
+          }
+        }
+        if (size !== asset.size) {
+          throw new InterruptedDownload(`asset size mismatch: expected ${asset.size}, got ${size}`);
+        }
+        return;
+      } catch (error) {
+        if (!(error instanceof InterruptedDownload) || attempt === attempts || size === asset.size) throw error;
+        await delay(250 * attempt);
       }
-      hash.update(buffer);
-      size = buffer.length;
-      await file.write(buffer);
     }
   } finally {
     await file.close();
   }
-  if (size !== asset.size) throw new Error(`asset size mismatch: expected ${asset.size}, got ${size}`);
-  if (hash.digest('hex') !== asset.sha256) throw new Error('asset SHA-256 mismatch');
 }
 
 async function unpackedSize(directory) {
