@@ -108,6 +108,23 @@ jobs:
         with:
           name: draft-request
           path: target/draft-request
+      - uses: actions/setup-node@v4
+        with:
+          # Same pin as debug-build.yml NODE_VERSION; the loader gate below runs
+          # the injector that build produced.
+          node-version: 24.22.0
+      - name: Verify the shipped loaders carry the SIGSYS entry stub
+        run: |
+          set -euo pipefail
+          # debug-build.yml injects the stub where the loader is produced, so a
+          # healthy release reports already (arm64) or skipped (x86_64) here. A
+          # loader that lost the stub fails the release instead of shipping a
+          # guest that dies with a bare "Bad system call", and the checksum
+          # recheck below proves these two calls rewrote nothing.
+          for loader in target/release-assets/bionilux-loader-*.so; do
+            node scripts/inject-sigsys-stub.mjs "$loader"
+            node scripts/inject-sigsys-stub.mjs "$loader" --check
+          done
       - name: Recheck asset checksums and source identity
         run: |
           set -euo pipefail
