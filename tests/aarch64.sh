@@ -11,6 +11,7 @@ command -v "$CC" >/dev/null
 command -v "$QEMU" >/dev/null
 "$CC" -shared -fPIC -O2 -Wall -Wextra -Werror -o "$TMP/preload.so" "$PROJECT/src/preload/hooks.c" -ldl -pthread
 "$CC" -O2 -Wall -Wextra -Werror -o "$TMP/probe" "$PROJECT/tests/helpers/runtime.c" -pthread
+"$CC" -O2 -Wall -Wextra -Werror -o "$TMP/accept-probe" "$PROJECT/tests/helpers/accept_compat.c"
 "$CC" -O2 -Wall -Wextra -Werror -Wl,--export-dynamic -o "$TMP/unit" "$PROJECT/tests/helpers/hooks_unit.c" -ldl -pthread
 mkdir -p "$TMP/root"/{etc,tmp,usr/bin}
 printf 'bn-group:x:4242:alice,bob\n' > "$TMP/root/etc/group"
@@ -26,6 +27,7 @@ for test in group hosts spawn temporary readlink; do
         -E BIONILUX_BINARY_PATH=/fixture-launcher -E "LD_PRELOAD=$TMP/preload.so" \
         "$TMP/probe" "$test"
 done
+"$QEMU" -L "$SYSROOT" -E "LD_PRELOAD=$TMP/preload.so" "$TMP/accept-probe"
 "$QEMU" -L "$SYSROOT" -E "BIONILUX_ROOTFS=$TMP/root" \
     -E BIONILUX_BINARY_PATH=/fixture-launcher -E PATH=/usr/bin:/bin "$TMP/unit"
 printf 'AArch64 glibc compile and QEMU regressions: OK (not Android validation)\n'

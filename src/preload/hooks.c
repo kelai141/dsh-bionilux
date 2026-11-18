@@ -2265,6 +2265,12 @@ int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *fa,
     return real(fa, bn_resolve(AT_FDCWD, path, buf, sizeof buf));
 }
 
+// Android's application syscall policy exposes accept4. Zero flags preserve
+// accept's descriptor semantics, and using libc retains pthread cancellation.
+int accept(int fd, struct sockaddr *address, socklen_t *length) {
+    return accept4(fd, address, length, 0);
+}
+
 // ── getifaddrs fallback via SIOCGIFCONF ────────────────────────────
 // Android's SELinux blocks the netlink RTM_GETLINK query glibc's
 // getifaddrs uses, so it returns EACCES. WebRTC/ICE needs the local

@@ -148,6 +148,7 @@ jobs:
           bash tests/shadow_compat.sh
           bash tests/android_prepare.sh
           bash tests/syscall_compat.sh
+          bash tests/accept_compat.sh
           bash tests/python_compat.sh
           bash tests/glob_compat.sh
           bash tests/host_paths.sh
