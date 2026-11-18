@@ -634,7 +634,12 @@ export function createMobileBootstrap(options = {}) {
     syncInjectionState: () => ready.then(() => serial(async () => { await synchronizeInjectionState(); return emit() })),
     install: ({ runtimeId, confirmed = false, activate = false } = {}) => ready.then(() => serial(async () => {
       if (confirmed !== true || activate !== true) throw new Error('install requires confirmed:true and activate:true')
-      const manifest = await fetchManifest()
+      // The host prepared digests from the checked release. The latest
+      // release may have moved while the host downloaded those assets.
+      const preparedManifest = state.availableManifest ?? state.pinnedManifest
+      const manifest = requireStagedBundle && preparedManifest
+        ? validateManifestShape(preparedManifest)
+        : await fetchManifest()
       return installRuntime({ manifest, runtimeId, activate: true })
     })),
     reinstall: ({ confirmed = false, activate = false } = {}) => ready.then(() => serial(async () => {
