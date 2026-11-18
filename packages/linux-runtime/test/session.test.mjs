@@ -461,6 +461,32 @@ test('a background job can be polled by byte offset without replaying output', {
   await manager.dispose();
 });
 
+test('poll reports a dead background supervisor without fabricating an exit code', {
+  skip: skip || process.platform !== 'linux',
+}, async (t) => {
+  const { manager } = await makeManager();
+  const registry = new SessionRegistry(manager);
+  t.after(async () => { await registry.dispose(); await manager.dispose(); });
+  const started = await registry.start('interrupted', {
+    command: 'printf before; sleep 1; printf after; exit 3',
+  });
+  await waitFor(async () => {
+    const result = await registry.poll('interrupted', { job: started.job });
+    return result.stdout === 'before' && result.running;
+  }, 'wait for the producer to begin');
+  process.kill(started.pid, 'SIGKILL');
+
+  const stopped = await waitFor(async () => {
+    const result = await registry.poll('interrupted', { job: started.job });
+    return result.finished ? result : null;
+  }, 'a missing status file must not keep an exited job running forever');
+  assert.equal(stopped.stdout, 'beforeafter');
+  assert.equal(stopped.running, false);
+  assert.equal(stopped.eof, true);
+  assert.equal(stopped.exitCode, null);
+  assert.match(stopped.stderr, /supervisor exited without reporting/);
+});
+
 test('explicit shell exit returns the final output and actual status', { skip }, async (t) => {
   const { manager } = await makeManager();
   t.after(() => manager.dispose());

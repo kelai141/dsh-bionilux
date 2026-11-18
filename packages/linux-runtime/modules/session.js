@@ -47,6 +47,18 @@ function procGroupAlive(job) {
   }
 }
 
+async function jobSupervisorExited(job) {
+  if (!PROC_SCOPES || !job.pid || !job.start) return false;
+  try {
+    const fields = statFields(await fs.readFile(`/proc/${job.pid}/stat`, 'utf8'));
+    return Boolean(fields && (fields[19] !== job.start || ['Z', 'X', 'x'].includes(fields[0])));
+  } catch (error) {
+    if (['ENOENT', 'ESRCH'].includes(error?.code)) return true;
+    if (['EACCES', 'EPERM'].includes(error?.code)) return false;
+    throw error;
+  }
+}
+
 function killWindowsTree(pid) {
   return new Promise((resolve) => {
     const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
@@ -1009,6 +1021,25 @@ export class PersistentSession {
     assertJobId(job);
     const jobInfo = this._jobs.get(job);
     if (!jobInfo) throw new Error(`unknown job ${job} in session ${this.id}`);
+    const readStatus = () => fs.readFile(path.join(jobInfo.directory, 'status'), 'utf8').catch((error) => {
+      if (error?.code === 'ENOENT') return null;
+      throw error;
+    });
+    // Read completion before the log so eof cannot refer to an older snapshot
+    // when the supervisor writes the final output during the poll.
+    let status = await readStatus();
+    if (status == null && jobInfo.finishedAt == null && await jobSupervisorExited(jobInfo) &&
+        (await this._jobMembers(jobInfo)).length === 0) {
+      status = await readStatus();
+      if (status == null) {
+        jobInfo.stderr = 'Background job supervisor exited without reporting a status.';
+        jobInfo.finishedAt = Date.now();
+      }
+    }
+    if (status != null) {
+      jobInfo.exitCode = Number.parseInt(status.trim(), 10);
+      jobInfo.finishedAt ??= Date.now();
+    }
     const start = Math.max(0, Number.isFinite(offset) ? Math.floor(offset) : 0);
     const max = Math.max(1, Math.min(Number.isFinite(limitBytes) ? Math.floor(limitBytes) : 64 * 1024, this.maxOutputBytes));
     let bytes = Buffer.alloc(0);
@@ -1033,26 +1064,16 @@ export class PersistentSession {
       if (error?.code !== 'ENOENT') throw error;
       jobInfo.offset = start;
     }
-    const statusText = await fs.readFile(path.join(jobInfo.directory, 'status'), 'utf8').catch((error) => {
-      if (error?.code === 'ENOENT') return null;
-      throw error;
-    });
-    const finished = statusText != null;
-    if (finished) {
-      jobInfo.exitCode = Number.parseInt(statusText.trim(), 10);
-      jobInfo.finishedAt ??= Date.now();
-    }
-    // A zombie leader answers signal 0. The frame status is the supervisor's
-    // own exit status, so a live producer or drain is never reported as done.
-    const running = !finished;
+    const finished = jobInfo.finishedAt != null;
     await this._pruneJobs();
     return {
       session: this.id,
       job,
       stdout: bytes.toString('utf8'),
+      ...(jobInfo.stderr ? { stderr: jobInfo.stderr } : {}),
       nextOffset: jobInfo.offset,
       eof: jobInfo.offset >= jobInfo.size,
-      running,
+      running: !finished,
       finished,
       exitCode: finished ? jobInfo.exitCode : null,
       logLimit: jobInfo.logLimit,
