@@ -98,8 +98,8 @@ distrib=$rootfs/usr/sbin/ldconfig.distrib
 # between dpkg versions.  An empty owner with the original truename means the
 # file is not diverted; LOCAL with our target is the diversion this script
 # owns.  Anything else belongs to a package or another local rule.
-owner=$(guest /usr/bin/dpkg-divert --listpackage /usr/sbin/ldconfig 2>/dev/null || true)
-truename=$(guest /usr/bin/dpkg-divert --truename /usr/sbin/ldconfig 2>/dev/null || true)
+owner=$(guest /usr/bin/dpkg-divert --listpackage /usr/sbin/ldconfig) || die 'cannot read the ldconfig diversion owner'
+truename=$(guest /usr/bin/dpkg-divert --truename /usr/sbin/ldconfig) || die 'cannot read the ldconfig diversion target'
 
 if [ -z "$owner" ]; then
     case $truename in
@@ -129,9 +129,7 @@ cp "$adapter" "$tmp" || die 'cannot copy the adapter'
 chmod 0755 "$tmp" || die 'cannot make the adapter executable'
 mv -f "$tmp" "$ldconfig" || { rm -f "$tmp"; die 'cannot install the adapter'; }
 
-if ! guest /usr/sbin/ldconfig.distrib --version >/dev/null 2>&1; then
-    die 'the diverted ldconfig does not run inside the guest'
-fi
+guest /usr/sbin/ldconfig.distrib --version >/dev/null || die "the diverted ldconfig failed (exit $?)"
 
 # Build the cache now.  Package triggers rebuild it later; doing it here proves
 # the adapter works on this rootfs and leaves a usable cache after install.
