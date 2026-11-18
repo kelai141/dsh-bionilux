@@ -84,6 +84,9 @@ jobs:
               ".tar.gz", ".tar.xz", ".tgz", ".xz", ".a", ".o", ".node",
               ".png", ".jpg", ".jpeg", ".webp", ".avif", ".mp4", ".mov",
           )
+          # Synthetic test fixtures: tiny hand-built archives that exercise extraction edge
+          # cases. They are test data, not release payloads, so they stay in Git.
+          fixture_prefixes = ("crates/install/tests/fixtures/",)
           lfs_pointer = b"version https://git-lfs.github.com/spec/v1\n"
           errors = []
           paths = subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0")
@@ -91,7 +94,7 @@ jobs:
               if not raw_path:
                   continue
               path = os.fsdecode(raw_path)
-              if path.lower().endswith(forbidden_suffixes):
+              if path.lower().endswith(forbidden_suffixes) and not path.startswith(fixture_prefixes):
                   errors.append(f"tracked release/binary asset: {path}")
               object_name = f"HEAD:{path}"
               try:
