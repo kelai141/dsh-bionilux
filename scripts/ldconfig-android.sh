@@ -56,6 +56,11 @@ fi
 resolve_path() { readlink -f -- "$1" 2>/dev/null; }
 
 distrib="$rootfs/usr/sbin/ldconfig.distrib"
+helper="$rootfs/usr/libexec/bionilux/ldconfig"
+if [ -e "$helper" ]; then
+    [ -x "$helper" ] || die 'bundled ldconfig helper is not executable'
+    distrib=$helper
+fi
 [ -x "$distrib" ] || die "missing $distrib; run prepare-android-rootfs.sh"
 # A mistaken diversion can leave the adapter at both names; refuse instead of
 # re-entering it endlessly through --version or --help.

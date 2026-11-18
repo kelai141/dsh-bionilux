@@ -1574,12 +1574,14 @@ export class LinuxRuntimeManager {
       ? ['/system/bin/linker64', '/system/bin/linker'].find(fileExists)
       : undefined;
     const linkerArgs = linker === undefined ? [] : ['--linker', linker];
+    const ldconfigHelper = path.join(instance.backend, 'bin', 'ldconfig');
+    const ldconfigArgs = fileExists(ldconfigHelper) ? ['--ldconfig-helper', ldconfigHelper] : [];
     const prepared = normaliseCommandResult(await this._runManaged({
       file: HOST_SCRIPT_INTERPRETER,
       args: [compatibilityScript, '--rootfs', instance.rootfs,
         '--launcher', launcher,
         '--preload', path.join(instance.backend, 'lib', 'libbionilux_preload.so'),
-        ...linkerArgs],
+        ...linkerArgs, ...ldconfigArgs],
       cwd: instance.root,
       env: hostEnvironment,
       timeout: 120_000,

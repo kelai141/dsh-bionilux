@@ -189,7 +189,12 @@ grep -q 'cannot read the ldconfig diversion owner' "$WORK/rejected.log"
 
 reject env DPKG_STUB_REJECT_LDCONFIG=1 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB"
 grep -q 'ldconfig: fixture execution denied' "$WORK/rejected.log"
-grep -q 'the diverted ldconfig failed (exit 126)' "$WORK/rejected.log"
+grep -q 'ldconfig backend failed (exit 126)' "$WORK/rejected.log"
+
+DPKG_STUB_REJECT_LDCONFIG=1 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB" \
+    --ldconfig-helper /usr/sbin/ldconfig >/dev/null
+cmp /usr/sbin/ldconfig "$ROOT/usr/libexec/bionilux/ldconfig"
+grep -aq 'libbnfixture\.so\.1' "$ROOT/etc/ld.so.cache"
 
 # A diversion owned by a package, or a local one with another target, is
 # refused by --listpackage/--truename rather than silently overwritten.
