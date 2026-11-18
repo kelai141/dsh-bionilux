@@ -135,9 +135,14 @@ fn is_plain_file_name(name: &str) -> bool {
         && !name.contains('\0')
 }
 
-/// 下载 + 校验；返回最终落盘路径。
+const DOWNLOAD_ATTEMPTS: usize = 4;
+
+/// 下载 + 校验（断点续传 + 重试）；返回最终落盘路径。
 ///
-/// `progress` 每约 1 MiB 回调一次；`cancelled` 返回 true 时删除临时文件并中止。
+/// 网络中断不再等于安装失败：`.part` 临时文件跨尝试保留，用 `Range` 接着下；
+/// 只有内容校验失败才丢弃重来（此时继续用坏字节没有意义）。
+///
+/// `progress` 每约 1 MiB 回调一次；`cancelled` 返回 true 时中止并丢掉临时文件。
 pub fn download_verified<P, C>(
     spec: &AssetSpec,
     dest_dir: &Path,
@@ -153,7 +158,67 @@ where
 
     let part = dest_dir.join(format!(".{}.part", spec.sha256));
     let final_path = dest_dir.join(&spec.name);
-    let _ = fs::remove_file(&part);
+    let mut last = String::new();
+
+    for attempt in 0..DOWNLOAD_ATTEMPTS {
+        if attempt > 0 {
+            // 退避期间也能取消：分片睡，避免用户点取消后还要等满一轮
+            for _ in 0..attempt * 2 {
+                if cancelled() {
+                    let _ = fs::remove_file(&part);
+                    return Err("下载已取消".into());
+                }
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+        }
+        match download_part(spec, &part, &progress, &cancelled) {
+            Ok(()) => match verify_part(&part, spec) {
+                Ok(()) => {
+                    fs::remove_file(&final_path).ok();
+                    fs::rename(&part, &final_path).map_err(|e| format!("资产落位失败: {e}"))?;
+                    return Ok(final_path);
+                }
+                Err(error) => {
+                    // 字节已坏，续传没有意义
+                    last = error;
+                    let _ = fs::remove_file(&part);
+                }
+            },
+            Err(error) => {
+                if error == "下载已取消" {
+                    let _ = fs::remove_file(&part);
+                    return Err(error);
+                }
+                last = error;
+            }
+        }
+    }
+
+    Err(format!(
+        "{last}（已尝试 {DOWNLOAD_ATTEMPTS} 次；临时文件保留，重试会续传）"
+    ))
+}
+
+/// 单趟下载：已有的 `part` 字节数用 `Range` 请求续传。
+fn download_part<P, C>(
+    spec: &AssetSpec,
+    part: &Path,
+    progress: &P,
+    cancelled: &C,
+) -> Result<(), String>
+where
+    P: Fn(u64, Option<u64>),
+    C: Fn() -> bool,
+{
+    let mut have = fs::metadata(part).map(|meta| meta.len()).unwrap_or(0);
+    if have > spec.size {
+        let _ = fs::remove_file(part);
+        have = 0;
+    }
+    if have == spec.size {
+        progress(have, Some(spec.size));
+        return Ok(());
+    }
 
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
@@ -161,37 +226,44 @@ where
         .redirects(0)
         .build();
 
-    let response = fetch_following_redirects(&agent, &spec.url, &cancelled)?;
+    let range = (have > 0).then_some(have);
+    let response = fetch_following_redirects(&agent, &spec.url, cancelled, range)?;
+    let status = response.status();
+    // 服务端不认 Range（回 200 而不是 206）时只能从头覆盖写
+    let resuming = range.is_some() && status == 206;
+    if range.is_some() && !resuming {
+        have = 0;
+    }
+
     let mut reader = response.into_reader();
-    let mut file = File::create(&part).map_err(|e| format!("创建临时文件失败: {e}"))?;
-    let mut hasher = Sha256::new();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resuming)
+        .truncate(!resuming)
+        .open(part)
+        .map_err(|e| format!("创建临时文件失败: {e}"))?;
     let mut buffer = vec![0u8; 128 * 1024];
-    let mut received: u64 = 0;
-    let mut last_report: u64 = 0;
+    let mut received = have;
+    let mut last_report = have;
 
     loop {
         if cancelled() {
-            drop(file);
-            let _ = fs::remove_file(&part);
             return Err("下载已取消".into());
         }
         let read = reader
             .read(&mut buffer)
-            .map_err(|e| fail(&part, format!("读取下载流失败: {e}")))?;
+            .map_err(|e| format!("读取下载流失败: {e}"))?;
         if read == 0 {
             break;
         }
         received += read as u64;
         if received > spec.size {
-            drop(file);
-            return Err(fail(
-                &part,
-                format!("下载体量超过清单声明（>{}）", spec.size),
-            ));
+            let _ = fs::remove_file(part);
+            return Err(format!("下载体量超过清单声明（>{}）", spec.size));
         }
-        hasher.update(&buffer[..read]);
         file.write_all(&buffer[..read])
-            .map_err(|e| fail(&part, format!("写入临时文件失败: {e}")))?;
+            .map_err(|e| format!("写入临时文件失败: {e}"))?;
         if received - last_report >= 1024 * 1024 {
             last_report = received;
             progress(received, Some(spec.size));
@@ -201,10 +273,32 @@ where
     progress(received, Some(spec.size));
 
     if received != spec.size {
-        return Err(fail(
-            &part,
-            format!("字节数不符：清单 {}，实际 {received}", spec.size),
+        return Err(format!("字节数不符：清单 {}，实际 {received}", spec.size));
+    }
+    Ok(())
+}
+
+/// 从磁盘整份重算 sha256（续传跨了多次请求，无法边下边算），返回错误时调用方丢弃临时文件。
+fn verify_part(part: &Path, spec: &AssetSpec) -> Result<(), String> {
+    let meta = fs::metadata(part).map_err(|e| format!("读取临时文件失败: {e}"))?;
+    if meta.len() != spec.size {
+        return Err(format!(
+            "字节数不符：清单 {}，实际 {}",
+            spec.size,
+            meta.len()
         ));
+    }
+    let mut file = File::open(part).map_err(|e| format!("读取临时文件失败: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 128 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| format!("校验读取失败: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
     }
     let actual: String = hasher
         .finalize()
@@ -212,20 +306,9 @@ where
         .map(|byte| format!("{byte:02x}"))
         .collect();
     if actual != spec.sha256 {
-        return Err(fail(
-            &part,
-            format!("SHA-256 不符：清单 {}，实际 {actual}", spec.sha256),
-        ));
+        return Err(format!("SHA-256 不符：清单 {}，实际 {actual}", spec.sha256));
     }
-
-    fs::remove_file(&final_path).ok();
-    fs::rename(&part, &final_path).map_err(|e| format!("资产落位失败: {e}"))?;
-    Ok(final_path)
-}
-
-fn fail(part: &Path, message: String) -> String {
-    let _ = fs::remove_file(part);
-    message
+    Ok(())
 }
 
 /// 拉取一个小文件（清单）：走同一套首跳/跳转校验，带字节上限。
@@ -235,7 +318,7 @@ pub fn fetch_bytes(url: &str, max: u64) -> Result<Vec<u8>, String> {
         .timeout_read(Duration::from_secs(60))
         .redirects(0)
         .build();
-    let response = fetch_following_redirects(&agent, url, &|| false)?;
+    let response = fetch_following_redirects(&agent, url, &|| false, None)?;
     let status = response.status();
     let mut reader = response.into_reader();
     let mut body = Vec::new();
@@ -262,6 +345,7 @@ fn fetch_following_redirects<C>(
     agent: &ureq::Agent,
     url: &str,
     cancelled: &C,
+    range: Option<u64>,
 ) -> Result<ureq::Response, String>
 where
     C: Fn() -> bool,
@@ -272,7 +356,12 @@ where
         if cancelled() {
             return Err("下载已取消".into());
         }
-        match agent.get(&current).call() {
+        let request = agent.get(&current);
+        let request = match range {
+            Some(offset) => request.set("Range", &format!("bytes={offset}-")),
+            None => request,
+        };
+        match request.call() {
             Ok(response) => {
                 // ureq 在 `redirects(0)` 时把 3xx 当正常响应返回（unit.rs: `redirects == 0` → `Ok(resp)`），
                 // 不自己跟就会把空的 302 body 当正文读出来。
