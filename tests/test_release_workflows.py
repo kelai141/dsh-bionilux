@@ -142,13 +142,14 @@ class ManifestTests(unittest.TestCase):
 
     def run_manifest(self, sha=SHA):
         return subprocess.run([sys.executable, str(ROOT / "scripts/build_release_manifest.py"), str(self.root),
-                               "owner/repo", "v0.5.0", "0.5.0", "0.14.0", "24.22.0"],
+                               "owner/repo", "v0.5.0", "0.5.0", "24.22.0"],
                               env={**os.environ, "SOURCE_SHA": sha}, capture_output=True, text=True)
 
     def test_dual_arch_manifest_and_checksums(self):
         result = self.run_manifest()
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((self.root / "linux-release.json").read_text())
+        self.assertEqual(manifest["minMobileVersion"], "0.0.0")
         self.assertEqual([r["architecture"] for r in manifest["runtimes"]], ["arm64", "x64"])
         self.assertEqual(len((self.root / "SHA256SUMS").read_text().splitlines()), 16)
 

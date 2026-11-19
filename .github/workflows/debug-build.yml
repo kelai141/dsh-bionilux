@@ -33,7 +33,6 @@ env:
   # Official SHASUMS256.txt for v24.22.0, checked 2026-10-21.
   NODE_ARCHIVE_SHA256_ARM64: fef00bb4d36e1c50104a9775a10359beee98f162b4104dd12472c75065c6a143
   NODE_ARCHIVE_SHA256_X64: cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008
-  MIN_MOBILE_VERSION: 0.14.0
 
 
 jobs:
@@ -602,7 +601,7 @@ jobs:
       - name: Validate manifest, source identity and complete asset set
         run: |
           set -euo pipefail
-          python3 scripts/build_release_manifest.py target/release-assets "$GITHUB_REPOSITORY" "$BUILD_TAG" "$BUILD_VERSION" "$MIN_MOBILE_VERSION" "$NODE_VERSION"
+          python3 scripts/build_release_manifest.py target/release-assets "$GITHUB_REPOSITORY" "$BUILD_TAG" "$BUILD_VERSION" "$NODE_VERSION"
           node --input-type=module -e 'import fs from "node:fs"; import {validateManifest} from "./packages/linux-runtime/modules/manifest.js"; validateManifest(JSON.parse(fs.readFileSync("target/release-assets/linux-release.json", "utf8")));'
           node --input-type=module -e 'import fs from "node:fs"; import {validateManifestShape} from "./packages/linux-bootstrap/src/manifest.js"; validateManifestShape(JSON.parse(fs.readFileSync("target/release-assets/linux-release.json", "utf8")), process.env.BUILD_TAG);'
           cd target/release-assets
