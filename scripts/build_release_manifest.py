@@ -9,7 +9,7 @@ import tarfile
 from urllib.parse import quote
 
 root = pathlib.Path(sys.argv[1])
-repository, tag, version, min_mobile, node_version = sys.argv[2:]
+repository, tag, version, node_version = sys.argv[2:]
 runtime_specs = (
     ("aarch64", "debian-minimal", "arm64", "arm64", "ARM64"),
     ("x86_64", "debian-minimal-x64", "x64", "x64", "x86_64"),
@@ -73,7 +73,8 @@ runtime_plugin["pluginReleaseUrl"] = page_url
 manifest = {
     "schemaVersion": 1,
     "version": version,
-    "minMobileVersion": min_mobile,
+    # Older schema-1 clients require this field. Zero leaves version selection to the release channel.
+    "minMobileVersion": "0.0.0",
     "plugins": {
         "bootstrap": bootstrap,
         "runtime": runtime_plugin,
