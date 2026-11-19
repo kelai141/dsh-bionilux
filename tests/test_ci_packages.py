@@ -14,7 +14,7 @@ SCRIPT = (ROOT / "scripts/ci-install-packages.sh").read_text(encoding="utf-8")
 
 class SourceContractTests(unittest.TestCase):
     def test_strict_bounded_authenticated_apt(self):
-        for text in ("set -euo pipefail", "180s apt-get", "600s apt-get", "--kill-after=15s",
+        for text in ("set -euo pipefail", "180s apt-get", "apt_install 240s --download-only", "apt_install 420s", "--kill-after=15s",
                      "Acquire::Retries=2", "APT::Update::Error-Mode=any", "Acquire::ForceIPv4=true",
                      "Acquire::AllowInsecureRepositories=false", "APT::Get::AllowUnauthenticated=false"):
             self.assertIn(text, SCRIPT)
@@ -49,7 +49,7 @@ class SourceContractTests(unittest.TestCase):
 
 @unittest.skipIf(os.name == "nt" or not shutil.which("bash"), "fake Bash processes run in Linux CI")
 class FakeProcessTests(unittest.TestCase):
-    def run_case(self, failure="", platform="ubuntu", architecture="amd64", fallback_failure=False, install_failure=False, normal_status=100, dns_failure=False):
+    def run_case(self, failure="", platform="ubuntu", architecture="amd64", fallback_failure=False, install_failure=False, normal_status=100, dns_failure=False, download_failure=""):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bindir = root / "bin"
@@ -76,7 +76,9 @@ fallback = any("Dir::Etc::sourcelist=" in arg for arg in args)
 if "update" in args:
     if fallback and os.environ["TEST_FALLBACK_FAILURE"] == "1": print("NO_PUBKEY badkey"); sys.exit(100)
     if not fallback and os.environ["TEST_FAILURE"]: print(os.environ["TEST_FAILURE"]); sys.exit(int(os.environ["TEST_NORMAL_STATUS"]))
-if "install" in args and os.environ["TEST_INSTALL_FAILURE"] == "1": sys.exit(100)
+if "--download-only" in args and os.environ["TEST_DOWNLOAD_FAILURE"]:
+    print(os.environ["TEST_DOWNLOAD_FAILURE"]); sys.exit(124)
+if "install" in args and "--download-only" not in args and os.environ["TEST_INSTALL_FAILURE"] == "1": sys.exit(100)
 sys.exit(0)
 '''.replace("PYTHON", sys.executable)
             for name in ("sudo", "timeout", "apt-get", "dpkg", "getent"):
@@ -88,7 +90,8 @@ sys.exit(0)
                 env={**os.environ, "PATH": str(bindir) + os.pathsep + os.environ["PATH"], "TEST_ARCH": architecture,
                      "TEST_LOG": str(log), "TEST_FAILURE": failure, "TEST_FALLBACK_FAILURE": str(int(fallback_failure)),
                      "TEST_INSTALL_FAILURE": str(int(install_failure)), "TEST_NORMAL_STATUS": str(normal_status),
-                     "TEST_DNS_FAILURE": str(int(dns_failure))}, capture_output=True, text=True, timeout=15)
+                     "TEST_DNS_FAILURE": str(int(dns_failure)), "TEST_DOWNLOAD_FAILURE": download_failure},
+                capture_output=True, text=True, timeout=15)
             commands = [json.loads(line) for line in log.read_text().splitlines()]
             sources = list(root.glob("target/independent-linux/ci-apt/run.*/fallback.sources"))
             return result.returncode, commands, [path.read_text() for path in sources]
@@ -96,7 +99,8 @@ sys.exit(0)
     def test_normal_success_never_uses_fallback(self):
         rc, commands, sources = self.run_case()
         self.assertEqual(rc, 0)
-        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(commands), 3)
+        self.assertIn('--download-only', commands[1])
         self.assertEqual(sources, [])
 
     def test_dns_failure_retries_signed_override_for_update_and_install(self):
@@ -133,6 +137,18 @@ sys.exit(0)
     def test_fallback_or_install_failure_stays_failure(self):
         self.assertEqual(self.run_case("Could not resolve host", fallback_failure=True)[0], 100)
         self.assertEqual(self.run_case(install_failure=True)[0], 100)
+
+    def test_stalled_download_uses_signed_mirror_before_install(self):
+        rc, commands, sources = self.run_case(download_failure="Get:1 http://us-east-2.ec2.archive.ubuntu.com/ubuntu noble gcc")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(commands), 4)
+        self.assertIn('--download-only', commands[1])
+        self.assertTrue(all(any("Dir::Etc::sourcelist=" in arg for arg in cmd) for cmd in commands[2:]))
+        self.assertEqual(len(sources), 1)
+        rc, commands, sources = self.run_case(download_failure="Get:1 http://archive.example/ubuntu\nHash Sum mismatch")
+        self.assertEqual(rc, 124)
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(sources, [])
 
 
 if __name__ == "__main__":
