@@ -143,6 +143,7 @@ export function validateManifest(manifest) {
       backendAsset: validateAsset(runtime.backendAsset, `${field}.backendAsset`),
       rootfsAsset: validateAsset(runtime.rootfsAsset, `${field}.rootfsAsset`),
       nodeAsset: validateAsset(runtime.nodeAsset, `${field}.nodeAsset`),
+      ...(runtime.rootfsCandidateHandoff === true ? { rootfsCandidateHandoff: true } : {}),
     });
   });
   const ids = new Set();

@@ -150,6 +150,9 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((self.root / "linux-release.json").read_text())
         self.assertEqual(manifest["minMobileVersion"], "0.0.0")
+        runtimes = {item["architecture"]: item for item in manifest["runtimes"]}
+        self.assertIs(runtimes["arm64"]["rootfsCandidateHandoff"], True)
+        self.assertNotIn("rootfsCandidateHandoff", runtimes["x64"])
         self.assertEqual([r["architecture"] for r in manifest["runtimes"]], ["arm64", "x64"])
         self.assertEqual(len((self.root / "SHA256SUMS").read_text().splitlines()), 16)
 
