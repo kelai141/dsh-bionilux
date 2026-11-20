@@ -84,6 +84,7 @@ manifest = {
         "label": f"Debian 13 (trixie) for {label}",
         "architecture": runtime_arch,
         "backend": "bionilux",
+        **({"rootfsCandidateHandoff": True} if runtime_arch == "arm64" else {}),
         "backendAsset": describe(f"bionilux-backend-{asset_arch}.tar.xz"),
         "rootfsAsset": describe(f"debian-minimal-{asset_arch}.tar.xz"),
         "nodeAsset": describe(f"node-glibc-v{node_version}-linux-{node_arch}.tar.xz"),

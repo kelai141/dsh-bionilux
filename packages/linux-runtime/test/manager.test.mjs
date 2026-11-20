@@ -386,6 +386,49 @@ test('install stages, proves health, then activates the runtime', async () => {
   assert.deepEqual(io.stats.extracts.sort(), ['backend', 'node', 'rootfs']);
 });
 
+test('an opted-in install claims a verified rootfs within the normal install transaction', async () => {
+  const fixture = makeManifest();
+  const runtime = fixture.manifest.runtimes[0];
+  const candidateId = '12345678-1234-4123-8123-123456781234';
+  const { extractArchive } = makeIo(fixture);
+  const claims = [];
+  const { manager, io } = makeManager(fixture, {
+    dataDir: tempDir(),
+    claimRootfsCandidate: async (id, asset, destination) => {
+      claims.push({ id, asset });
+      await extractArchive(null, destination, { kind: 'rootfs' });
+    },
+  });
+  await assert.rejects(
+    manager.installFromRootfsCandidate(fixture.manifest, runtime.id, candidateId),
+    /does not allow rootfs candidate handoff/,
+  );
+  assert.deepEqual(claims, []);
+  runtime.rootfsCandidateHandoff = true;
+  const status = await manager.installFromRootfsCandidate(fixture.manifest, runtime.id, candidateId);
+  assert.equal(status.healthy, true);
+  assert.deepEqual(claims, [{ id: candidateId, asset: runtime.rootfsAsset }]);
+  assert.deepEqual(io.stats.extracts.sort(), ['backend', 'node']);
+});
+
+test('a failed rootfs claim preserves the previous active instance', async () => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, {
+    dataDir: tempDir(),
+    claimRootfsCandidate: async () => { throw new Error('candidate verification failed'); },
+  });
+  const first = await manager.install(fixture.manifest);
+  const next = makeManifest({ version: '1.1.0' }).manifest;
+  next.runtimes[0].rootfsCandidateHandoff = true;
+  await assert.rejects(
+    manager.installFromRootfsCandidate(next, next.runtimes[0].id, '12345678-1234-4123-8123-123456781234'),
+    /candidate verification failed/,
+  );
+  const actual = manager.status();
+  assert.equal(actual.instanceId, first.instanceId);
+  assert.equal(actual.version, first.version);
+});
+
 test('a failing install leaves the previous active runtime untouched', async () => {
   const dataDir = tempDir();
   const good = makeManifest();

@@ -885,6 +885,7 @@ export class LinuxRuntimeManager {
     if (typeof this.fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
     this.downloadAsset = options.downloadAsset;
     this.extractArchive = options.extractArchive;
+    this.claimRootfsCandidate = options.claimRootfsCandidate;
     this.runCommand = options.runCommand ?? spawnCommand;
     if (typeof this.runCommand !== 'function') throw new TypeError('runCommand must be a function');
     // The host app passes ApplicationInfo.nativeLibraryDir here. It is the only
@@ -1909,9 +1910,22 @@ export class LinuxRuntimeManager {
     return this._exclusive(() => this._installLocked(manifest, runtimeId, { preserveGuestHome }));
   }
 
-  async _installLocked(manifest, runtimeId, { preserveGuestHome = true } = {}) {
+  async installFromRootfsCandidate(manifest, runtimeId, candidateId) {
+    if (typeof this.claimRootfsCandidate !== 'function') {
+      throw new Error('Rootfs candidate handoff requires a host claim handler');
+    }
+    if (typeof candidateId !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(candidateId)) {
+      throw new TypeError('Invalid rootfs candidate identifier');
+    }
+    return this._exclusive(() => this._installLocked(manifest, runtimeId, { candidateId }));
+  }
+
+  async _installLocked(manifest, runtimeId, { preserveGuestHome = true, candidateId } = {}) {
     if (this.disposed) throw new Error('manager is disposed');
     const selection = selectRuntime(manifest, runtimeId, this.arch);
+    if (candidateId !== undefined && selection.runtime.rootfsCandidateHandoff !== true) {
+      throw new Error('The selected runtime does not allow rootfs candidate handoff');
+    }
     await this._ensureDirectories();
     const previous = this._readActive();
     const instanceId = makeId(runtimeId);
@@ -1940,12 +1954,16 @@ export class LinuxRuntimeManager {
         instance.backend,
         'backend',
       );
-      await this._materialize(
-        selection.runtime.rootfsAsset,
-        path.join(staging, 'rootfs.archive'),
-        instance.rootfs,
-        'rootfs',
-      );
+      if (candidateId === undefined) {
+        await this._materialize(
+          selection.runtime.rootfsAsset,
+          path.join(staging, 'rootfs.archive'),
+          instance.rootfs,
+          'rootfs',
+        );
+      } else {
+        await this.claimRootfsCandidate(candidateId, selection.runtime.rootfsAsset, instance.rootfs);
+      }
       await this._prepareRootfs(instance);
       await this._prepareHostPaths(instance.rootfs, [nodeResult.node]);
       if (previous && preserveGuestHome) {

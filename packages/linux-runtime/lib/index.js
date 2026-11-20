@@ -334,6 +334,7 @@ export async function apply(ctx, config = {}) {
       arch: config.arch,
       downloadAsset: config.downloadAsset ?? config.linuxAssetIO?.downloadAsset,
       extractArchive: config.extractArchive ?? config.linuxAssetIO?.extractArchive,
+      claimRootfsCandidate: config.linuxAssetIO?.claimRootfsCandidate,
       fetchImpl: config.fetchImpl,
       runCommand: config.runCommand,
       onStateChange: config.onStateChange,
