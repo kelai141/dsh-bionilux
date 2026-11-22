@@ -86,6 +86,10 @@ Bionilux、rootfs 与一份共享的 glibc Node.js 包都以带校验和的 Rele
 宿主的 Bionic Node 与 Termux Bash 保持不变。rootfs 提供的是 Debian/glibc **运行环境
 支持**，不是安全沙箱。
 
+Android 初始化会固定 `libc6` 和 `libc-bin`，以保留运行时对 glibc 的适配。新 rootfs 从同一份
+Debian 快照准备 `libc6-dev`，使 GCC 安装可以复用匹配的头文件。采用较旧 rootfs 的实例，
+如果滚动镜像已经移除匹配版本，请先备份项目，再通过 Linux 环境管理更新 rootfs。
+
 ## guest 路径语义
 
 * 只有绝对路径会被重写；已经在 rootfs 内的路径原样保留，因此不会被重复加前缀。
