@@ -38,9 +38,9 @@
 // silently doing nothing would move the failure back to a "Bad system call"
 // nobody can place.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 /** Records which libc digest is patched, so a repeated ensure costs one read. */
@@ -147,11 +147,21 @@ export async function ensureGuestLibcSeccompPatch(rootfs, options = {}) {
   if (!existsSync(libc)) {
     return { status: 'skipped', path: libc, reason: 'guest libc is not present' };
   }
-  const original = await readFile(libc);
+  const target = await realpath(libc);
+  const root = await realpath(rootfs);
+  if (!target.startsWith(root + path.sep)) throw new Error('guest libc resolves outside the rootfs');
+  const identity = await stat(target, { bigint: true });
+  const original = await readFile(target);
   const digest = digestOf(original);
   const markerPath = path.join(rootfs, ...MARKER);
+  const markerDirectory = path.dirname(markerPath);
+  await mkdir(markerDirectory, { recursive: true });
+  if (await realpath(markerDirectory) !== path.join(root, ...MARKER.slice(0, -1))) {
+    throw new Error('guest libc marker directory resolves through a symlink');
+  }
   const readMarker = async () => {
     try {
+      if (await realpath(markerPath) !== path.join(root, ...MARKER)) return null;
       return JSON.parse(await readFile(markerPath, 'utf8'));
     } catch {
       return null;
@@ -169,17 +179,30 @@ export async function ensureGuestLibcSeccompPatch(rootfs, options = {}) {
       reason: 'no set_robust_list/rseq call site matched; the guest libc changed shape',
     };
   }
-  await writeFile(libc, buffer);
-  await mkdir(path.join(rootfs, ...MARKER.slice(0, -1)), { recursive: true });
-  await writeFile(
-    markerPath,
-    JSON.stringify({
+  const suffix = '.' + randomUUID() + '.tmp';
+  const stagedLibc = target + suffix;
+  const stagedMarker = markerPath + suffix;
+  try {
+    await writeFile(stagedLibc, buffer, { flag: 'wx', mode: Number(identity.mode & 0o777n) });
+    await writeFile(stagedMarker, JSON.stringify({
       schemaVersion: 1,
       originalDigest: digest,
       patchedDigest: digestOf(buffer),
       sites: sites.map((site) => ({ offset: site.offset, syscall: site.syscall, name: site.name })),
-    }, null, 2) + '\n',
-  );
+    }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    const current = await stat(target, { bigint: true });
+    if (current.ino !== identity.ino || current.dev !== identity.dev || current.ctimeNs !== identity.ctimeNs) {
+      throw new Error('guest libc changed during compatibility preparation; retry after the package operation finishes');
+    }
+    // Publish the expected digest first. An interrupted rename leaves the
+    // original libc available for another attempt.
+    await rename(stagedMarker, markerPath);
+    // Existing processes may still map the previous inode.
+    await rename(stagedLibc, target);
+  } finally {
+    await rm(stagedLibc, { force: true });
+    await rm(stagedMarker, { force: true });
+  }
   log('guest libc: answered ' + sites.map((site) => site.name).join(', ') + ' with -ENOSYS');
   return { status: 'patched', path: libc, sites };
 }

@@ -142,8 +142,12 @@ Debian 快照准备 `libc6-dev`，使 GCC 安装可以复用匹配的头文件�
   无需手工追加参数。
 * **`ldconfig` 是静态链接的**，任何 preload 都无法映射它；它会往 Android 只读的 `/etc` 写。
   Android 安装流程通过 `dpkg-divert` 保留原程序，并安装路径适配器，使用真实 `ldconfig`
-  在 guest 内生成和读取缓存；该适配会在 libc-bin 更新时保留。
-* **静态二进制**完全在 `LD_PRELOAD` 触及范围之外。
+  生成和读取缓存。安装阶段由 Android 宿主 shell 整理路径，只把动态缓存写入器交给
+  guest 加载器。缓存生成失败时保留原有运行时并报告退出码。该适配会在 libc-bin 更新时保留。
+* **静态二进制**完全在 `LD_PRELOAD` 触及范围之外。Android 应用私有目录中的 ARM64
+  静态 `ET_EXEC` 和无 `PT_INTERP` 的 static PIE 无法经 guest 动态加载器启动。
+  编译原生工具时使用带 guest 解释器的动态 PIE。只有 x86-64 版本的工具可尝试走随 ARM64
+  后端提供的 Box64，例如 SDK Build Tools。Box64 所需的 x86-64 库必须在 guest 中可用。
 
 全新 rootfs 在使用前还需要先跑 `scripts/prepare-rootfs.sh`：它重写 Debian rootfs 里那些
 **绝对**符号链接，否则内核会相对*宿主*根去解析——这正是 `/usr/bin/awk` 与

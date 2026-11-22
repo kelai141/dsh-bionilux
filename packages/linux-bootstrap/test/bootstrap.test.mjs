@@ -143,6 +143,21 @@ test('a failed activation is rolled back without leaving the service reporting a
   assert.match(status.error, /runtime status is unavailable/)
 })
 
+test('status verifies a live runtime instead of returning its stale healthy value', async () => {
+  let current = { healthy: true, state: 'healthy' }
+  const value = harness({ hostReturnsManager: false, managerProvider: async () => ({
+    install: async () => {},
+    uninstall: async () => {},
+    status: () => ({ healthy: true, state: 'healthy' }),
+    verify: async () => current,
+  }) })
+  await value.service.install({ confirmed: true, activate: true })
+  assert.equal((await value.service.status()).runtime.healthy, true)
+  current = { healthy: false, state: 'unhealthy', reason: 'runtime probe failed (exit 159): guest-id' }
+  assert.deepEqual((await value.service.status()).runtime, current)
+  assert.deepEqual((await createRouteHandlers(value.service).status()).runtime, current)
+})
+
 test('mobile-version delta triggers automatic check/install once; enabling toggle does not check', async () => {
   const value = harness()
   await value.service.ready

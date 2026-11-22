@@ -1201,13 +1201,13 @@ export class LinuxRuntimeManager {
   /** Prove bash itself, child-process rerouting and the shared Node all work. */
   async _probeRuntime(paths, { timeoutMs = this.probeTimeoutMs } = {}) {
     const command = [
-      'fail() { printf "bionilux-probe: %s\\n" "$*" >&2; exit 1; }',
-      '[ -n "$BASH_VERSION" ] || fail bash-builtin',
-      'uid=$(/usr/bin/id -u) || fail guest-id',
-      '[ "$uid" = 0 ] || fail "guest-uid uid=$uid expected=0"',
-      '/usr/bin/uname -m >/dev/null || fail guest-uname',
-      '/usr/bin/ls / >/dev/null || fail guest-root-list',
-      'node --version >/dev/null || fail guest-node',
+      'fail() { status=$1; shift; printf "bionilux-probe: %s\\n" "$*" >&2; exit "$status"; }',
+      '[ -n "$BASH_VERSION" ] || fail $? bash-builtin',
+      'uid=$(/usr/bin/id -u) || fail $? guest-id',
+      '[ "$uid" = 0 ] || fail $? "guest-uid uid=$uid expected=0"',
+      '/usr/bin/uname -m >/dev/null || fail $? guest-uname',
+      '/usr/bin/ls / >/dev/null || fail $? guest-root-list',
+      'node --version >/dev/null || fail $? guest-node',
       "printf '%s\n' '" + PROBE_MARKER + "'",
     ].join('; ');
     const start = launchArgv(paths.launcher, ['/bin/bash', '--noprofile', '--norc', '-c', command]);
@@ -1255,9 +1255,8 @@ export class LinuxRuntimeManager {
 
   /** Caller holds a shared (verify/execute) or exclusive (install) permit. */
   async _verifyLocked({ force = false } = {}) {
-    const state = this.status();
     const record = this._readActive();
-    if (!record || !state.paths) return state;
+    if (!record) return this.status();
     const health = this._healthForRecord(record);
     if (!health.healthy) return this.status();
     let key;
@@ -1267,16 +1266,30 @@ export class LinuxRuntimeManager {
       return this.status();
     }
     if (!force && this._probeVerdict?.key === key && Date.now() - this._probeVerdict.checkedAt < PROBE_CACHE_MS) {
-      return state;
+      return this.status();
     }
     if (!this._probePending || this._probePending.key !== key) {
       const promise = (async () => {
-        const verdict = await this._probeRuntime(health.paths);
+        let verdict;
+        let verifiedKey = key;
+        try {
+          if (process.platform === 'android' && this.arch === 'arm64') {
+            const patch = await ensureGuestLibcSeccompPatch(health.paths.rootfs, { architecture: this.arch });
+            if (patch.status !== 'patched' && patch.status !== 'already') throw new Error(patch.reason);
+            verifiedKey = this._probeKey(record, health.paths);
+            if (this._probePending?.promise === promise) this._probePending.key = verifiedKey;
+          }
+          verdict = await this._probeRuntime(health.paths);
+        } catch (error) {
+          const reason = 'guest libc compatibility check failed: ' + error.message;
+          verdict = { ok: false, reason };
+          await this._writeProbeFailure(reason, {});
+        }
         // Do not publish a verdict about files changed during the probe.
         let currentKey;
         try { currentKey = this._probeKey(record, health.paths); } catch { /* Files are being replaced. */ }
-        if (this._probePending?.key === key && key === currentKey) {
-          this._probeVerdict = { key, checkedAt: Date.now(), ...verdict };
+        if (this._probePending?.promise === promise && verifiedKey === currentKey) {
+          this._probeVerdict = { key: verifiedKey, checkedAt: Date.now(), ...verdict };
           this._emitState();
         }
       })();
@@ -1516,7 +1529,8 @@ export class LinuxRuntimeManager {
     const environment = cleanHostEnvironment();
     // Drop any Termux bin directory the caller may have put on PATH: those
     // entries are unresolvable by this process's exec policy (see above).
-    environment.PATH = withoutUnrunnableBinDirectories(environment.PATH, this.dataDir);
+    environment.PATH = process.platform === 'android'
+      ? DEFAULT_HOST_PATH : withoutUnrunnableBinDirectories(environment.PATH, this.dataDir);
     // Guest programs are glibc binaries whose interpreter is /lib/ld-linux-*.so,
     // and the launcher starts them by execve, so that interpreter must itself be
     // executable. The rootfs copy never is (app_data_file), which is why the
@@ -1640,9 +1654,8 @@ export class LinuxRuntimeManager {
     }
     const args = [script, '--rootfs', instance.rootfs, '--relative-links'];
     if (dns.servers.length > 0) args.push('--dns', dns.servers.join(' '));
-    // Host preparation runs Termux tools, not guest programs. It needs the host
-    // loader path (for example libandroid-glob) and must not reuse the guest's
-    // clean environment. Guest execute remains cleanHostEnvironment-based.
+    // Android preparation uses system tools. Termux executables under app
+    // data are unavailable here because the host loader hooks are absent.
     const hostEnvironment = this._hostToolEnvironment();
     const result = normaliseCommandResult(
       await this._runManaged({
@@ -1684,6 +1697,7 @@ export class LinuxRuntimeManager {
     }
     await this._prepareHostPaths(instance.rootfs, [instance.rootfs]);
     const hostEnvironment = this._hostToolEnvironment();
+    hostEnvironment.BIONILUX_HOST_SHELL = HOST_SCRIPT_INTERPRETER;
     const compatibilityScript = path.join(instance.backend, 'scripts', 'prepare-android-rootfs.sh');
     if (!fileExists(compatibilityScript)) {
       throw new Error('Android backend is missing prepare-android-rootfs.sh; install matching runtime assets');

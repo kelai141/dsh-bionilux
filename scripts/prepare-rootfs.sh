@@ -60,6 +60,8 @@ ROOTFS="$(cd "$ROOTFS" && pwd -P)"
 ROOTFS="${ROOTFS%/}"
 
 # Capture find's status before entering a pipeline: unreadable trees must fail.
+# Use a shell here-document below so a large tree never becomes one printf
+# argument on Android shells that dispatch printf to a separate executable.
 links=$(find "$ROOTFS" -type l) || exit 1
 # Normalise components without consulting the host filesystem. In particular,
 # /../../etc names the guest's /etc, never a parent of the physical rootfs.
@@ -119,12 +121,14 @@ desired_link_target() {
 }
 
 count_pending_links() {
-    printf '%s\n' "$links" | while IFS= read -r link; do
+    while IFS= read -r link; do
         [ -n "$link" ] || continue
         target=$(readlink "$link") || exit 1
         wanted=$(desired_link_target "$link" "$target") || exit 1
         [ "$wanted" = "$target" ] || echo "$link"
-    done | wc -l
+    done <<EOF | wc -l
+$links
+EOF
 }
 
 echo "== absolute symlinks under $ROOTFS"
@@ -134,13 +138,15 @@ if [ "$VERIFY" = 1 ]; then
 elif [ "$DRY" = 1 ]; then
     echo "would rewrite $before absolute link(s) (mode: $MODE)"
 else
-    printf '%s\n' "$links" | while IFS= read -r link; do
+    while IFS= read -r link; do
         [ -n "$link" ] || continue
         target=$(readlink "$link") || exit 1
         new_target=$(desired_link_target "$link" "$target") || exit 1
         [ "$target" != "$new_target" ] || continue
         ln -sfn "$new_target" "$link" || exit 1
-    done
+    done <<EOF
+$links
+EOF
     after=$(count_pending_links)
     [ "$after" -eq 0 ] || { echo "NEEDS-FIX $after link(s) still need rewriting" >&2; exit 1; }
     echo "rewrote $before link(s); pending links now: $after"

@@ -67,6 +67,20 @@ fi
 grep -q 'bionilux-ldconfig-adapter-v1' "$distrib" 2>/dev/null && \
     die "$distrib is an adapter, not the real ldconfig; reinstall libc-bin"
 
+run_ldconfig() {
+    if [ -n "${BIONILUX_LDCONFIG_HOST_LAUNCHER:-}" ]; then
+        [ "$distrib" = "$helper" ] || die 'host-launched ldconfig requires the bundled helper'
+        set -- "$BIONILUX_LDCONFIG_HOST_LAUNCHER" --rootfs "$rootfs" /usr/libexec/bionilux/ldconfig "$@"
+        if [ -n "${BIONILUX_LDCONFIG_HOST_LINKER:-}" ]; then
+            set -- "$BIONILUX_LDCONFIG_HOST_LINKER" "$@"
+        fi
+        BIONILUX_FAKE_ROOT=1 BIONILUX_ANDROID_PATHS=1 \
+            BIONILUX_LDCONFIG_HOST_LAUNCHER= BIONILUX_LDCONFIG_HOST_LINKER= "$@"
+    else
+        "$distrib" "$@"
+    fi
+}
+
 cache=
 conf=
 print_cache=0
@@ -77,7 +91,7 @@ while [ $# -gt 0 ]; do
     arg=$1
     case $arg in
         --) shift; [ $# -eq 0 ] || die 'positional library directories are not supported' ;;
-        --help|--usage|--version) "$distrib" "$arg"; exit $? ;;
+        --help|--usage|--version) run_ldconfig "$arg"; exit $? ;;
         --print-cache) print_cache=1; shift ;;
         --ignore-aux-cache) flags="$flags -i"; shift ;;
         --verbose) flags="$flags -v"; shift ;;
@@ -171,7 +185,7 @@ trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
 if [ "$print_cache" = 1 ]; then
-    "$distrib" -p -C "$cache_phys"
+    run_ldconfig -p -C "$cache_phys"
     exit $?
 fi
 
@@ -263,6 +277,6 @@ fi
 
 # The real binary records physical paths.  Those are what the guest's loader
 # resolves after the preload maps /lib/... to the same files.
-"$distrib" $flags -i -X -C "$cache_phys" -f "$tmp_conf"
+run_ldconfig $flags -i -X -C "$cache_phys" -f "$tmp_conf"
 status=$?
 exit "$status"

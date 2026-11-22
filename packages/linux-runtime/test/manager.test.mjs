@@ -1498,6 +1498,39 @@ test('restored instances require proof; cache expires, failures recover and chan
   await manager.dispose();
 });
 
+test('live Android verification repairs replaced ARM64 libc before sharing a new probe', async (t) => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  const installed = await manager.install(fixture.manifest);
+  const library = path.join(installed.paths.rootfs, 'usr', 'lib', 'aarch64-linux-gnu');
+  await mkdir(library, { recursive: true });
+  const libc = path.join(library, 'libc.so.6');
+  const unpatched = Buffer.alloc(8);
+  unpatched.writeUInt32LE(0xd2800c68, 0); // mov x8, #99
+  unpatched.writeUInt32LE(0xd4000001, 4); // svc #0
+  await writeFile(libc, unpatched);
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { ...platform, value: 'android' });
+  t.after(async () => {
+    Object.defineProperty(process, 'platform', platform);
+    await manager.dispose();
+  });
+  let probes = 0;
+  manager._probeRuntime = async () => {
+    probes += 1;
+    assert.equal((await readFile(libc)).readUInt32LE(4), 0x928004a0);
+    return { ok: true };
+  };
+  const results = await Promise.all([manager.verify(), manager.verify(), manager.verify()]);
+  assert.ok(results.every(({ healthy }) => healthy));
+  assert.equal(probes, 1);
+  await writeFile(libc, Buffer.alloc(8));
+  const failed = await manager.verify();
+  assert.equal(failed.healthy, false);
+  assert.match(failed.reason, /guest libc compatibility check failed: .*changed shape/);
+  assert.equal(probes, 1);
+});
+
 test('concurrent verification shares one managed probe and uninstall drains it first', async () => {
   const fixture = makeManifest();
   const { manager } = makeManager(fixture, { dataDir: tempDir() });

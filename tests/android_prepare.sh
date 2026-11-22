@@ -171,7 +171,9 @@ case $cmd in
             exit 126
         fi
         exec "$DPKG_STUB_ROOT$cmd" "$@" ;;
-    /usr/sbin/ldconfig) BIONILUX_ROOTFS=$DPKG_STUB_ROOT exec "$DPKG_STUB_ROOT/usr/sbin/ldconfig" "$@" ;;
+    /usr/sbin/ldconfig)
+        [ "${DPKG_STUB_REJECT_ADAPTER:-0}" != 1 ] || { echo 'Bad system call' >&2; exit 159; }
+        BIONILUX_ROOTFS=$DPKG_STUB_ROOT exec "$DPKG_STUB_ROOT/usr/sbin/ldconfig" "$@" ;;
     *) exec "$DPKG_STUB_ROOT$cmd" "$@" ;;
 esac
 LAUNCH
@@ -196,7 +198,11 @@ reject env DPKG_STUB_REJECT_LDCONFIG=1 sh "$PREPARE" --rootfs "$ROOT" --launcher
 grep -q 'ldconfig: fixture execution denied' "$WORK/rejected.log"
 grep -q 'ldconfig backend failed (exit 126)' "$WORK/rejected.log"
 
-DPKG_STUB_REJECT_LDCONFIG=1 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB" \
+reject env DPKG_STUB_REJECT_ADAPTER=1 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB"
+grep -q 'failed to build the guest cache (exit 159)' "$WORK/rejected.log"
+
+DPKG_STUB_REJECT_LDCONFIG=1 DPKG_STUB_REJECT_ADAPTER=1 \
+    sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB" \
     --ldconfig-helper /usr/sbin/ldconfig >/dev/null
 cmp /usr/sbin/ldconfig "$ROOT/usr/libexec/bionilux/ldconfig"
 grep -aq 'libbnfixture\.so\.1' "$ROOT/etc/ld.so.cache"

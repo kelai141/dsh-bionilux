@@ -151,9 +151,15 @@ files and external workspaces remain on disk.
 On Android, installation holds the guest packages \`libc6\` and \`libc-bin\` to preserve the Android-prepared glibc. Update them by installing a compatible runtime release. A failed execution probe records the most recent bounded launcher output in \`logs/last-probe-failure.json\` under the private runtime directory.
 
 On Android, installation also prepares DNS and a locally diverted `ldconfig`
-adapter after the rootfs reaches its final path. The adapter invokes the
-original static program to generate a real guest cache, retains the diversion
-across package upgrades, and rejects unsupported arguments explicitly.
+adapter after the rootfs reaches its final path. With the bundled dynamic
+helper, the Android host shell prepares the paths and runs the cache writer via
+the guest launcher. The adapter retains the diversion across package upgrades
+and rejects unsupported arguments explicitly.
+
+The live manager checks the ARM64 guest libc again before its next execution
+probe when the libc file changes or the probe cache expires. It replaces a
+recognized unpatched libc atomically. Unknown builds surface a health error.
+The active bootstrap status query uses the same verification and its cache.
 
 ## The two shells, as the Agent sees them
 
