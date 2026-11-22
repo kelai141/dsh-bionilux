@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -80,9 +80,17 @@ test('ensure patches again when the libc bytes changed underneath', async () => 
   const root = await rootfsWithLibc(words(NOP, movzX8(99), SVC));
   assert.equal((await ensureGuestLibcSeccompPatch(root, { architecture: 'arm64' })).status, 'patched');
   // An upgrade replaces the file with an unpatched, different build.
-  await writeFile(guestLibcPath(root), words(NOP, movzX8(99), SVC, NOP, NOP));
-  const again = await ensureGuestLibcSeccompPatch(root, { architecture: 'arm64' });
-  assert.equal(again.status, 'patched');
+  const replacement = words(NOP, movzX8(99), SVC, NOP, NOP);
+  await writeFile(guestLibcPath(root), replacement);
+  const previous = await open(guestLibcPath(root), 'r');
+  try {
+    const again = await ensureGuestLibcSeccompPatch(root, { architecture: 'arm64' });
+    assert.equal(again.status, 'patched');
+    assert.deepEqual(await previous.readFile(), replacement);
+    assert.equal((await readFile(guestLibcPath(root))).readUInt32LE(8), MOVN_X0_ENOSYS);
+  } finally {
+    await previous.close();
+  }
 });
 
 test('ensure refuses to guess when no call site matches', async () => {

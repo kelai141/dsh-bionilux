@@ -206,13 +206,14 @@ test('healthy proof refreshes retain tool identities and their persistent sessio
     const listed = await session.execute({ action: 'list' });
     assert.deepEqual(listed.sessions, [{ session: 'retained', running: true }]);
     fixture.setHealth(false);
-    assert.equal(fixture.registered.size, 0, 'failed health must withdraw both tools');
-    assert.equal(registry.disposed, true);
-    assert.equal(closed, 1);
+    assert.equal(fixture.registered.get('linux_bash'), bash);
+    assert.equal(fixture.registered.get('linux_session'), session);
+    assert.equal(registry.disposed, false);
+    assert.equal(closed, 0);
     fixture.setHealth(true);
-    assert.equal(fixture.registrations.length, 4, 'recovery creates one fresh tool pair');
-    assert.notEqual(fixture.registered.get('linux_bash'), bash);
-    assert.notEqual(fixture.registered.get('linux_session'), session);
+    assert.equal(fixture.registrations.length, 2, 'recovery keeps the same tool pair');
+    assert.equal(fixture.registered.get('linux_bash'), bash);
+    assert.equal(fixture.registered.get('linux_session'), session);
   } finally {
     SessionRegistry.prototype.run = originalRun;
     fixture.cleanup();
@@ -232,13 +233,17 @@ test('unloading during delayed proof cannot publish late tools or a service', as
   assert.deepEqual(fixture.published, []);
 });
 
-test('a failed execution verdict remains inspectable without exposing Linux tools', async () => {
+test('a failed execution verdict leaves stable tools and a diagnostic', async () => {
   const fixture = delayedActivation();
   try {
     fixture.finishProof(false);
     await fixture.pending;
-    assert.equal(fixture.registrations.length, 0);
-    assert.equal(fixture.registered.size, 0);
+    assert.equal(fixture.registrations.length, 2);
+    fixture.manager.verify = async () => fixture.manager.status();
+    await assert.rejects(
+      fixture.registered.get('linux_session').execute({ action: 'open' }),
+      /Linux runtime is unavailable: probe failed/,
+    );
     assert.equal(fixture.manager.status().healthy, false);
     assert.deepEqual(fixture.published, [{ name: 'linuxRuntimeManager', service: fixture.manager }]);
   } finally { fixture.cleanup(); }

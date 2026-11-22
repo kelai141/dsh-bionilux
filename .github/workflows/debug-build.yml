@@ -313,9 +313,11 @@ jobs:
             "$DEBIAN_SNAPSHOT/dists/$DEBIAN_SUITE/InRelease" -o "$snapshot_release"
           echo "$DEBIAN_INRELEASE_SHA256  $snapshot_release" | sha256sum --check --strict
           gpgv --keyring "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" "$snapshot_release"
+          # Android preparation holds the patched libc. Include the matching headers now,
+          # since the rolling Debian mirror may later carry only a newer libc6-dev.
           sudo timeout --signal=TERM --kill-after=30s 1500s debootstrap --arch="$DEBIAN_ARCHITECTURE" --foreign --variant=minbase \
             --keyring="$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" \
-            --include=apt,bash,ca-certificates,curl,debian-archive-keyring,libstdc++6,unzip \
+            --include=apt,bash,ca-certificates,curl,debian-archive-keyring,libc6-dev,libstdc++6,unzip \
             --components=main "$DEBIAN_SUITE" "$rootfs" "$DEBIAN_SNAPSHOT"
           if [[ "$CROSS_ARCH" == "true" ]]; then
             sudo install -m 755 /usr/bin/qemu-aarch64-static "$rootfs/usr/bin/qemu-aarch64-static"
@@ -330,6 +332,9 @@ jobs:
           trap cleanup_mounts EXIT
           sudo timeout --signal=TERM --kill-after=30s 1500s chroot "$rootfs" /debootstrap/debootstrap --second-stage
           test "$(sudo chroot "$rootfs" dpkg --print-architecture)" = "$DEBIAN_ARCHITECTURE"
+          libc_version="$(sudo chroot "$rootfs" dpkg-query -W -f='${Version}' libc6)"
+          test -n "$libc_version"
+          test "$(sudo chroot "$rootfs" dpkg-query -W -f='${Version}' libc6-dev)" = "$libc_version"
           grep -q '^VERSION_CODENAME=trixie$' "$rootfs/etc/os-release"
           for program in bash apt-get curl dpkg dpkg-divert find grep readlink sed unzip; do
             elf="$rootfs/usr/bin/$program"

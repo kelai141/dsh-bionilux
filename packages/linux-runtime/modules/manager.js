@@ -21,7 +21,7 @@ import { defaultRuntimeIdForArch, resolveHostArchitecture, selectRuntime } from 
 import { assertOfficialAssetUrl, isAllowedAssetOrigin } from './asset-installer.js';
 import { ProcessScope } from './process-scope.js';
 import { assertResolvConfWritable, inspectResolvConf, resolveDnsServers } from './dns-config.js';
-import { ensureGuestLibcSeccompPatch } from './libc-seccomp-patch.js';
+import { ensureGuestLibcSeccompPatch, guestLibcPath } from './libc-seccomp-patch.js';
 import { ensureGuestStaticSeccompPatch } from './static-seccomp-patch.js';
 
 const ACTIVE_SCHEMA_VERSION = 1;
@@ -1125,6 +1125,13 @@ export class LinuxRuntimeManager {
   _probeKey(record, paths) {
     const files = [paths.launcher, paths.preload, path.join(paths.node, 'bin', 'node'),
       ...ROOTFS_REQUIRED_FILES.map((relative) => resolveRootfsTarget(paths.rootfs, path.join(paths.rootfs, relative)))];
+    if (process.platform === 'android' && this.arch === 'arm64') {
+      files.push(guestLibcPath(paths.rootfs));
+    }
+    for (const relative of ROOTFS_LOADER_CANDIDATES[this.arch]) {
+      const loader = inspectRootfsObject(paths.rootfs, relative);
+      if (loader.regular) files.push(resolveRootfsTarget(paths.rootfs, path.join(paths.rootfs, relative)));
+    }
     const identities = files.map((file) => {
       const stat = statSync(file, { bigint: true });
       return [String(stat.dev), String(stat.ino), String(stat.size), String(stat.mtimeNs), String(stat.ctimeNs)];
@@ -1194,12 +1201,13 @@ export class LinuxRuntimeManager {
   /** Prove bash itself, child-process rerouting and the shared Node all work. */
   async _probeRuntime(paths, { timeoutMs = this.probeTimeoutMs } = {}) {
     const command = [
-      'set -e',
-      '[ -n "$BASH_VERSION" ]',
-      '[ "$(/usr/bin/id -u)" = 0 ]',
-      '/usr/bin/uname -m >/dev/null',
-      '/usr/bin/ls / >/dev/null',
-      'node --version >/dev/null',
+      'fail() { status=$1; shift; printf "bionilux-probe: %s\\n" "$*" >&2; exit "$status"; }',
+      '[ -n "$BASH_VERSION" ] || fail $? bash-builtin',
+      'uid=$(/usr/bin/id -u) || fail $? guest-id',
+      '[ "$uid" = 0 ] || fail $? "guest-uid uid=$uid expected=0"',
+      '/usr/bin/uname -m >/dev/null || fail $? guest-uname',
+      '/usr/bin/ls / >/dev/null || fail $? guest-root-list',
+      'node --version >/dev/null || fail $? guest-node',
       "printf '%s\n' '" + PROBE_MARKER + "'",
     ].join('; ');
     const start = launchArgv(paths.launcher, ['/bin/bash', '--noprofile', '--norc', '-c', command]);
@@ -1209,40 +1217,79 @@ export class LinuxRuntimeManager {
         file: start.file, args: start.args, cwd: this.dataDir, env: environment,
         timeout: timeoutMs, maxOutputBytes: 16 * 1024,
       }));
-      if (result.timedOut) return { ok: false, reason: 'runtime probe timed out after ' + timeoutMs + ' ms: ' +
-        (firstLine(result.stderr) || firstLine(result.stdout)) };
-      if (result.exitCode !== 0) {
-        return { ok: false, reason: 'runtime probe failed (exit ' + result.exitCode + '): ' +
-          (firstLine(result.stderr) || firstLine(result.stdout)) };
-      }
-      if (result.stdout.trim() !== PROBE_MARKER || result.stdoutTruncated || result.stderrTruncated) {
-        return { ok: false, reason: 'runtime probe did not produce the expected marker: ' + firstLine(result.stdout) };
+      const step = result.stderr.split('\n').find((line) => line.startsWith('bionilux-probe: '));
+      const detail = firstLine(step) || firstLine(result.stderr) || firstLine(result.stdout)
+        || 'launcher or guest shell produced no diagnostic output';
+      const diagnosis = result.timedOut ? 'runtime probe timed out after ' + timeoutMs + ' ms'
+        : result.exitCode !== 0 ? 'runtime probe failed (exit ' + result.exitCode
+          + (result.signal ? ', signal ' + result.signal : '') + ')'
+        : result.stdout.trim() !== PROBE_MARKER || result.stdoutTruncated || result.stderrTruncated
+          ? 'runtime probe did not produce the expected marker' : null;
+      if (diagnosis) {
+        await this._writeProbeFailure(diagnosis, result);
+        return { ok: false, reason: diagnosis + ': ' + detail };
       }
       return { ok: true };
     } catch (error) {
       // Missing launcher/interpreter, permission denial and every spawn error
       // are runtime failures, never a special test-mode success.
-      return { ok: false, reason: 'runtime probe could not start: ' + (error.code ?? error.message) };
+      const reason = 'runtime probe could not start: ' + (error.code ?? error.message);
+      await this._writeProbeFailure(reason, { stderr: error.message });
+      return { ok: false, reason };
+    }
+  }
+
+  async _writeProbeFailure(reason, result) {
+    const logs = path.join(this.dataDir, 'logs');
+    try {
+      await fs.mkdir(logs, { mode: 0o700 }).catch((error) => {
+        if (error.code !== 'EEXIST') throw error;
+      });
+      if (!(await fs.lstat(logs)).isDirectory()) return;
+      await writeFileAtomic(path.join(logs, 'last-probe-failure.json'),
+        JSON.stringify({ time: new Date().toISOString(), reason, ...result }, null, 2) + '\n');
+    } catch {
+      // A logging failure must not hide the original health verdict.
     }
   }
 
   /** Caller holds a shared (verify/execute) or exclusive (install) permit. */
   async _verifyLocked({ force = false } = {}) {
-    const state = this.status();
     const record = this._readActive();
-    if (!record || !state.paths) return state;
+    if (!record) return this.status();
     const health = this._healthForRecord(record);
     if (!health.healthy) return this.status();
-    const key = this._probeKey(record, health.paths);
+    let key;
+    try {
+      key = this._probeKey(record, health.paths);
+    } catch {
+      return this.status();
+    }
     if (!force && this._probeVerdict?.key === key && Date.now() - this._probeVerdict.checkedAt < PROBE_CACHE_MS) {
-      return state;
+      return this.status();
     }
     if (!this._probePending || this._probePending.key !== key) {
       const promise = (async () => {
-        const verdict = await this._probeRuntime(health.paths);
+        let verdict;
+        let verifiedKey = key;
+        try {
+          if (process.platform === 'android' && this.arch === 'arm64') {
+            const patch = await ensureGuestLibcSeccompPatch(health.paths.rootfs, { architecture: this.arch });
+            if (patch.status !== 'patched' && patch.status !== 'already') throw new Error(patch.reason);
+            verifiedKey = this._probeKey(record, health.paths);
+            if (this._probePending?.promise === promise) this._probePending.key = verifiedKey;
+          }
+          verdict = await this._probeRuntime(health.paths);
+        } catch (error) {
+          const reason = 'guest libc compatibility check failed: ' + error.message;
+          verdict = { ok: false, reason };
+          await this._writeProbeFailure(reason, {});
+        }
         // Do not publish a verdict about files changed during the probe.
-        if (key === this._probeKey(record, health.paths)) {
-          this._probeVerdict = { key, checkedAt: Date.now(), ...verdict };
+        let currentKey;
+        try { currentKey = this._probeKey(record, health.paths); } catch { /* Files are being replaced. */ }
+        if (this._probePending?.promise === promise && verifiedKey === currentKey) {
+          this._probeVerdict = { key: verifiedKey, checkedAt: Date.now(), ...verdict };
           this._emitState();
         }
       })();
@@ -1482,7 +1529,8 @@ export class LinuxRuntimeManager {
     const environment = cleanHostEnvironment();
     // Drop any Termux bin directory the caller may have put on PATH: those
     // entries are unresolvable by this process's exec policy (see above).
-    environment.PATH = withoutUnrunnableBinDirectories(environment.PATH, this.dataDir);
+    environment.PATH = process.platform === 'android'
+      ? DEFAULT_HOST_PATH : withoutUnrunnableBinDirectories(environment.PATH, this.dataDir);
     // Guest programs are glibc binaries whose interpreter is /lib/ld-linux-*.so,
     // and the launcher starts them by execve, so that interpreter must itself be
     // executable. The rootfs copy never is (app_data_file), which is why the
@@ -1606,9 +1654,8 @@ export class LinuxRuntimeManager {
     }
     const args = [script, '--rootfs', instance.rootfs, '--relative-links'];
     if (dns.servers.length > 0) args.push('--dns', dns.servers.join(' '));
-    // Host preparation runs Termux tools, not guest programs. It needs the host
-    // loader path (for example libandroid-glob) and must not reuse the guest's
-    // clean environment. Guest execute remains cleanHostEnvironment-based.
+    // Android preparation uses system tools. Termux executables under app
+    // data are unavailable here because the host loader hooks are absent.
     const hostEnvironment = this._hostToolEnvironment();
     const result = normaliseCommandResult(
       await this._runManaged({
@@ -1650,6 +1697,7 @@ export class LinuxRuntimeManager {
     }
     await this._prepareHostPaths(instance.rootfs, [instance.rootfs]);
     const hostEnvironment = this._hostToolEnvironment();
+    hostEnvironment.BIONILUX_HOST_SHELL = HOST_SCRIPT_INTERPRETER;
     const compatibilityScript = path.join(instance.backend, 'scripts', 'prepare-android-rootfs.sh');
     if (!fileExists(compatibilityScript)) {
       throw new Error('Android backend is missing prepare-android-rootfs.sh; install matching runtime assets');

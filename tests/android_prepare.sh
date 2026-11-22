@@ -161,13 +161,19 @@ cat > "$LAUNCHER" <<'LAUNCH'
 cmd=$1; shift
 case $cmd in
     /usr/bin/dpkg-divert) exec "$DPKG_STUB" "$@" ;;
+    /usr/bin/apt-mark)
+        [ "$*" = 'hold libc6 libc-bin' ] || exit 2
+        printf '%s\n' "$*" > "$DPKG_STUB_ROOT/var/lib/dpkg/fixture-holds"
+        ;;
     /usr/sbin/ldconfig.distrib)
         if [ "${DPKG_STUB_REJECT_LDCONFIG:-0}" = 1 ]; then
             printf 'ldconfig: fixture execution denied\n' >&2
             exit 126
         fi
         exec "$DPKG_STUB_ROOT$cmd" "$@" ;;
-    /usr/sbin/ldconfig) BIONILUX_ROOTFS=$DPKG_STUB_ROOT exec "$DPKG_STUB_ROOT/usr/sbin/ldconfig" "$@" ;;
+    /usr/sbin/ldconfig)
+        [ "${DPKG_STUB_REJECT_ADAPTER:-0}" != 1 ] || { echo 'Bad system call' >&2; exit 159; }
+        BIONILUX_ROOTFS=$DPKG_STUB_ROOT exec "$DPKG_STUB_ROOT/usr/sbin/ldconfig" "$@" ;;
     *) exec "$DPKG_STUB_ROOT$cmd" "$@" ;;
 esac
 LAUNCH
@@ -181,6 +187,7 @@ cp /usr/sbin/ldconfig "$ROOT/usr/sbin/ldconfig"
 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB" > /dev/null
 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB" > /dev/null
 [ -s "$ROOT/etc/ld.so.cache" ]
+grep -qx "hold libc6 libc-bin" "$ROOT/var/lib/dpkg/fixture-holds"
 grep -aq 'libbnfixture\.so\.1' "$ROOT/etc/ld.so.cache"
 
 reject env DPKG_STUB_REJECT_LOOKUP=1 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB"
@@ -191,7 +198,11 @@ reject env DPKG_STUB_REJECT_LDCONFIG=1 sh "$PREPARE" --rootfs "$ROOT" --launcher
 grep -q 'ldconfig: fixture execution denied' "$WORK/rejected.log"
 grep -q 'ldconfig backend failed (exit 126)' "$WORK/rejected.log"
 
-DPKG_STUB_REJECT_LDCONFIG=1 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB" \
+reject env DPKG_STUB_REJECT_ADAPTER=1 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB"
+grep -q 'failed to build the guest cache (exit 159)' "$WORK/rejected.log"
+
+DPKG_STUB_REJECT_LDCONFIG=1 DPKG_STUB_REJECT_ADAPTER=1 \
+    sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB" \
     --ldconfig-helper /usr/sbin/ldconfig >/dev/null
 cmp /usr/sbin/ldconfig "$ROOT/usr/libexec/bionilux/ldconfig"
 grep -aq 'libbnfixture\.so\.1' "$ROOT/etc/ld.so.cache"

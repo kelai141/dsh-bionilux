@@ -200,9 +200,8 @@ export function registerLinuxSession(ctx, manager, { registry = new SessionRegis
 /**
  * Build the Agent tool face for a manager.
  *
- * Registration is dynamic: the tool exists only while the runtime is healthy, so
- * the Agent never sees a Linux tool that cannot run. Each execution re-reads
- * health and normalizes the result through the manager.
+ * Tools stay registered for the lifetime of the plugin. Command admission
+ * re-verifies runtime health and reports the failure reason when unavailable.
  *
  * @param {object} ctx - Cordis context (uses `ctx.tools.register` when present).
  * @param {import('../modules/manager.js').LinuxRuntimeManager} manager - Runtime manager.
@@ -347,36 +346,13 @@ export async function apply(ctx, config = {}) {
     });
 
   let disposeTool = () => {};
-  let registered = false;
   let cleaned = false;
-  const syncTool = () => {
-    if (cleaned) return;
-    const healthy = manager.status().healthy === true;
-    // Verification refreshes also emit change. Do not dispose live persistent
-    // registries on healthy -> healthy, including the session doing the probe.
-    if (healthy && registered) return;
-    if (!healthy && !registered) return;
-    try {
-      disposeTool();
-    } catch {
-      // A broken host tool disposer must not break a runtime state change.
-    }
-    registered = false;
-    disposeTool = () => {};
-    if (healthy) {
-      // Activation must fail if the real registry rejects a tool. Reporting a
-      // healthy environment while silently hiding its tools strands the agent.
-      disposeTool = registerLinuxBash(ctx, manager) ?? (() => {});
-      registered = true;
-    }
-  };
   let cleanupResult;
   const cleanup = () => {
     if (!cleaned) {
       cleaned = true;
       try { disposeTool(); } catch { /* Still release owned runtime resources. */ }
       disposeTool = () => {};
-      manager.off('change', syncTool);
       cleanupResult = ownsManager ? manager.dispose() : undefined;
     }
     return cleanupResult;
@@ -386,13 +362,12 @@ export async function apply(ctx, config = {}) {
     // Register teardown before providing services: a failed plugin apply must
     // not retain the directory's manager lease indefinitely.
     if (typeof ctx.effect === 'function') ctx.effect(() => cleanup);
-    manager.on('change', syncTool);
     // A restored active.json is not evidence that Android can execute this
     // backend. Prove Bash, external commands and shared Node before publishing
-    // the service or tools; a failed proof remains visible but unregistered.
+    // the service and stable tool definitions, including an unhealthy backend.
     if (typeof manager.verify === 'function') await manager.verify();
     if (!cleaned) {
-      syncTool();
+      disposeTool = registerLinuxBash(ctx, manager);
       if (typeof ctx.provide === 'function') ctx.provide('linuxRuntimeManager', manager);
     }
   } catch (error) {

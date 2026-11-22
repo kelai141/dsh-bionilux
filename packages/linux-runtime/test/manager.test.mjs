@@ -1037,12 +1037,13 @@ test('a rootfs loader symlink is resolved inside the rootfs and cannot escape', 
   await rm(loader, { force: true });
   await symlink('/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1', loader);
 
-  const resolved = manager.status();
+  assert.equal(manager.status().state, "unverified", "a replacement loader invalidates the execution proof");
+  const resolved = await manager.verify();
   assert.equal(resolved.healthy, true, resolved.reason);
 
   await rm(loader, { force: true });
   await symlink(real, loader);
-  const legacy = manager.status();
+  const legacy = await manager.verify();
   assert.equal(legacy.healthy, true, legacy.reason);
 
   await rm(loader, { force: true });
@@ -1437,6 +1438,21 @@ test('runtime probes fail closed for spawn errors, external failures and forged 
   await manager.dispose();
 });
 
+test('probe reports the failing stage and preserves bounded launcher diagnostics', async () => {
+  const dataDir = tempDir();
+  await mkdir(dataDir, { recursive: true });
+  const { manager } = makeManager(makeManifest(), { dataDir });
+  const paths = { launcher: '/launcher', rootfs: '/rootfs', node: '/node', preload: '/preload' };
+  manager.runCommand = async () => ({ exitCode: 1, stdout: '', stderr: '' });
+  assert.match((await manager._probeRuntime(paths)).reason, /launcher or guest shell produced no diagnostic output/);
+  const stderr = 'launcher detail\nbionilux-probe: guest-uid uid=2000 expected=0\n';
+  manager.runCommand = async () => ({ exitCode: 1, stdout: '', stderr });
+  assert.match((await manager._probeRuntime(paths)).reason, /guest-uid uid=2000 expected=0/);
+  const log = JSON.parse(await readFile(path.join(dataDir, 'logs', 'last-probe-failure.json'), 'utf8'));
+  assert.equal(log.stderr, stderr);
+  await manager.dispose();
+});
+
 test('failed preactivation execution preserves the previous active record', async () => {
   const fixture = makeManifest();
   const { manager } = makeManager(fixture, { dataDir: tempDir() });
@@ -1480,6 +1496,39 @@ test('restored instances require proof; cache expires, failures recover and chan
   await manager.execute({ command: 'echo reproved' });
   assert.equal(manager.status().healthy, true);
   await manager.dispose();
+});
+
+test('live Android verification repairs replaced ARM64 libc before sharing a new probe', async (t) => {
+  const fixture = makeManifest();
+  const { manager } = makeManager(fixture, { dataDir: tempDir() });
+  const installed = await manager.install(fixture.manifest);
+  const library = path.join(installed.paths.rootfs, 'usr', 'lib', 'aarch64-linux-gnu');
+  await mkdir(library, { recursive: true });
+  const libc = path.join(library, 'libc.so.6');
+  const unpatched = Buffer.alloc(8);
+  unpatched.writeUInt32LE(0xd2800c68, 0); // mov x8, #99
+  unpatched.writeUInt32LE(0xd4000001, 4); // svc #0
+  await writeFile(libc, unpatched);
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { ...platform, value: 'android' });
+  t.after(async () => {
+    Object.defineProperty(process, 'platform', platform);
+    await manager.dispose();
+  });
+  let probes = 0;
+  manager._probeRuntime = async () => {
+    probes += 1;
+    assert.equal((await readFile(libc)).readUInt32LE(4), 0x928004a0);
+    return { ok: true };
+  };
+  const results = await Promise.all([manager.verify(), manager.verify(), manager.verify()]);
+  assert.ok(results.every(({ healthy }) => healthy));
+  assert.equal(probes, 1);
+  await writeFile(libc, Buffer.alloc(8));
+  const failed = await manager.verify();
+  assert.equal(failed.healthy, false);
+  assert.match(failed.reason, /guest libc compatibility check failed: .*changed shape/);
+  assert.equal(probes, 1);
 });
 
 test('concurrent verification shares one managed probe and uninstall drains it first', async () => {

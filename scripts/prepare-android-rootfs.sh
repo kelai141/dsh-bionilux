@@ -93,7 +93,21 @@ guest() {
     BIONILUX_ROOTFS=$rootfs \
     BIONILUX_PRELOAD=$preload \
     BIONILUX_FAKE_ROOT=1 \
+    BIONILUX_ANDROID_PATHS=1 \
     run_launcher --rootfs "$rootfs" "$@"
+}
+
+run_adapter() {
+    if [ -n "$ldconfig_helper" ]; then
+        # Use the host shell and utilities for path and cache preparation.
+        # Only the PIE cache writer itself needs the guest dynamic loader.
+        BIONILUX_ROOTFS=$rootfs BIONILUX_PRELOAD=$preload \
+            BIONILUX_LDCONFIG_HOST_LAUNCHER=$launcher \
+            BIONILUX_LDCONFIG_HOST_LINKER=$linker \
+            "${BIONILUX_HOST_SHELL:-/bin/sh}" "$ldconfig" "$@"
+    else
+        guest /usr/sbin/ldconfig "$@"
+    fi
 }
 
 ldconfig=$rootfs/usr/sbin/ldconfig
@@ -156,13 +170,19 @@ guest "$ldconfig_guest" --version >/dev/null || die "ldconfig backend failed (ex
 
 # Build the cache now.  Package triggers rebuild it later; doing it here proves
 # the adapter works on this rootfs and leaves a usable cache after install.
-if ! guest /usr/sbin/ldconfig; then
-    die 'the ldconfig adapter failed to build the guest cache'
+if run_adapter; then
+    :
+else
+    die "the ldconfig adapter failed to build the guest cache (exit $?)"
 fi
 cache=$rootfs/etc/ld.so.cache
 [ -s "$cache" ] || die "no cache was written to $cache"
-if ! guest /usr/sbin/ldconfig -p >/dev/null; then
+if ! run_adapter -p >/dev/null; then
     die 'the guest cache cannot be read back by ldconfig -p'
 fi
+
+# The Android preparation patches the guest libc/loader for Android seccomp.
+# Dpkg replacing libc6 would undo that preparation underneath live processes.
+guest /usr/bin/apt-mark hold libc6 libc-bin || die 'cannot hold the Android guest glibc packages'
 
 printf 'ldconfig adapter installed; guest cache is %s bytes\n' "$(wc -c < "$cache")"
