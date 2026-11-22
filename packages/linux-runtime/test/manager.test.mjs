@@ -1037,12 +1037,13 @@ test('a rootfs loader symlink is resolved inside the rootfs and cannot escape', 
   await rm(loader, { force: true });
   await symlink('/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1', loader);
 
-  const resolved = manager.status();
+  assert.equal(manager.status().state, "unverified", "a replacement loader invalidates the execution proof");
+  const resolved = await manager.verify();
   assert.equal(resolved.healthy, true, resolved.reason);
 
   await rm(loader, { force: true });
   await symlink(real, loader);
-  const legacy = manager.status();
+  const legacy = await manager.verify();
   assert.equal(legacy.healthy, true, legacy.reason);
 
   await rm(loader, { force: true });
@@ -1434,6 +1435,21 @@ test('runtime probes fail closed for spawn errors, external failures and forged 
   }
   manager.runCommand = (spec) => Promise.resolve(successfulCommand(spec));
   assert.equal((await manager._probeRuntime(paths)).ok, true);
+  await manager.dispose();
+});
+
+test('probe reports the failing stage and preserves bounded launcher diagnostics', async () => {
+  const dataDir = tempDir();
+  await mkdir(dataDir, { recursive: true });
+  const { manager } = makeManager(makeManifest(), { dataDir });
+  const paths = { launcher: '/launcher', rootfs: '/rootfs', node: '/node', preload: '/preload' };
+  manager.runCommand = async () => ({ exitCode: 1, stdout: '', stderr: '' });
+  assert.match((await manager._probeRuntime(paths)).reason, /launcher or guest shell produced no diagnostic output/);
+  const stderr = 'launcher detail\nbionilux-probe: guest-uid uid=2000 expected=0\n';
+  manager.runCommand = async () => ({ exitCode: 1, stdout: '', stderr });
+  assert.match((await manager._probeRuntime(paths)).reason, /guest-uid uid=2000 expected=0/);
+  const log = JSON.parse(await readFile(path.join(dataDir, 'logs', 'last-probe-failure.json'), 'utf8'));
+  assert.equal(log.stderr, stderr);
   await manager.dispose();
 });
 

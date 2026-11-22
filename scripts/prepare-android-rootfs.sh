@@ -165,4 +165,8 @@ if ! guest /usr/sbin/ldconfig -p >/dev/null; then
     die 'the guest cache cannot be read back by ldconfig -p'
 fi
 
+# The Android preparation patches the guest libc/loader for Android seccomp.
+# Dpkg replacing libc6 would undo that preparation underneath live processes.
+guest /usr/bin/apt-mark hold libc6 libc-bin || die 'cannot hold the Android guest glibc packages'
+
 printf 'ldconfig adapter installed; guest cache is %s bytes\n' "$(wc -c < "$cache")"

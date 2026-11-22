@@ -213,7 +213,11 @@ export function createMobileBootstrap(options = {}) {
   let tail = Promise.resolve()
   const listeners = new Set()
 
-  const statusValue = () => statusShape(state, mobileVersion, operation, options.version ?? BOOTSTRAP_VERSION, hostArch)
+  const statusValue = () => {
+    const runtime = operation === 'idle' && state.injectionActivated && typeof manager?.status === 'function'
+      ? manager.status() : state.runtime
+    return statusShape({ ...state, runtime }, mobileVersion, operation, options.version ?? BOOTSTRAP_VERSION, hostArch)
+  }
   const emit = () => {
     lastStatus = statusValue()
     for (const listener of listeners) {

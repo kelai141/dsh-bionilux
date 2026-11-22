@@ -18,7 +18,7 @@ settings section) enables the runtime.
 | Storage layout | `<dataDir>/instances/<id>/{backend,rootfs}` plus `<dataDir>/active.json` |
 | Shared Node.js | One app-level glibc Node under `<dataDir>/shared/node/<nodeKey>/<arch>` |
 | Guest environment | Derived, host-clean environment (see below) |
-| Agent tool | `linux_bash`, registered only while the runtime is healthy |
+| Agent tool | `linux_bash`, registered after plugin activation, with actionable errors when the runtime is unhealthy |
 
 Bionilux, the Debian minimal rootfs and the Node.js package are **release
 assets**, downloaded and checksum-verified by the bootstrap plugin. They are not
@@ -147,6 +147,8 @@ variables between calls. The accompanying `linux_session` tool supports
 bounded log and expose its byte offset; exceeding the log cap does not stop
 the build. Session processes end on plugin disposal or host restart; guest
 files and external workspaces remain on disk.
+
+On Android, installation holds the guest packages \`libc6\` and \`libc-bin\` to preserve the Android-prepared glibc. Update them by installing a compatible runtime release. A failed execution probe records the most recent bounded launcher output in \`logs/last-probe-failure.json\` under the private runtime directory.
 
 On Android, installation also prepares DNS and a locally diverted `ldconfig`
 adapter after the rootfs reaches its final path. The adapter invokes the

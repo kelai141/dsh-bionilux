@@ -21,7 +21,7 @@ import { defaultRuntimeIdForArch, resolveHostArchitecture, selectRuntime } from 
 import { assertOfficialAssetUrl, isAllowedAssetOrigin } from './asset-installer.js';
 import { ProcessScope } from './process-scope.js';
 import { assertResolvConfWritable, inspectResolvConf, resolveDnsServers } from './dns-config.js';
-import { ensureGuestLibcSeccompPatch } from './libc-seccomp-patch.js';
+import { ensureGuestLibcSeccompPatch, guestLibcPath } from './libc-seccomp-patch.js';
 import { ensureGuestStaticSeccompPatch } from './static-seccomp-patch.js';
 
 const ACTIVE_SCHEMA_VERSION = 1;
@@ -1125,6 +1125,13 @@ export class LinuxRuntimeManager {
   _probeKey(record, paths) {
     const files = [paths.launcher, paths.preload, path.join(paths.node, 'bin', 'node'),
       ...ROOTFS_REQUIRED_FILES.map((relative) => resolveRootfsTarget(paths.rootfs, path.join(paths.rootfs, relative)))];
+    if (process.platform === 'android' && this.arch === 'arm64') {
+      files.push(guestLibcPath(paths.rootfs));
+    }
+    for (const relative of ROOTFS_LOADER_CANDIDATES[this.arch]) {
+      const loader = inspectRootfsObject(paths.rootfs, relative);
+      if (loader.regular) files.push(resolveRootfsTarget(paths.rootfs, path.join(paths.rootfs, relative)));
+    }
     const identities = files.map((file) => {
       const stat = statSync(file, { bigint: true });
       return [String(stat.dev), String(stat.ino), String(stat.size), String(stat.mtimeNs), String(stat.ctimeNs)];
@@ -1194,12 +1201,13 @@ export class LinuxRuntimeManager {
   /** Prove bash itself, child-process rerouting and the shared Node all work. */
   async _probeRuntime(paths, { timeoutMs = this.probeTimeoutMs } = {}) {
     const command = [
-      'set -e',
-      '[ -n "$BASH_VERSION" ]',
-      '[ "$(/usr/bin/id -u)" = 0 ]',
-      '/usr/bin/uname -m >/dev/null',
-      '/usr/bin/ls / >/dev/null',
-      'node --version >/dev/null',
+      'fail() { printf "bionilux-probe: %s\\n" "$*" >&2; exit 1; }',
+      '[ -n "$BASH_VERSION" ] || fail bash-builtin',
+      'uid=$(/usr/bin/id -u) || fail guest-id',
+      '[ "$uid" = 0 ] || fail "guest-uid uid=$uid expected=0"',
+      '/usr/bin/uname -m >/dev/null || fail guest-uname',
+      '/usr/bin/ls / >/dev/null || fail guest-root-list',
+      'node --version >/dev/null || fail guest-node',
       "printf '%s\n' '" + PROBE_MARKER + "'",
     ].join('; ');
     const start = launchArgv(paths.launcher, ['/bin/bash', '--noprofile', '--norc', '-c', command]);
@@ -1209,20 +1217,39 @@ export class LinuxRuntimeManager {
         file: start.file, args: start.args, cwd: this.dataDir, env: environment,
         timeout: timeoutMs, maxOutputBytes: 16 * 1024,
       }));
-      if (result.timedOut) return { ok: false, reason: 'runtime probe timed out after ' + timeoutMs + ' ms: ' +
-        (firstLine(result.stderr) || firstLine(result.stdout)) };
-      if (result.exitCode !== 0) {
-        return { ok: false, reason: 'runtime probe failed (exit ' + result.exitCode + '): ' +
-          (firstLine(result.stderr) || firstLine(result.stdout)) };
-      }
-      if (result.stdout.trim() !== PROBE_MARKER || result.stdoutTruncated || result.stderrTruncated) {
-        return { ok: false, reason: 'runtime probe did not produce the expected marker: ' + firstLine(result.stdout) };
+      const step = result.stderr.split('\n').find((line) => line.startsWith('bionilux-probe: '));
+      const detail = firstLine(step) || firstLine(result.stderr) || firstLine(result.stdout)
+        || 'launcher or guest shell produced no diagnostic output';
+      const diagnosis = result.timedOut ? 'runtime probe timed out after ' + timeoutMs + ' ms'
+        : result.exitCode !== 0 ? 'runtime probe failed (exit ' + result.exitCode
+          + (result.signal ? ', signal ' + result.signal : '') + ')'
+        : result.stdout.trim() !== PROBE_MARKER || result.stdoutTruncated || result.stderrTruncated
+          ? 'runtime probe did not produce the expected marker' : null;
+      if (diagnosis) {
+        await this._writeProbeFailure(diagnosis, result);
+        return { ok: false, reason: diagnosis + ': ' + detail };
       }
       return { ok: true };
     } catch (error) {
       // Missing launcher/interpreter, permission denial and every spawn error
       // are runtime failures, never a special test-mode success.
-      return { ok: false, reason: 'runtime probe could not start: ' + (error.code ?? error.message) };
+      const reason = 'runtime probe could not start: ' + (error.code ?? error.message);
+      await this._writeProbeFailure(reason, { stderr: error.message });
+      return { ok: false, reason };
+    }
+  }
+
+  async _writeProbeFailure(reason, result) {
+    const logs = path.join(this.dataDir, 'logs');
+    try {
+      await fs.mkdir(logs, { mode: 0o700 }).catch((error) => {
+        if (error.code !== 'EEXIST') throw error;
+      });
+      if (!(await fs.lstat(logs)).isDirectory()) return;
+      await writeFileAtomic(path.join(logs, 'last-probe-failure.json'),
+        JSON.stringify({ time: new Date().toISOString(), reason, ...result }, null, 2) + '\n');
+    } catch {
+      // A logging failure must not hide the original health verdict.
     }
   }
 
@@ -1233,7 +1260,12 @@ export class LinuxRuntimeManager {
     if (!record || !state.paths) return state;
     const health = this._healthForRecord(record);
     if (!health.healthy) return this.status();
-    const key = this._probeKey(record, health.paths);
+    let key;
+    try {
+      key = this._probeKey(record, health.paths);
+    } catch {
+      return this.status();
+    }
     if (!force && this._probeVerdict?.key === key && Date.now() - this._probeVerdict.checkedAt < PROBE_CACHE_MS) {
       return state;
     }
@@ -1241,7 +1273,9 @@ export class LinuxRuntimeManager {
       const promise = (async () => {
         const verdict = await this._probeRuntime(health.paths);
         // Do not publish a verdict about files changed during the probe.
-        if (key === this._probeKey(record, health.paths)) {
+        let currentKey;
+        try { currentKey = this._probeKey(record, health.paths); } catch { /* Files are being replaced. */ }
+        if (this._probePending?.key === key && key === currentKey) {
           this._probeVerdict = { key, checkedAt: Date.now(), ...verdict };
           this._emitState();
         }

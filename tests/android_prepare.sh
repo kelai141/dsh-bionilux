@@ -161,6 +161,10 @@ cat > "$LAUNCHER" <<'LAUNCH'
 cmd=$1; shift
 case $cmd in
     /usr/bin/dpkg-divert) exec "$DPKG_STUB" "$@" ;;
+    /usr/bin/apt-mark)
+        [ "$*" = 'hold libc6 libc-bin' ] || exit 2
+        printf '%s\n' "$*" > "$DPKG_STUB_ROOT/var/lib/dpkg/fixture-holds"
+        ;;
     /usr/sbin/ldconfig.distrib)
         if [ "${DPKG_STUB_REJECT_LDCONFIG:-0}" = 1 ]; then
             printf 'ldconfig: fixture execution denied\n' >&2
@@ -181,6 +185,7 @@ cp /usr/sbin/ldconfig "$ROOT/usr/sbin/ldconfig"
 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB" > /dev/null
 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB" > /dev/null
 [ -s "$ROOT/etc/ld.so.cache" ]
+grep -qx "hold libc6 libc-bin" "$ROOT/var/lib/dpkg/fixture-holds"
 grep -aq 'libbnfixture\.so\.1' "$ROOT/etc/ld.so.cache"
 
 reject env DPKG_STUB_REJECT_LOOKUP=1 sh "$PREPARE" --rootfs "$ROOT" --launcher "$LAUNCHER" --preload "$STUB"
