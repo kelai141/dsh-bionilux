@@ -1657,18 +1657,26 @@ export class LinuxRuntimeManager {
     // Android preparation uses system tools. Termux executables under app
     // data are unavailable here because the host loader hooks are absent.
     const hostEnvironment = this._hostToolEnvironment();
-    const result = normaliseCommandResult(
-      await this._runManaged({
+    // Android mksh materializes here-documents under TMPDIR. Its default
+    // /data/local is not writable by the application UID.
+    const temporary = process.platform === 'android'
+      ? await fs.mkdtemp(path.join(instance.root, '.prepare-tmp-'))
+      : undefined;
+    if (temporary) hostEnvironment.TMPDIR = temporary;
+    try {
+      const result = normaliseCommandResult(await this._runManaged({
         file: HOST_SCRIPT_INTERPRETER,
         args,
         cwd: instance.root,
         env: hostEnvironment,
         timeout: 120_000,
         signal,
-      }),
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`prepare-rootfs.sh failed with exit code ${result.exitCode}: ${result.stderr}`.trim());
+      }));
+      if (result.exitCode !== 0) {
+        throw new Error(`prepare-rootfs.sh failed with exit code ${result.exitCode}: ${result.stderr}`.trim());
+      }
+    } finally {
+      if (temporary) await fs.rm(temporary, { recursive: true, force: true });
     }
   }
 

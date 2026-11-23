@@ -1498,6 +1498,34 @@ test('restored instances require proof; cache expires, failures recover and chan
   await manager.dispose();
 });
 
+test('Android rootfs preparation gives mksh a private TMPDIR and cleans it after success and failure', async (t) => {
+  const { manager } = makeManager(makeManifest(), { dataDir: tempDir() });
+  const root = tempDir();
+  const rootfs = path.join(root, 'rootfs');
+  await mkdir(path.join(rootfs, 'etc'), { recursive: true });
+  await writeFile(path.join(rootfs, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\n');
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { ...platform, value: 'android' });
+  t.after(async () => {
+    Object.defineProperty(process, 'platform', platform);
+    await manager.dispose();
+  });
+  const instance = { root, rootfs, backend: path.join(root, 'backend') };
+  const temporary = [];
+  manager._runManaged = async ({ env }) => {
+    assert.equal(path.dirname(env.TMPDIR), root);
+    assert.equal((await stat(env.TMPDIR)).mode & 0o777, 0o700);
+    await writeFile(path.join(env.TMPDIR, 'mksh.tmp'), 'fixture');
+    temporary.push(env.TMPDIR);
+    return temporary.length === 1 ? { exitCode: 0 } : { exitCode: 1, stderr: 'fixture failure' };
+  };
+  await manager._prepareRootfs(instance);
+  assert.equal(existsSync(temporary[0]), false);
+  await assert.rejects(manager._prepareRootfs(instance), /fixture failure/);
+  assert.notEqual(temporary[1], temporary[0]);
+  assert.equal(existsSync(temporary[1]), false);
+});
+
 test('live Android verification repairs replaced ARM64 libc before sharing a new probe', async (t) => {
   const fixture = makeManifest();
   const { manager } = makeManager(fixture, { dataDir: tempDir() });

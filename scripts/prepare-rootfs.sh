@@ -121,14 +121,16 @@ desired_link_target() {
 }
 
 count_pending_links() {
+    count=0
     while IFS= read -r link; do
         [ -n "$link" ] || continue
         target=$(readlink "$link") || exit 1
         wanted=$(desired_link_target "$link" "$target") || exit 1
-        [ "$wanted" = "$target" ] || echo "$link"
-    done <<EOF | wc -l
+        [ "$wanted" = "$target" ] || count=$((count + 1))
+    done <<EOF || return 1
 $links
 EOF
+    printf '%s\n' "$count"
 }
 
 echo "== absolute symlinks under $ROOTFS"
@@ -144,7 +146,7 @@ else
         new_target=$(desired_link_target "$link" "$target") || exit 1
         [ "$target" != "$new_target" ] || continue
         ln -sfn "$new_target" "$link" || exit 1
-    done <<EOF
+    done <<EOF || exit 1
 $links
 EOF
     after=$(count_pending_links)
