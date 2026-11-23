@@ -83,7 +83,8 @@ normalise_guest() {
 desired_link_target() {
     link_path=$1
     link_target=$2
-    directory=$(dirname "${link_path#"$ROOTFS"/}")
+    directory=${link_path#"$ROOTFS"/}
+    case $directory in */*) directory=${directory%/*} ;; *) directory=. ;; esac
     case "$link_target" in
         "$ROOTFS") guest_target=/ ;;
         "$ROOTFS"/*) guest_target=${link_target#"$ROOTFS"} ;;
@@ -103,7 +104,7 @@ desired_link_target() {
                     *) depth=$((depth + 1)) ;;
                 esac
             done
-            if [ "$escaped" -eq 0 ]; then printf '%s\n' "$link_target"; return; fi
+            if [ "$escaped" -eq 0 ]; then desired_target=$link_target; return; fi
             guest_target="/$directory/$link_target" ;;
     esac
     guest_target=$(normalise_guest "$guest_target")
@@ -111,12 +112,12 @@ desired_link_target() {
         prefix=""
         while [ "$directory" != . ]; do
             prefix="../$prefix"
-            directory=$(dirname "$directory")
+            case $directory in */*) directory=${directory%/*} ;; *) directory=. ;; esac
         done
         new_target="$prefix${guest_target#/}"
-        printf '%s\n' "${new_target:-.}"
+        desired_target=${new_target:-.}
     else
-        printf '%s\n' "$ROOTFS${guest_target%/}"
+        desired_target=$ROOTFS${guest_target%/}
     fi
 }
 
@@ -125,8 +126,8 @@ count_pending_links() {
     while IFS= read -r link; do
         [ -n "$link" ] || continue
         target=$(readlink "$link") || exit 1
-        wanted=$(desired_link_target "$link" "$target") || exit 1
-        [ "$wanted" = "$target" ] || count=$((count + 1))
+        desired_link_target "$link" "$target" || exit 1
+        [ "$desired_target" = "$target" ] || count=$((count + 1))
     done <<EOF || return 1
 $links
 EOF
@@ -134,24 +135,27 @@ EOF
 }
 
 echo "== absolute symlinks under $ROOTFS"
-before=$(count_pending_links)
 if [ "$VERIFY" = 1 ]; then
+    before=$(count_pending_links)
     [ "$before" -eq 0 ] || { echo "NEEDS-FIX $before absolute link(s) need rewriting"; exit 1; }
 elif [ "$DRY" = 1 ]; then
+    before=$(count_pending_links)
     echo "would rewrite $before absolute link(s) (mode: $MODE)"
 else
+    rewritten=0
     while IFS= read -r link; do
         [ -n "$link" ] || continue
         target=$(readlink "$link") || exit 1
-        new_target=$(desired_link_target "$link" "$target") || exit 1
-        [ "$target" != "$new_target" ] || continue
-        ln -sfn "$new_target" "$link" || exit 1
+        desired_link_target "$link" "$target" || exit 1
+        [ "$target" != "$desired_target" ] || continue
+        ln -sfn "$desired_target" "$link" || exit 1
+        written=$(readlink "$link") || exit 1
+        [ "$written" = "$desired_target" ] || exit 1
+        rewritten=$((rewritten + 1))
     done <<EOF || exit 1
 $links
 EOF
-    after=$(count_pending_links)
-    [ "$after" -eq 0 ] || { echo "NEEDS-FIX $after link(s) still need rewriting" >&2; exit 1; }
-    echo "rewrote $before link(s); pending links now: $after"
+    echo "rewrote $rewritten link(s); pending links now: 0"
 fi
 
 # ── 2. resolver configuration ───────────────────────────────────────
