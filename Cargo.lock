@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "bionilux"
-version = "0.10.10"
+version = "0.10.11"
 dependencies = [
  "clap",
  "goblin",
