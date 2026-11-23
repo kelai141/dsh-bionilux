@@ -1669,7 +1669,7 @@ export class LinuxRuntimeManager {
         args,
         cwd: instance.root,
         env: hostEnvironment,
-        timeout: 120_000,
+        timeout: 300_000,
         signal,
       }));
       if (result.exitCode !== 0) {
