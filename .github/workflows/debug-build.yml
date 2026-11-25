@@ -380,6 +380,7 @@ jobs:
           fi
           sudo rm -f "$rootfs/etc/resolv.conf" "$rootfs/etc/machine-id" "$rootfs/var/lib/dbus/machine-id"
           sudo rm -rf "$rootfs/var/lib/apt/lists/"* "$rootfs/var/cache/apt/archives/"*
+          sudo rm -f "$rootfs/var/cache/apt/pkgcache.bin" "$rootfs/var/cache/apt/srcpkgcache.bin"
           # The APK ships this loader in jniLibs. An app process on targetSdk
           # >= 29 cannot execve its own data directory, so the copy the guest
           # runs has to live where SELinux labels it apk_data_file.
@@ -417,6 +418,13 @@ jobs:
             --hard-dereference --exclude='./dev/*' \
             --xattrs --xattrs-include='*' --acls -cJf "$stage/debian-minimal-$ARCH.tar.xz" \
             -C "$rootfs" .
+          tar_list="$(tar -tJf "$stage/debian-minimal-$ARCH.tar.xz")"
+          if echo "$tar_list" | grep -E '(^|\./)var/cache/apt/(pkgcache|srcpkgcache)\.bin$' >/dev/null; then
+            echo "ERROR: regenerable apt binary cache leaked into debian-minimal-$ARCH.tar.xz" >&2
+            exit 1
+          fi
+          echo "$tar_list" | grep -E '(^|\./)var/lib/dpkg/status$' >/dev/null
+          echo "$tar_list" | grep -E '(^|\./)etc/apt/sources\.list$' >/dev/null
           sudo chmod 644 "$stage/debian-minimal-$ARCH.tar.xz"
           tar -tJf "$stage/debian-minimal-$ARCH.tar.xz" | grep '^\./etc/os-release$' > /dev/null
           tar -tJf "$stage/debian-minimal-$ARCH.tar.xz" | grep '^\./usr/bin/apt-get$' > /dev/null
