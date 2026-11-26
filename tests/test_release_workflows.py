@@ -125,6 +125,7 @@ class ManifestTests(unittest.TestCase):
         self.archives = ["linux-bootstrap-plugin.tar.xz", "linux-runtime-plugin.tar.xz"]
         for arch, node in (("aarch64", "arm64"), ("x86_64", "x64")):
             self.archives.extend((f"bionilux-backend-{arch}.tar.xz", f"debian-minimal-{arch}.tar.xz",
+                                  f"debian-workspace-lite-{arch}.tar.xz",
                                   f"node-glibc-v24.22.0-linux-{node}.tar.xz"))
             (self.root / f"bionilux-{arch}").write_bytes(b"launcher fixture")
             (self.root / f"libbionilux_preload-{arch}.so").write_bytes(b"preload fixture")
@@ -150,15 +151,32 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((self.root / "linux-release.json").read_text())
         self.assertEqual(manifest["minMobileVersion"], "0.0.0")
-        runtimes = {item["architecture"]: item for item in manifest["runtimes"]}
-        self.assertIs(runtimes["arm64"]["rootfsCandidateHandoff"], True)
-        self.assertNotIn("rootfsCandidateHandoff", runtimes["x64"])
-        self.assertEqual([r["architecture"] for r in manifest["runtimes"]], ["arm64", "x64"])
-        self.assertEqual(len((self.root / "SHA256SUMS").read_text().splitlines()), 16)
+        runtimes = {item["id"]: item for item in manifest["runtimes"]}
+        self.assertEqual(list(runtimes), [
+            "debian-minimal", "debian-minimal-x64", "debian-workspace-lite", "debian-workspace-lite-x64",
+        ])
+        for baseline_id, workspace_id, arch in [
+            ("debian-minimal", "debian-workspace-lite", "arm64"),
+            ("debian-minimal-x64", "debian-workspace-lite-x64", "x64"),
+        ]:
+            base, workspace = runtimes[baseline_id], runtimes[workspace_id]
+            self.assertEqual(base["architecture"], arch)
+            self.assertEqual(workspace["architecture"], arch)
+            self.assertEqual(base["backendAsset"], workspace["backendAsset"])
+            self.assertEqual(base["nodeAsset"], workspace["nodeAsset"])
+            self.assertNotEqual(base["rootfsAsset"]["url"], workspace["rootfsAsset"]["url"])
+            self.assertEqual(workspace.get("rootfsCandidateHandoff", False), arch == "arm64")
+        self.assertEqual(len((self.root / "SHA256SUMS").read_text().splitlines()), 18)
 
     def test_missing_architecture_fails(self):
         (self.root / "debian-minimal-aarch64.tar.xz").unlink()
         self.assertNotEqual(self.run_manifest().returncode, 0)
+
+    def test_missing_workspace_archive_fails(self):
+        (self.root / "debian-workspace-lite-x86_64.tar.xz").unlink()
+        result = self.run_manifest()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Missing or empty required release asset: debian-workspace-lite-x86_64.tar.xz", result.stderr)
 
     def test_unsafe_archive_fails(self):
         self.archive(self.archives[0], "../outside")
