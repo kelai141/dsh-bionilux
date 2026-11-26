@@ -6,27 +6,32 @@ import os
 import pathlib
 import sys
 import tarfile
+from functools import cache
 from urllib.parse import quote
 
 root = pathlib.Path(sys.argv[1])
 repository, tag, version, node_version = sys.argv[2:]
-runtime_specs = (
-    ("aarch64", "debian-minimal", "arm64", "arm64", "ARM64"),
-    ("x86_64", "debian-minimal-x64", "x64", "x64", "x86_64"),
+architecture_specs = (
+    ("aarch64", "arm64", "arm64", "ARM64"),
+    ("x86_64", "x64", "x64", "x86_64"),
+)
+profiles = (
+    ("minimal", "debian-minimal", "Debian 13 (trixie)"),
+    ("workspace-lite", "debian-workspace-lite", "Debian workspace"),
 )
 required = [
     "linux-bootstrap-plugin.tar.xz",
     "linux-runtime-plugin.tar.xz",
 ]
-for asset_arch, _runtime_id, _runtime_arch, node_arch, _label in runtime_specs:
+for asset_arch, _runtime_arch, node_arch, _label in architecture_specs:
     required.extend((
         f"bionilux-{asset_arch}",
         f"libbionilux_preload-{asset_arch}.so",
         f"bionilux-loader-{asset_arch}.so",
         f"bionilux-backend-{asset_arch}.tar.xz",
-        f"debian-minimal-{asset_arch}.tar.xz",
         f"node-glibc-v{node_version}-linux-{node_arch}.tar.xz",
     ))
+    required.extend(f"debian-{profile}-{asset_arch}.tar.xz" for profile, _, _ in profiles)
 pointer = b"version https://git-lfs.github.com/spec/v1\n"
 for name in required:
     path = root / name
@@ -41,6 +46,7 @@ for name in required:
 base_url = f"https://github.com/{repository}/releases/download/{quote(tag, safe='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-')}"
 page_url = f"https://github.com/{repository}/releases/tag/{quote(tag, safe='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-')}"
 
+@cache
 def describe(name):
     path = root / name
     digest = hashlib.sha256()
@@ -80,33 +86,22 @@ manifest = {
         "runtime": runtime_plugin,
     },
     "runtimes": [{
-        "id": runtime_id,
-        "label": f"Debian 13 (trixie) for {label}",
+        "id": profile_id if runtime_arch == "arm64" else f"{profile_id}-x64",
+        "label": f"{profile_label} for {label}",
         "architecture": runtime_arch,
         "backend": "bionilux",
         **({"rootfsCandidateHandoff": True} if runtime_arch == "arm64" else {}),
         "backendAsset": describe(f"bionilux-backend-{asset_arch}.tar.xz"),
-        "rootfsAsset": describe(f"debian-minimal-{asset_arch}.tar.xz"),
+        "rootfsAsset": describe(f"debian-{profile}-{asset_arch}.tar.xz"),
         "nodeAsset": describe(f"node-glibc-v{node_version}-linux-{node_arch}.tar.xz"),
-    } for asset_arch, runtime_id, runtime_arch, node_arch, label in runtime_specs],
+    } for profile, profile_id, profile_label in profiles
+      for asset_arch, runtime_arch, node_arch, label in architecture_specs],
 }
 out = root / "linux-release.json"
 out.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 print(f"Generated {out} for {repository}@{tag}")
 
-expected = {
-    "linux-bootstrap-plugin.tar.xz", "linux-runtime-plugin.tar.xz",
-    "linux-release.json", "BUILD_INFO.json",
-}
-for asset_arch, node_arch in (("aarch64", "arm64"), ("x86_64", "x64")):
-    expected.update({
-        f"bionilux-{asset_arch}",
-        f"libbionilux_preload-{asset_arch}.so",
-        f"bionilux-loader-{asset_arch}.so",
-        f"bionilux-backend-{asset_arch}.tar.xz",
-        f"debian-minimal-{asset_arch}.tar.xz",
-        f"node-glibc-v{node_version}-linux-{node_arch}.tar.xz",
-    })
+expected = {*required, "linux-release.json", "BUILD_INFO.json"}
 actual = {path.name for path in root.iterdir() if path.is_file()}
 if actual != expected:
     raise SystemExit(f"Unexpected release asset set: missing={expected-actual}, extra={actual-expected}")

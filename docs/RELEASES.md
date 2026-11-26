@@ -25,6 +25,7 @@
 | `libbionilux_preload-aarch64.so` | glibc preload hook |
 | `bionilux-backend-aarch64.tar.xz` | 运行时后端打包（`bin/`、`lib/`、`scripts/`） |
 | `debian-minimal-aarch64.tar.xz` | Debian 13 trixie minimal rootfs（不含 Node.js） |
+| `debian-workspace-lite-aarch64.tar.xz` | Optional Debian workspace with Git and the SSH client. Uses the same backend and shared Node archive as Debian minimal. |
 | `node-glibc-v<版本>-linux-arm64.tar.xz` | 官方 Node.js 的 glibc arm64 包（应用级共享一份） |
 | `linux-release.json` | 发布清单（安装器唯一读取入口） |
 

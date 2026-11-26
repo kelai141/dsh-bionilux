@@ -420,6 +420,18 @@ jobs:
           sudo chmod 644 "$stage/debian-minimal-$ARCH.tar.xz"
           tar -tJf "$stage/debian-minimal-$ARCH.tar.xz" | grep '^\./etc/os-release$' > /dev/null
           tar -tJf "$stage/debian-minimal-$ARCH.tar.xz" | grep '^\./usr/bin/apt-get$' > /dev/null
+      - name: Build the optional Debian workspace
+        env:
+          ARCH: ${{ matrix.architecture }}
+          CROSS_ARCH: ${{ matrix.cross_arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/build-workspace-rootfs.sh \
+            "$GITHUB_WORKSPACE/target/debian-rootfs-$ARCH" \
+            "$GITHUB_WORKSPACE/target/release-assets/debian-workspace-lite-$ARCH.tar.xz" \
+            "$DEBIAN_SNAPSHOT" "$DEBIAN_SUITE" "$GITHUB_WORKSPACE/target/build-debian-keyring.gpg" \
+            "$(git show -s --format=%ct HEAD)" "$CROSS_ARCH"
       - name: Download and package the pinned official glibc Node.js runtime
         env:
           ARCH: ${{ matrix.architecture }}
@@ -503,6 +515,7 @@ jobs:
             "$stage/bionilux-loader-$ARCH.so" \
             "$stage/bionilux-backend-$ARCH.tar.xz" \
             "$stage/debian-minimal-$ARCH.tar.xz" \
+            "$stage/debian-workspace-lite-$ARCH.tar.xz" \
             "$stage"/node-glibc-*-linux-*.tar.xz || failed=1
           echo "$ARCH guest ELF layout checked for $GUEST_PAGE_SIZE-byte kernels; own launcher/preload both built for 16KB alignment. Actual target-page-size glibc/Android execution is NOT tested." >> "$GITHUB_STEP_SUMMARY"
           if [[ "$ARCH" == "x86_64" ]]; then
